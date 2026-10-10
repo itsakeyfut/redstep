@@ -1,0 +1,43 @@
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- OS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.iml
+.fleet/
+.zed/
+*.swp
+*.swo
+*~
+
+# --- Secrets / local env ---
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+*.local.toml
+# 将来テスト用の鍵を含める場合は例外を追加:
+#   !tests/fixtures/*.pem
+
+# --- Logs / temp ---
+*.log
+tmp/
+
+# --- private ---
+TODO.md
