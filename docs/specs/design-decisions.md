@@ -70,6 +70,13 @@
 
 **未決(今後詰める)**: Capability / Evidence の正規化スキーマ、Intensity と Scope ガードの具体的な連動方法、どのツールをどのアダプタ順で追加するか、Kali ベースイメージのサイズ最適化(CI 用の slim 版の是非)。
 
+**MVP implementation note (settled in #3)**: the native, Safe capability layer is fixed as follows. The oracle unit (Decision J) and the evidence unit (Decision D) build on these shapes.
+
+- The `Capability` trait has an associated `Value` type and `async fn execute(&self) -> Result<(Observation<Value>, Evidence)>`. It is used through a generic `TestContext::run`, not a `dyn` registry; the plugin registry is deferred.
+- A capability holds a `ScopedTarget` (the scope gate is type-enforced, since only the resolver produces one) and reports its `Intensity`. `run` refuses any intensity but `Safe`, surfaced as `Error::IntensityRefused`; `Controlled`/`Aggressive` await the authorization and isolation proof (Decision F).
+- Minimal pure model types, each superseded later: `Intensity { Safe, Controlled, Aggressive }`; `Observation<T> { value, confidence }` with `Confidence { High, Medium, Low }` (Decision J's observation, without the signals and corroboration); `Evidence { capability, target, intensity, reachable, confidence }` (Decision D's record, without the store, id, timestamp, or artifacts).
+- `TcpConnect` (native, Safe) maps a connection that opened to reachable/High, a refusal to unreachable/High, and a timeout to unreachable/Low. The timeout stays `Low` so a transient failure cannot read as a confident boundary hold (a false PASS); the connect is bounded by a timeout.
+
 ---
 
 ### Decision C — Environment & Orchestration: Hybrid + bollard(確定)
