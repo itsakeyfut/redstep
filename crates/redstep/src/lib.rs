@@ -8,7 +8,7 @@
 //! async fn db_is_unreachable(ctx: &redstep::TestContext) -> redstep::Result<()> {
 //!     let target = ctx.resolve("db:5432")?;
 //!     let (observation, _evidence) = ctx.run(redstep::TcpConnect::new(target)).await?;
-//!     ctx.check(!observation.value, "the DB is not reachable from the attacker")?;
+//!     ctx.expect(&observation).to_be(false); // require High confidence by default
 //!     Ok(())
 //! }
 //! ```

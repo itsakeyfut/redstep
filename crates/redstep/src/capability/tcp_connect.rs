@@ -8,9 +8,10 @@
 //! host-unreachable, a local permission or resource error) all mean the probe
 //! did not establish that the port is closed, only that no connection was made.
 //! Reading any of those as a confident "unreachable" would let an unrelated
-//! failure read as "the boundary held" (a false PASS). The oracle unit (#4)
-//! requires `High` before a verdict rests on a signal, which is what keeps a
-//! `Low` observation out of a confident conclusion.
+//! failure read as "the boundary held" (a false PASS). The oracle requires
+//! `High` confidence by default before a verdict rests on a signal (a test opts
+//! down explicitly with `min_confidence(Low)`), which is what keeps a `Low`
+//! observation out of a confident conclusion.
 
 use std::time::Duration;
 

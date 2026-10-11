@@ -73,6 +73,37 @@ async fn expect_inconclusive_demo(ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
+/// A High observation that matches the expectation verdicts Pass through the
+/// expect path end to end.
+#[security_test]
+async fn expect_pass_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: false,
+        confidence: Confidence::High,
+    };
+    ctx.expect(&observed).to_be(false);
+    Ok(())
+}
+
+/// A Low observation with no explicit minimum: the default gate requires High,
+/// so this is Inconclusive, not a confident Pass. This is the fail-closed
+/// default that keeps a timeout (Low) from reading as "the boundary held".
+#[security_test]
+async fn default_gate_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: false,
+        confidence: Confidence::Low,
+    };
+    ctx.expect(&observed).to_be(false);
+    Ok(())
+}
+
+/// A test that asserts nothing: Inconclusive, not Pass. Nothing was proven.
+#[security_test]
+async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
+    Ok(())
+}
+
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
@@ -98,10 +129,35 @@ fn registered_tests_are_discovered_and_executed_with_mapped_verdicts() {
     assert_eq!(verdict_of(&summary, "::panicking_demo"), Verdict::Error);
     assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
     assert_eq!(verdict_of(&summary, "::expect_fail_demo"), Verdict::Fail);
+    assert_eq!(verdict_of(&summary, "::expect_pass_demo"), Verdict::Pass);
     assert_eq!(
         verdict_of(&summary, "::expect_inconclusive_demo"),
         Verdict::Inconclusive
     );
+    assert_eq!(
+        verdict_of(&summary, "::default_gate_demo"),
+        Verdict::Inconclusive,
+        "a Low observation with no explicit minimum is Inconclusive, not a confident Pass"
+    );
+    assert_eq!(
+        verdict_of(&summary, "::no_assertion_demo"),
+        Verdict::Inconclusive,
+        "a test that asserts nothing proved nothing"
+    );
+
+    // The judgement reason survives into the summary (not dropped). Mutation:
+    // build TestRun with `judgements: Vec::new()` -> this find fails.
+    let expect_fail = summary
+        .runs
+        .iter()
+        .find(|r| r.name.ends_with("::expect_fail_demo"))
+        .expect("discovered");
+    let judgement = expect_fail
+        .judgements
+        .first()
+        .expect("expect_fail_demo recorded a judgement");
+    assert_eq!(judgement.expected, "false");
+    assert_eq!(judgement.actual, "true");
 }
 
 /// Guard: `run` hands its scope to the tests. Mutation: make `run` discard the

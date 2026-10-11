@@ -50,11 +50,25 @@ impl TestContext {
         self.scope.resolve(spec)
     }
 
-    /// A bare boolean assertion: `Ok(())` when the condition holds,
-    /// [`Error::Check`] otherwise (which stops the test and verdicts it `Fail`).
-    /// Use [`expect`](Self::expect) for an assertion over an `Observation`; this
-    /// is for a plain condition that is not an observation.
+    /// A bare boolean assertion, for a plain condition that is not an
+    /// observation: records a `Pass` judgement when it holds and a `Fail`
+    /// (returning [`Error::Check`], which stops the test) when it does not. It
+    /// is confidence-blind, so a weak signal gets a confident verdict; use
+    /// [`expect`](Self::expect) for anything observed, where the confidence gate
+    /// applies. A test that records no judgement at all is `Inconclusive`, so a
+    /// passing `check` is what makes a check-only test `Pass`.
     pub fn check(&self, condition: bool, message: &str) -> Result<()> {
+        let verdict = if condition {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        };
+        self.record(Judgement {
+            verdict,
+            expected: "condition holds".to_owned(),
+            actual: message.to_owned(),
+            confidence: Confidence::High,
+        });
         if condition {
             Ok(())
         } else {
@@ -68,13 +82,14 @@ impl TestContext {
     /// several expectations accumulate (See Decision J).
     ///
     /// ```ignore
-    /// let verdict = ctx.expect(&observation).min_confidence(Confidence::High).to_be(false);
+    /// let verdict = ctx.expect(&observation).to_be(false);                      // requires High by default
+    /// let verdict = ctx.expect(&observation).min_confidence(Confidence::Low).to_be(false);  // opt down
     /// ```
     pub fn expect<'a, T>(&'a self, observation: &'a Observation<T>) -> ExpectationBuilder<'a, T> {
         ExpectationBuilder {
             ctx: self,
             observation,
-            min_confidence: Confidence::Low,
+            min_confidence: Confidence::High,
         }
     }
 
@@ -119,9 +134,14 @@ impl TestContext {
 }
 
 /// Builds an expectation over an observation and judges it. Returned by
-/// [`TestContext::expect`]; `min_confidence` is optional (default: accept any),
-/// and `to_be` is the terminal that judges, records the judgement, and returns
-/// the verdict.
+/// [`TestContext::expect`]; `min_confidence` is optional (default: require
+/// `High`), and `to_be` is the terminal that judges, records the judgement, and
+/// returns the verdict.
+///
+/// `#[must_use]`: a builder dropped without calling `to_be` records nothing, so
+/// a forgotten terminal would silently assert nothing. The warning turns that
+/// into a compile-time catch rather than a vacuous `Inconclusive`.
+#[must_use = "call .to_be(expected) to judge and record the expectation"]
 pub struct ExpectationBuilder<'a, T> {
     ctx: &'a TestContext,
     observation: &'a Observation<T>,

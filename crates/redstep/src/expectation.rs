@@ -3,8 +3,9 @@
 //!
 //! Pure model layer. An [`Expectation`] is the declared, acceptable value plus
 //! an optional minimum confidence. [`judge`] compares an [`Observation`] against
-//! it and yields a [`Judgement`]: a [`Verdict`] and the machine-readable reason
-//! (expected vs actual) the report renders.
+//! it and yields a [`Judgement`]: a [`Verdict`] and the reason (expected vs
+//! actual) the report renders. The reason is `Debug`-formatted for now; the
+//! stable machine form is the canonical JSON (Decision E).
 
 use std::fmt::Debug;
 
@@ -23,15 +24,19 @@ pub struct Expectation<T> {
 }
 
 impl<T> Expectation<T> {
-    /// Expect this value, accepting any confidence (the gate is off).
+    /// Expect this value, requiring `High` confidence by default: fail-closed,
+    /// so a weak signal (a timeout, a probe-side error) is `Inconclusive`
+    /// rather than a confident verdict. A test that wants to act on a weaker
+    /// signal opts down explicitly with `min_confidence(Low)`.
     pub fn to_be(expected: T) -> Self {
         Self {
             expected,
-            min_confidence: Confidence::Low,
+            min_confidence: Confidence::High,
         }
     }
 
     /// Require at least this confidence; a weaker observation is `Inconclusive`.
+    /// Lower than the default to let a test act on a weaker signal.
     pub fn min_confidence(mut self, minimum: Confidence) -> Self {
         self.min_confidence = minimum;
         self
@@ -120,22 +125,41 @@ mod tests {
         );
     }
 
-    /// Guard: with no `min_confidence`, the gate is off and the verdict is by
-    /// value even for a Low observation. Mutation: change `to_be`'s default from
-    /// `Low` to `High` -> a Low observation becomes Inconclusive instead of
-    /// Pass/Fail -> fails.
+    /// Guard: the default is fail-closed. With no `min_confidence`, a Low
+    /// observation is Inconclusive (not a confident Pass/Fail), and opting down
+    /// to `min_confidence(Low)` is what lets a weak signal be judged by value.
+    /// Mutation: change `to_be`'s default from `High` back to `Low` -> the Low
+    /// observation becomes a confident Pass -> fails. This is the fix for a
+    /// timeout (Low) reading as a confident "boundary held".
     #[test]
-    fn default_expectation_accepts_any_confidence() {
-        let expect_unreachable = Expectation::to_be(false);
+    fn default_requires_high_confidence() {
+        // Default gate: a Low signal cannot reach a confident verdict.
         assert_eq!(
-            judge(&observed(false, Confidence::Low), &expect_unreachable).verdict,
-            Verdict::Pass,
-            "a Low match passes when no minimum is required"
+            judge(
+                &observed(false, Confidence::Low),
+                &Expectation::to_be(false)
+            )
+            .verdict,
+            Verdict::Inconclusive,
+            "a Low observation is Inconclusive under the default gate"
         );
+        // A High signal is judged by value under the default.
         assert_eq!(
-            judge(&observed(true, Confidence::Low), &expect_unreachable).verdict,
-            Verdict::Fail,
-            "a Low mismatch fails when no minimum is required"
+            judge(
+                &observed(false, Confidence::High),
+                &Expectation::to_be(false)
+            )
+            .verdict,
+            Verdict::Pass
+        );
+        // Opting down lets a Low signal be judged by value.
+        assert_eq!(
+            judge(
+                &observed(false, Confidence::Low),
+                &Expectation::to_be(false).min_confidence(Confidence::Low),
+            )
+            .verdict,
+            Verdict::Pass
         );
     }
 

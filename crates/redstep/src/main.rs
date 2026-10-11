@@ -1,4 +1,5 @@
-//! The thin CLI: run every registered security test and report one line each.
+//! The thin CLI: run every registered security test and report each one's
+//! verdict, with its failure reasons indented beneath it.
 //!
 //! The argument surface is deliberately minimal; it grows with the runner in a
 //! later unit (see Decision A's MVP note in docs/specs/design-decisions.md).
@@ -39,6 +40,8 @@ fn main() -> ExitCode {
             println!("             {reason}");
         }
         for judgement in &test.judgements {
+            // Only the non-Pass judgements are a reason worth printing; a Pass
+            // judgement is the absence of a problem, not a line to read.
             if judgement.verdict != redstep::Verdict::Pass {
                 println!(
                     "             {}: expected {}, observed {} ({:?})",

@@ -75,6 +75,10 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
         .into_iter()
         .map(|test| {
             let ctx = TestContext::new(scope.clone());
+            // AssertUnwindSafe is sound here: `ctx`'s judgement sink is only
+            // ever touched by `record`/`take_judgements`, which borrow, mutate
+            // and drop within one statement and never across an `.await`, so an
+            // unwind cannot leave the `RefCell` borrowed or half-written.
             let result =
                 std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
             let judgements = ctx.take_judgements();
@@ -102,35 +106,43 @@ fn ordered(mut tests: Vec<&registry::RegisteredTest>) -> Vec<&registry::Register
 /// Turn a caught test result and its recorded judgements into a verdict and an
 /// optional message. Pure, so the mapping is tested without a runtime.
 ///
-/// A panic or a non-`Check` error means the test could not run to a verdict:
-/// `Error`. A bare `check` failure is `Fail`. Otherwise the verdict is the
-/// aggregate of the recorded judgements.
+/// A recorded `Fail` dominates: a confirmed finding stands even if the body
+/// then errored or panicked, so a breach is never demoted to `Error`. Otherwise
+/// a panic or a non-`Check` error is `Error` (the test could not run to a
+/// verdict), a bare `check` failure is `Fail`, and a clean body takes the
+/// aggregate of its judgements.
 fn classify(
     result: std::thread::Result<crate::Result<()>>,
     judgements: &[Judgement],
 ) -> (Verdict, Option<String>) {
+    let recorded = aggregate(judgements);
     match result {
-        Err(panic) => (Verdict::Error, Some(panic_message(panic))),
-        Ok(Err(Error::Check(message))) => (Verdict::Fail, Some(message)),
-        Ok(Err(other)) => (Verdict::Error, Some(other.to_string())),
-        Ok(Ok(())) => (aggregate(judgements), None),
+        Ok(Ok(())) => (recorded, None),
+        Ok(Err(Error::Check(message))) => (worse_of(recorded, Verdict::Fail), Some(message)),
+        Ok(Err(other)) => (worse_of(recorded, Verdict::Error), Some(other.to_string())),
+        Err(panic) => (
+            worse_of(recorded, Verdict::Error),
+            Some(panic_message(panic)),
+        ),
     }
 }
 
-/// Aggregate a test's judgements: a `Fail` dominates, then an `Inconclusive`,
-/// else `Pass` (including a test that recorded none). Fail-closed: an
-/// unconfirmed judgement never upgrades to Pass.
+/// Aggregate a test's judgements into the most severe. A test that recorded
+/// none is `Inconclusive`, not `Pass`: nothing was proven, so it must not read
+/// as safe (CLAUDE.md row 6). Non-empty takes the max over `Verdict::severity`,
+/// which is where the fail-closed ordering lives.
 fn aggregate(judgements: &[Judgement]) -> Verdict {
-    if judgements.iter().any(|j| j.verdict == Verdict::Fail) {
-        Verdict::Fail
-    } else if judgements
+    judgements
         .iter()
-        .any(|j| j.verdict == Verdict::Inconclusive)
-    {
-        Verdict::Inconclusive
-    } else {
-        Verdict::Pass
-    }
+        .map(|j| j.verdict)
+        .max_by_key(|verdict| verdict.severity())
+        .unwrap_or(Verdict::Inconclusive)
+}
+
+/// The more severe of two verdicts (see `Verdict::severity`), so a recorded
+/// `Fail` is not demoted by a later `Error`.
+fn worse_of(a: Verdict, b: Verdict) -> Verdict {
+    if a.severity() >= b.severity() { a } else { b }
 }
 
 /// Recover a readable message from a panic payload.
@@ -219,12 +231,13 @@ mod tests {
         assert_ne!(summary.exit_code(), 0);
     }
 
-    /// Guard: a panic or a non-Check error is Error, a Check failure is Fail,
-    /// and a clean body takes the aggregate of its judgements. Mutation: map the
-    /// Check arm to Error, or the panic arm to Pass -> fails.
+    /// Guard: a clean body takes the aggregate (an empty body is Inconclusive),
+    /// a Check failure is Fail, and a non-Check error or panic is Error.
+    /// Mutation: map the Check arm to Error, or the Ok arm to a constant Pass ->
+    /// fails.
     #[test]
     fn classify_maps_result_to_verdict() {
-        assert_eq!(classify(Ok(Ok(())), &[]).0, Verdict::Pass);
+        assert_eq!(classify(Ok(Ok(())), &[]).0, Verdict::Inconclusive);
         assert_eq!(
             classify(Ok(Err(Error::Check("nope".into()))), &[]),
             (Verdict::Fail, Some("nope".to_owned()))
@@ -243,12 +256,43 @@ mod tests {
         assert_eq!(classify(Err(panic), &[]).0, Verdict::Error);
     }
 
-    /// Guard: the aggregate is fail-closed: Fail dominates, then Inconclusive,
-    /// else Pass. Mutation: reorder the precedence (Inconclusive before Fail, or
-    /// default to Pass ignoring Fail) -> fails.
+    /// Guard: a recorded Fail is not demoted by a later error or panic (a
+    /// confirmed breach stands). Mutation: drop `worse_of` and return `Error`
+    /// directly in the error/panic arms -> the recorded Fail is lost -> fails.
+    #[test]
+    fn recorded_fail_survives_a_later_error_or_panic() {
+        let fail = [judged(Verdict::Fail)];
+        assert_eq!(
+            classify(
+                Ok(Err(Error::OutOfScope {
+                    spec: "db:5432".into()
+                })),
+                &fail,
+            )
+            .0,
+            Verdict::Fail
+        );
+        let panic: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(classify(Err(panic), &fail).0, Verdict::Fail);
+        // An Inconclusive does NOT survive an error (could-not-run dominates):
+        let inconclusive = [judged(Verdict::Inconclusive)];
+        let panic2: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(classify(Err(panic2), &inconclusive).0, Verdict::Error);
+    }
+
+    /// Guard: a test that recorded no judgement is Inconclusive, not Pass:
+    /// nothing was proven (CLAUDE.md row 6). Mutation: make `aggregate(&[])`
+    /// return Pass -> fails.
+    #[test]
+    fn no_judgement_is_inconclusive() {
+        assert_eq!(aggregate(&[]), Verdict::Inconclusive);
+    }
+
+    /// Guard: the aggregate is fail-closed: Fail dominates Inconclusive
+    /// dominates Pass. Mutation: reorder the precedence (Inconclusive before
+    /// Fail, or ignore Fail) -> fails.
     #[test]
     fn aggregate_is_fail_closed() {
-        assert_eq!(aggregate(&[]), Verdict::Pass);
         assert_eq!(aggregate(&[judged(Verdict::Pass)]), Verdict::Pass);
         assert_eq!(
             aggregate(&[judged(Verdict::Pass), judged(Verdict::Inconclusive)]),
