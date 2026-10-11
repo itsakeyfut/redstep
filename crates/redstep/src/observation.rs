@@ -20,6 +20,23 @@ pub enum Confidence {
     Low,
 }
 
+impl Confidence {
+    /// Whether this is at least as strong as `minimum`. The variants are
+    /// declared strongest first, so a derived `Ord` would be reversed; this
+    /// ranks them explicitly instead (`High` > `Medium` > `Low`).
+    pub fn meets(self, minimum: Confidence) -> bool {
+        self.rank() >= minimum.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Confidence::High => 3,
+            Confidence::Medium => 2,
+            Confidence::Low => 1,
+        }
+    }
+}
+
 /// What a capability observed, and how much to trust it. For a reachability
 /// capability `T` is `bool`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,4 +45,21 @@ pub struct Observation<T> {
     pub value: T,
     /// How much to trust it.
     pub confidence: Confidence,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard: `meets` is "at least as strong", not reversed. Mutation: derive
+    /// `Ord` on the strongest-first declaration and compare with `>=`, or flip
+    /// the `rank` order -> `High.meets(Low)` and `Low.meets(High)` swap -> fails.
+    #[test]
+    fn confidence_meets_is_not_reversed() {
+        assert!(Confidence::High.meets(Confidence::Low));
+        assert!(Confidence::High.meets(Confidence::High));
+        assert!(!Confidence::Low.meets(Confidence::High));
+        assert!(Confidence::Medium.meets(Confidence::Low));
+        assert!(!Confidence::Low.meets(Confidence::Medium));
+    }
 }

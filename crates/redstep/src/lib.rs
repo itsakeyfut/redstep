@@ -29,6 +29,7 @@ mod capability;
 mod context;
 mod error;
 mod evidence;
+mod expectation;
 mod intensity;
 mod observation;
 // `#[doc(hidden)]`: the `#[security_test]` expansion reaches these by path, but
@@ -37,13 +38,16 @@ mod observation;
 pub mod registry;
 mod runner;
 mod scope;
+mod verdict;
 
 pub use capability::{Capability, TcpConnect};
-pub use context::TestContext;
+pub use context::{ExpectationBuilder, TestContext};
 pub use error::{Error, Result};
 pub use evidence::Evidence;
+pub use expectation::{Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
 pub use redstep_macros::security_test;
-pub use runner::{Outcome, RunError, RunSummary, TestRun, run};
+pub use runner::{RunError, RunSummary, TestRun, run};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};
+pub use verdict::Verdict;

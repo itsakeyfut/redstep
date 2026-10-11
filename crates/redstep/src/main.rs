@@ -34,9 +34,20 @@ fn main() -> ExitCode {
     }
 
     for test in &summary.runs {
-        match test.outcome.reason() {
-            Some(reason) => println!("{:<5} {} ({reason})", test.outcome.label(), test.name),
-            None => println!("{:<5} {}", test.outcome.label(), test.name),
+        println!("{:<12} {}", test.verdict.label(), test.name);
+        if let Some(reason) = &test.error {
+            println!("             {reason}");
+        }
+        for judgement in &test.judgements {
+            if judgement.verdict != redstep::Verdict::Pass {
+                println!(
+                    "             {}: expected {}, observed {} ({:?})",
+                    judgement.verdict.label(),
+                    judgement.expected,
+                    judgement.actual,
+                    judgement.confidence,
+                );
+            }
         }
     }
 
