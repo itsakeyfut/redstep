@@ -39,6 +39,9 @@ fn tcp_connect_open_port_observes_reachable() {
     assert_eq!(evidence.target, spec);
     assert_eq!(evidence.intensity, Intensity::Safe);
     assert!(evidence.reachable);
+    // The evidence mirrors the observation it was built from. Mutation: set
+    // evidence.confidence to a fixed value in execute -> this fails.
+    assert_eq!(evidence.confidence, observation.confidence);
 }
 
 /// Guard: a port with no listener observes unreachable (High, a refusal).
@@ -62,4 +65,5 @@ fn tcp_connect_closed_port_observes_unreachable() {
     assert!(!observation.value, "a closed port is unreachable");
     assert_eq!(observation.confidence, Confidence::High);
     assert!(!evidence.reachable);
+    assert_eq!(evidence.confidence, observation.confidence);
 }

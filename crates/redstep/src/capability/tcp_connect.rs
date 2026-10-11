@@ -56,13 +56,10 @@ impl Capability for TcpConnect {
 
     async fn execute(&self) -> crate::Result<(Observation<bool>, Evidence)> {
         let addr = format!("{}:{}", self.target.host(), self.target.port());
-        let outcome =
-            tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(addr)).await;
-        let (connected, timed_out) = match outcome {
-            Ok(Ok(_stream)) => (true, false),
-            Ok(Err(_io)) => (false, false),
-            Err(_elapsed) => (false, true),
-        };
+        let (connected, timed_out) = connect_flags(self.timeout, async move {
+            tokio::net::TcpStream::connect(addr).await.map(|_stream| ())
+        })
+        .await;
 
         let observation = classify_connect(connected, timed_out);
         let evidence = Evidence {
@@ -73,6 +70,22 @@ impl Capability for TcpConnect {
             confidence: observation.confidence,
         };
         Ok((observation, evidence))
+    }
+}
+
+/// Drive a connect future under a timeout and reduce it to two flags:
+/// `(connected, timed_out)`. Generic over the future so the three outcomes are
+/// tested with `ready`/`pending` rather than a real socket: a future that
+/// resolves `Ok` connected, one that resolves `Err` was refused, and one that
+/// never resolves times out.
+async fn connect_flags<F>(timeout: Duration, connect: F) -> (bool, bool)
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(timeout, connect).await {
+        Ok(Ok(())) => (true, false),
+        Ok(Err(_io)) => (false, false),
+        Err(_elapsed) => (false, true),
     }
 }
 
@@ -109,6 +122,47 @@ mod tests {
     /// confidence. Mutation: swap the reachable value, or raise the timeout
     /// confidence to High -> fails. This is where the reachable/unreachable
     /// mapping and the weak-timeout-signal rule are pinned, without a socket.
+    fn time_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime with time builds")
+    }
+
+    /// Guard: `connect_flags` reduces each connect outcome to the right flags,
+    /// deterministically and without a socket. Mutation: change the timeout arm
+    /// to `(false, false)` -> `connect_flags_times_out` fails; swap the Ok/Err
+    /// arms -> the connected/refused cases fail. This guards the wiring that a
+    /// real socket's timeout feeds `classify_connect`.
+    #[test]
+    fn connect_flags_reduces_each_outcome() {
+        let rt = time_runtime();
+        assert_eq!(
+            rt.block_on(connect_flags(
+                Duration::from_secs(5),
+                std::future::ready(Ok(()))
+            )),
+            (true, false),
+            "a connect that resolves Ok is connected"
+        );
+        assert_eq!(
+            rt.block_on(connect_flags(
+                Duration::from_secs(5),
+                std::future::ready(Err(std::io::ErrorKind::ConnectionRefused.into())),
+            )),
+            (false, false),
+            "a connect that resolves Err was refused, not timed out"
+        );
+        assert_eq!(
+            rt.block_on(connect_flags(
+                Duration::from_millis(10),
+                std::future::pending::<std::io::Result<()>>(),
+            )),
+            (false, true),
+            "a connect that never resolves times out"
+        );
+    }
+
     #[test]
     fn classify_connect_maps_outcome_to_confidence() {
         assert_eq!(
