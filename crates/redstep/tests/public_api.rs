@@ -6,7 +6,9 @@
 //! also exercise the full `#[security_test]` expansion, which references this
 //! crate as `::redstep`.
 
-use redstep::{Outcome, RunSummary, Scope, TestContext, run, security_test};
+use redstep::{
+    Confidence, Observation, RunSummary, Scope, TestContext, Verdict, run, security_test,
+};
 
 /// A tautology: should pass.
 #[security_test]
@@ -15,21 +17,21 @@ async fn tautology_demo(ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
-/// A failed check: should map to Failed.
+/// A failed check: should verdict Fail.
 #[security_test]
 async fn failing_demo(ctx: &TestContext) -> redstep::Result<()> {
     ctx.check(false, "deliberately false")?;
     Ok(())
 }
 
-/// A panic: should be caught and mapped to Errored, not abort the run.
+/// A panic: should be caught and verdict Error, not abort the run.
 #[security_test]
 async fn panicking_demo(_ctx: &TestContext) -> redstep::Result<()> {
     panic!("deliberate panic in a demo test");
 }
 
 /// Resolving an out-of-scope target errors before a target is produced; that
-/// error maps to Errored.
+/// error verdicts Error.
 #[security_test]
 async fn out_of_scope_demo(ctx: &TestContext) -> redstep::Result<()> {
     let _target = ctx.resolve("db:5432")?;
@@ -45,39 +47,117 @@ async fn in_scope_resolve_demo(ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
-/// The outcome of the discovered test whose name ends with `suffix`.
-fn outcome_of<'a>(summary: &'a RunSummary, suffix: &str) -> &'a Outcome {
-    &summary
+/// An expectation an observation violates: the expect path verdicts Fail and
+/// the body still returns Ok, so the verdict comes from the recorded judgement.
+#[security_test]
+async fn expect_fail_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: true,
+        confidence: Confidence::High,
+    };
+    ctx.expect(&observed).to_be(false);
+    Ok(())
+}
+
+/// An observation too weak for the required confidence: the expect path
+/// verdicts Inconclusive, which must surface as the run verdict.
+#[security_test]
+async fn expect_inconclusive_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: false,
+        confidence: Confidence::Low,
+    };
+    ctx.expect(&observed)
+        .min_confidence(Confidence::High)
+        .to_be(false);
+    Ok(())
+}
+
+/// A High observation that matches the expectation verdicts Pass through the
+/// expect path end to end.
+#[security_test]
+async fn expect_pass_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: false,
+        confidence: Confidence::High,
+    };
+    ctx.expect(&observed).to_be(false);
+    Ok(())
+}
+
+/// A Low observation with no explicit minimum: the default gate requires High,
+/// so this is Inconclusive, not a confident Pass. This is the fail-closed
+/// default that keeps a timeout (Low) from reading as "the boundary held".
+#[security_test]
+async fn default_gate_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observed = Observation {
+        value: false,
+        confidence: Confidence::Low,
+    };
+    ctx.expect(&observed).to_be(false);
+    Ok(())
+}
+
+/// A test that asserts nothing: Inconclusive, not Pass. Nothing was proven.
+#[security_test]
+async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
+    Ok(())
+}
+
+/// The verdict of the discovered test whose name ends with `suffix`.
+fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
+    summary
         .runs
         .iter()
         .find(|r| r.name.ends_with(suffix))
         .unwrap_or_else(|| panic!("test {suffix} was not discovered"))
-        .outcome
+        .verdict
 }
 
-/// Guard: every `#[security_test]` is discovered by the runner and its result
-/// maps to the right outcome, including a panic caught without aborting the
-/// run. Mutation: make the macro omit its `inventory::submit!` -> the demos are
-/// absent from the summary -> the lookups panic -> fails. The caught panic
-/// (panicking_demo) does not abort the run, so the later tautology_demo still
-/// reports Passed.
+/// Guard: every `#[security_test]` is discovered and its verdict is right,
+/// including a caught panic (Error) and the three-valued expect path (Fail and
+/// Inconclusive surface as run verdicts). Mutation: make the macro omit its
+/// `inventory::submit!` -> the demos are absent -> the lookups panic. The caught
+/// panic does not abort the run, so the later tautology_demo still verdicts
+/// Pass.
 #[test]
-fn registered_tests_are_discovered_and_executed_with_mapped_outcomes() {
+fn registered_tests_are_discovered_and_executed_with_mapped_verdicts() {
     let summary: RunSummary = run(Scope::default()).expect("the runtime starts");
 
-    assert_eq!(*outcome_of(&summary, "::tautology_demo"), Outcome::Passed);
-    assert!(matches!(
-        outcome_of(&summary, "::failing_demo"),
-        Outcome::Failed(_)
-    ));
-    assert!(matches!(
-        outcome_of(&summary, "::panicking_demo"),
-        Outcome::Errored(_)
-    ));
-    assert!(matches!(
-        outcome_of(&summary, "::out_of_scope_demo"),
-        Outcome::Errored(_)
-    ));
+    assert_eq!(verdict_of(&summary, "::tautology_demo"), Verdict::Pass);
+    assert_eq!(verdict_of(&summary, "::failing_demo"), Verdict::Fail);
+    assert_eq!(verdict_of(&summary, "::panicking_demo"), Verdict::Error);
+    assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
+    assert_eq!(verdict_of(&summary, "::expect_fail_demo"), Verdict::Fail);
+    assert_eq!(verdict_of(&summary, "::expect_pass_demo"), Verdict::Pass);
+    assert_eq!(
+        verdict_of(&summary, "::expect_inconclusive_demo"),
+        Verdict::Inconclusive
+    );
+    assert_eq!(
+        verdict_of(&summary, "::default_gate_demo"),
+        Verdict::Inconclusive,
+        "a Low observation with no explicit minimum is Inconclusive, not a confident Pass"
+    );
+    assert_eq!(
+        verdict_of(&summary, "::no_assertion_demo"),
+        Verdict::Inconclusive,
+        "a test that asserts nothing proved nothing"
+    );
+
+    // The judgement reason survives into the summary (not dropped). Mutation:
+    // build TestRun with `judgements: Vec::new()` -> this find fails.
+    let expect_fail = summary
+        .runs
+        .iter()
+        .find(|r| r.name.ends_with("::expect_fail_demo"))
+        .expect("discovered");
+    let judgement = expect_fail
+        .judgements
+        .first()
+        .expect("expect_fail_demo recorded a judgement");
+    assert_eq!(judgement.expected, "false");
+    assert_eq!(judgement.actual, "true");
 }
 
 /// Guard: `run` hands its scope to the tests. Mutation: make `run` discard the
@@ -91,13 +171,10 @@ fn run_passes_the_scope_to_tests() {
     let summary = run(scope).expect("the runtime starts");
 
     assert_eq!(
-        *outcome_of(&summary, "::in_scope_resolve_demo"),
-        Outcome::Passed
+        verdict_of(&summary, "::in_scope_resolve_demo"),
+        Verdict::Pass
     );
-    assert!(matches!(
-        outcome_of(&summary, "::out_of_scope_demo"),
-        Outcome::Errored(_)
-    ));
+    assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
 }
 
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's

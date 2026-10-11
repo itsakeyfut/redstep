@@ -9,9 +9,9 @@
 pub enum Error {
     /// The target was not in the scope allowlist. Resolution yields no
     /// `ScopedTarget`, so nothing can act on it (docs/rules/security.md section
-    /// 2); the runner maps a test that returns this to `Errored`. A test that
-    /// matches on the `Result` could handle it instead of propagating, but it
-    /// can never turn it into a reachable target.
+    /// 2); the runner maps a test that returns this to `Verdict::Error`. A test
+    /// that matches on the `Result` could handle it instead of propagating, but
+    /// it can never turn it into a reachable target.
     #[error("target {spec:?} is out of scope")]
     OutOfScope {
         /// The rejected target specification, as given.
@@ -27,9 +27,9 @@ pub enum Error {
         reason: String,
     },
 
-    /// A `TestContext::check` assertion did not hold. This is the minimal
-    /// assertion channel for the runner MVP; the verdict oracle (Decision J)
-    /// supersedes it.
+    /// A `TestContext::check` assertion did not hold, stopping the test. `check`
+    /// is the bare-boolean channel; the oracle's `expect` (Decision J) is the
+    /// path for an assertion over an observation, with the confidence gate.
     #[error("check failed: {0}")]
     Check(String),
 

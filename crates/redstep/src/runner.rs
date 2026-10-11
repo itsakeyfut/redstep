@@ -3,64 +3,29 @@
 //! Execution is sequential, in name order, one test at a time on a single
 //! current-thread runtime: deterministic and safe against a shared lab target.
 //! Each test runs inside `catch_unwind`, so one test's panic cannot abort the
-//! run and is never read as a pass.
+//! run and is never read as a pass. Each test gets its own `TestContext`, so the
+//! judgements it records are its own.
 
 use crate::TestContext;
 use crate::error::Error;
+use crate::expectation::Judgement;
 use crate::registry;
 use crate::scope::Scope;
+use crate::verdict::Verdict;
 use std::panic::AssertUnwindSafe;
 
-/// What became of one test.
-///
-/// `#[non_exhaustive]`, so a downstream match needs a wildcard. Inside this
-/// crate `label` and `reason` match it totally, so a new variant is a compile
-/// error there (docs/rules/design.md section 5). `RunSummary::exit_code` does
-/// not match it; it compares to `Passed`, so it fails closed, counting any new
-/// variant as non-passing until that site is updated. The names (`Outcome`,
-/// `Passed`/`Failed`/`Errored`) are MVP placeholders to reconcile with the
-/// verdict model (Decision J) and `Evidence`'s own `Outcome` (Decision D) when
-/// those land.
-#[derive(Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Outcome {
-    /// The test returned `Ok(())`.
-    Passed,
-    /// The test returned [`Error::Check`]: an assertion did not hold.
-    Failed(String),
-    /// The test returned any other error, or panicked. A test that could not
-    /// run is never a pass (CLAUDE.md row 6).
-    Errored(String),
-}
-
-impl Outcome {
-    /// A short label for a report line (`ok` / `FAIL` / `ERROR`). Matched
-    /// totally here, in the crate that owns `Outcome`, so a new variant is a
-    /// compile error at this site rather than a silently unlabelled outcome.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Outcome::Passed => "ok",
-            Outcome::Failed(_) => "FAIL",
-            Outcome::Errored(_) => "ERROR",
-        }
-    }
-
-    /// The failure reason, if this outcome carries one.
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Outcome::Passed => None,
-            Outcome::Failed(reason) | Outcome::Errored(reason) => Some(reason),
-        }
-    }
-}
-
-/// One test's name and outcome.
+/// One test's name, its verdict, and why: the judgements its expectations
+/// produced, and a message when it failed a bare check or could not run.
 #[derive(Debug)]
 pub struct TestRun {
     /// The fully-qualified test name.
     pub name: &'static str,
-    /// What became of it.
-    pub outcome: Outcome,
+    /// The test's verdict.
+    pub verdict: Verdict,
+    /// The judgements recorded by `expect`, in the order declared.
+    pub judgements: Vec<Judgement>,
+    /// A message for a bare `check` failure, an error, or a panic.
+    pub error: Option<String>,
 }
 
 /// The result of running every discovered test.
@@ -71,17 +36,16 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    /// `0` only when at least one test ran and every one passed; non-zero when
-    /// any failed or errored, and non-zero for an empty run.
+    /// `0` only when at least one test ran and every verdict is `Pass`;
+    /// non-zero otherwise.
     ///
-    /// An empty run is not a pass. "Nothing was discovered" must not read as
-    /// "all clear": a vacuous `all()` over no tests would return `0`, and since
-    /// the shipped binary links no tests and any discovery failure yields an
-    /// empty run, that would turn a non-run into a green CI gate (a false PASS,
-    /// CLAUDE.md row 6). Errored is non-passing for the same reason: a test that
-    /// could not run must not read as safe.
+    /// `Fail`, `Error`, and `Inconclusive` are all non-zero. Inconclusive is
+    /// non-zero on purpose: an unconfirmed result must not read as a green gate
+    /// (CLAUDE.md row 6). An empty run is not a pass either: "nothing was
+    /// discovered" must not read as "all clear" (a vacuous `all()` over no runs
+    /// would return `0`), and the shipped binary links no tests.
     pub fn exit_code(&self) -> i32 {
-        if !self.runs.is_empty() && self.runs.iter().all(|r| r.outcome == Outcome::Passed) {
+        if !self.runs.is_empty() && self.runs.iter().all(|r| r.verdict == Verdict::Pass) {
             0
         } else {
             1
@@ -89,7 +53,7 @@ impl RunSummary {
     }
 }
 
-/// A fatal error that stops the whole run before any test outcome exists.
+/// A fatal error that stops the whole run before any test verdict exists.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RunError {
@@ -98,23 +62,32 @@ pub enum RunError {
     Runtime(#[source] std::io::Error),
 }
 
-/// Discover every registered test and run it against a context over `scope`.
+/// Discover every registered test and run it, each against its own context over
+/// a clone of `scope`.
 pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(RunError::Runtime)?;
-    let ctx = TestContext::new(scope);
 
     let tests = ordered(registry::all().collect());
 
     let runs = tests
         .into_iter()
         .map(|test| {
+            let ctx = TestContext::new(scope.clone());
+            // AssertUnwindSafe is sound here: `ctx`'s judgement sink is only
+            // ever touched by `record`/`take_judgements`, which borrow, mutate
+            // and drop within one statement and never across an `.await`, so an
+            // unwind cannot leave the `RefCell` borrowed or half-written.
             let result =
                 std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
+            let judgements = ctx.take_judgements();
+            let (verdict, error) = classify(result, &judgements);
             TestRun {
                 name: test.name,
-                outcome: classify(result),
+                verdict,
+                judgements,
+                error,
             }
         })
         .collect();
@@ -130,15 +103,46 @@ fn ordered(mut tests: Vec<&registry::RegisteredTest>) -> Vec<&registry::Register
     tests
 }
 
-/// Map a caught test result to an [`Outcome`]. Pure, so the mapping is tested
-/// without a runtime or the registry.
-fn classify(result: std::thread::Result<crate::Result<()>>) -> Outcome {
+/// Turn a caught test result and its recorded judgements into a verdict and an
+/// optional message. Pure, so the mapping is tested without a runtime.
+///
+/// A recorded `Fail` dominates: a confirmed finding stands even if the body
+/// then errored or panicked, so a breach is never demoted to `Error`. Otherwise
+/// a panic or a non-`Check` error is `Error` (the test could not run to a
+/// verdict), a bare `check` failure is `Fail`, and a clean body takes the
+/// aggregate of its judgements.
+fn classify(
+    result: std::thread::Result<crate::Result<()>>,
+    judgements: &[Judgement],
+) -> (Verdict, Option<String>) {
+    let recorded = aggregate(judgements);
     match result {
-        Ok(Ok(())) => Outcome::Passed,
-        Ok(Err(Error::Check(message))) => Outcome::Failed(message),
-        Ok(Err(other)) => Outcome::Errored(other.to_string()),
-        Err(panic) => Outcome::Errored(panic_message(panic)),
+        Ok(Ok(())) => (recorded, None),
+        Ok(Err(Error::Check(message))) => (worse_of(recorded, Verdict::Fail), Some(message)),
+        Ok(Err(other)) => (worse_of(recorded, Verdict::Error), Some(other.to_string())),
+        Err(panic) => (
+            worse_of(recorded, Verdict::Error),
+            Some(panic_message(panic)),
+        ),
     }
+}
+
+/// Aggregate a test's judgements into the most severe. A test that recorded
+/// none is `Inconclusive`, not `Pass`: nothing was proven, so it must not read
+/// as safe (CLAUDE.md row 6). Non-empty takes the max over `Verdict::severity`,
+/// which is where the fail-closed ordering lives.
+fn aggregate(judgements: &[Judgement]) -> Verdict {
+    judgements
+        .iter()
+        .map(|j| j.verdict)
+        .max_by_key(|verdict| verdict.severity())
+        .unwrap_or(Verdict::Inconclusive)
+}
+
+/// The more severe of two verdicts (see `Verdict::severity`), so a recorded
+/// `Fail` is not demoted by a later `Error`.
+fn worse_of(a: Verdict, b: Verdict) -> Verdict {
+    if a.severity() >= b.severity() { a } else { b }
 }
 
 /// Recover a readable message from a panic payload.
@@ -155,156 +159,158 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observation::Confidence;
 
-    /// Guard: the summary exits zero only when every test passed. Mutation:
-    /// change `all` to `any` in `exit_code` -> a summary with one failure
-    /// exits zero -> fails.
+    fn run_of(name: &'static str, verdict: Verdict) -> TestRun {
+        TestRun {
+            name,
+            verdict,
+            judgements: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn judged(verdict: Verdict) -> Judgement {
+        Judgement {
+            verdict,
+            expected: "x".to_owned(),
+            actual: "y".to_owned(),
+            confidence: Confidence::High,
+        }
+    }
+
+    /// Guard: the summary exits zero only when every verdict is Pass. Mutation:
+    /// treat Fail as Pass in `exit_code` -> a failing run exits zero -> fails.
     #[test]
-    fn failed_run_exits_nonzero() {
+    fn fail_run_exits_nonzero() {
+        let summary = RunSummary {
+            runs: vec![run_of("a", Verdict::Pass), run_of("b", Verdict::Fail)],
+        };
+        assert_ne!(summary.exit_code(), 0);
+    }
+
+    /// Guard: an Inconclusive run exits non-zero, like Fail (an unconfirmed pass
+    /// is not a green gate, CLAUDE.md row 6). Mutation: treat Inconclusive as
+    /// Pass in `exit_code` -> exits zero -> fails.
+    #[test]
+    fn inconclusive_run_exits_nonzero() {
         let summary = RunSummary {
             runs: vec![
-                TestRun {
-                    name: "a",
-                    outcome: Outcome::Passed,
-                },
-                TestRun {
-                    name: "b",
-                    outcome: Outcome::Failed("x".into()),
-                },
+                run_of("a", Verdict::Pass),
+                run_of("b", Verdict::Inconclusive),
             ],
         };
         assert_ne!(summary.exit_code(), 0);
     }
 
-    /// Guard: an errored test makes the run exit non-zero, exactly like a
-    /// failure (CLAUDE.md row 6). Mutation: treat `Errored` as passing in
-    /// `exit_code` -> this exits zero -> fails.
+    /// Guard: an errored run exits non-zero. Mutation: treat Error as Pass ->
+    /// exits zero -> fails.
     #[test]
     fn errored_run_exits_nonzero() {
         let summary = RunSummary {
-            runs: vec![
-                TestRun {
-                    name: "a",
-                    outcome: Outcome::Passed,
-                },
-                TestRun {
-                    name: "b",
-                    outcome: Outcome::Errored("boom".into()),
-                },
-            ],
+            runs: vec![run_of("a", Verdict::Error)],
         };
         assert_ne!(summary.exit_code(), 0);
     }
 
-    /// Guard: an empty run (nothing discovered) is not a pass. Mutation: drop
-    /// the `!is_empty()` term from `exit_code` -> a run that discovered nothing
-    /// exits zero -> fails. This is the row-6 false PASS an empty discovery
-    /// (the shipped binary, a broken registration, a filter that matches
-    /// nothing) would otherwise report as all-clear.
+    /// Guard: an all-passed run exits zero. Mutation: make `exit_code` always
+    /// return 1 -> fails.
+    #[test]
+    fn all_passed_run_exits_zero() {
+        let summary = RunSummary {
+            runs: vec![run_of("a", Verdict::Pass)],
+        };
+        assert_eq!(summary.exit_code(), 0);
+    }
+
+    /// Guard: an empty run is not a pass. Mutation: drop the `!is_empty()` term
+    /// -> an empty run exits zero -> fails.
     #[test]
     fn empty_run_does_not_pass() {
         let summary = RunSummary { runs: vec![] };
         assert_ne!(summary.exit_code(), 0);
     }
 
-    /// Guard: an all-passed summary exits zero. Mutation: make `exit_code`
-    /// always return 1 -> fails.
+    /// Guard: a clean body takes the aggregate (an empty body is Inconclusive),
+    /// a Check failure is Fail, and a non-Check error or panic is Error.
+    /// Mutation: map the Check arm to Error, or the Ok arm to a constant Pass ->
+    /// fails.
     #[test]
-    fn all_passed_run_exits_zero() {
-        let summary = RunSummary {
-            runs: vec![TestRun {
-                name: "a",
-                outcome: Outcome::Passed,
-            }],
-        };
-        assert_eq!(summary.exit_code(), 0);
-    }
-
-    /// Guard: classify maps `Ok(Ok(()))` to Passed. Mutation: map it to Failed
-    /// -> fails.
-    #[test]
-    fn classify_ok_is_passed() {
-        assert_eq!(classify(Ok(Ok(()))), Outcome::Passed);
-    }
-
-    /// Guard: classify maps a `Check` error to Failed carrying its message.
-    /// Mutation: map `Check` to Errored -> fails.
-    #[test]
-    fn classify_check_error_is_failed() {
+    fn classify_maps_result_to_verdict() {
+        assert_eq!(classify(Ok(Ok(())), &[]).0, Verdict::Inconclusive);
         assert_eq!(
-            classify(Ok(Err(Error::Check("nope".into())))),
-            Outcome::Failed("nope".into())
+            classify(Ok(Err(Error::Check("nope".into()))), &[]),
+            (Verdict::Fail, Some("nope".to_owned()))
         );
-    }
-
-    /// Guard: classify maps any non-`Check` error to Errored. Mutation: map it
-    /// to Failed or Passed -> fails.
-    #[test]
-    fn classify_other_error_is_errored() {
-        let out = classify(Ok(Err(Error::OutOfScope {
-            spec: "db:5432".into(),
-        })));
-        assert!(matches!(out, Outcome::Errored(_)));
-    }
-
-    /// Guard: classify maps a `&str` panic to Errored carrying the message.
-    /// Mutation: map the panic arm to Passed -> a panicking test reads as safe
-    /// -> fails.
-    #[test]
-    fn classify_panic_is_errored() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(classify(Err(payload)), Outcome::Errored("kaboom".into()));
-    }
-
-    /// Guard: a `String` panic payload keeps its message. Mutation: replace the
-    /// `String` arm of `panic_message` -> the message is lost -> fails.
-    /// `panic!("{}", x)` produces a `String`, not a `&str`, so this arm is the
-    /// common one.
-    #[test]
-    fn classify_string_panic_keeps_message() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
         assert_eq!(
-            classify(Err(payload)),
-            Outcome::Errored("owned boom".into())
+            classify(
+                Ok(Err(Error::OutOfScope {
+                    spec: "db:5432".into()
+                })),
+                &[]
+            )
+            .0,
+            Verdict::Error
         );
+        let panic: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(classify(Err(panic), &[]).0, Verdict::Error);
     }
 
-    /// Guard: a non-string panic payload still errors, with a generic message.
-    /// Mutation: change the fallback string -> fails; map the fallback to Passed
-    /// -> a `panic_any(non_string)` reads as safe -> fails.
+    /// Guard: a recorded Fail is not demoted by a later error or panic (a
+    /// confirmed breach stands). Mutation: drop `worse_of` and return `Error`
+    /// directly in the error/panic arms -> the recorded Fail is lost -> fails.
     #[test]
-    fn classify_nonstring_panic_is_generic_errored() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+    fn recorded_fail_survives_a_later_error_or_panic() {
+        let fail = [judged(Verdict::Fail)];
         assert_eq!(
-            classify(Err(payload)),
-            Outcome::Errored("test panicked".into())
+            classify(
+                Ok(Err(Error::OutOfScope {
+                    spec: "db:5432".into()
+                })),
+                &fail,
+            )
+            .0,
+            Verdict::Fail
         );
+        let panic: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(classify(Err(panic), &fail).0, Verdict::Fail);
+        // An Inconclusive does NOT survive an error (could-not-run dominates):
+        let inconclusive = [judged(Verdict::Inconclusive)];
+        let panic2: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(classify(Err(panic2), &inconclusive).0, Verdict::Error);
     }
 
-    /// Guard: each outcome has its own report label. Mutation: return the same
-    /// label for every variant (e.g. `""`) -> this fails. The label is what a
-    /// reader greps a run's output for.
+    /// Guard: a test that recorded no judgement is Inconclusive, not Pass:
+    /// nothing was proven (CLAUDE.md row 6). Mutation: make `aggregate(&[])`
+    /// return Pass -> fails.
     #[test]
-    fn outcome_labels_are_distinct() {
-        assert_eq!(Outcome::Passed.label(), "ok");
-        assert_eq!(Outcome::Failed("x".into()).label(), "FAIL");
-        assert_eq!(Outcome::Errored("y".into()).label(), "ERROR");
+    fn no_judgement_is_inconclusive() {
+        assert_eq!(aggregate(&[]), Verdict::Inconclusive);
     }
 
-    /// Guard: only a failed or errored outcome carries a reason, and it is the
-    /// carried string. Mutation: return `Some` for Passed, or `None` for a
-    /// failure -> this fails.
+    /// Guard: the aggregate is fail-closed: Fail dominates Inconclusive
+    /// dominates Pass. Mutation: reorder the precedence (Inconclusive before
+    /// Fail, or ignore Fail) -> fails.
     #[test]
-    fn outcome_reason_is_the_failure_message() {
-        assert_eq!(Outcome::Passed.reason(), None);
-        assert_eq!(Outcome::Failed("boom".into()).reason(), Some("boom"));
-        assert_eq!(Outcome::Errored("boom".into()).reason(), Some("boom"));
+    fn aggregate_is_fail_closed() {
+        assert_eq!(aggregate(&[judged(Verdict::Pass)]), Verdict::Pass);
+        assert_eq!(
+            aggregate(&[judged(Verdict::Pass), judged(Verdict::Inconclusive)]),
+            Verdict::Inconclusive
+        );
+        assert_eq!(
+            aggregate(&[
+                judged(Verdict::Pass),
+                judged(Verdict::Inconclusive),
+                judged(Verdict::Fail),
+            ]),
+            Verdict::Fail
+        );
     }
 
     /// Guard: `ordered` sorts tests by name regardless of input order.
     /// Mutation: drop the `sort_by_key` -> the unsorted input comes back
-    /// unsorted -> this fails. An end-to-end order check cannot catch this: the
-    /// registry's iteration order is unspecified and happened to be sorted.
+    /// unsorted -> this fails.
     #[test]
     fn ordered_sorts_by_name() {
         fn stub(_: &TestContext) -> registry::TestFuture<'_> {

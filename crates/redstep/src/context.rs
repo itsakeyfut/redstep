@@ -1,36 +1,46 @@
 //! The entry point a security test is handed.
 //!
-//! For the runner MVP it holds the scope and offers resolution, a minimal
-//! assertion, and running a capability. A capability *registry* (the plugin
-//! side of Decision B) and the evidence *sink* (Decision D, recording into the
-//! context rather than returning the record) are later; `run` returns the
-//! evidence for now.
+//! It holds the scope and offers resolution, a bare assertion (`check`),
+//! running a capability (`run`), and declaring an expectation over an
+//! observation (`expect`, the oracle entry). It records each expectation's
+//! [`Judgement`] in an interior-mutable sink the runner drains per test; a
+//! capability *registry* (the plugin side of Decision B) and the *evidence*
+//! sink (Decision D, recording the evidence record rather than returning it)
+//! are still later.
 //!
 //! A test holds `&TestContext` (the `#[security_test]` signature and
-//! `registry::TestFn` both take a shared reference), so the evidence sink, when
-//! it lands, records through a shared `&self` and must be interior-mutable
-//! (a `RefCell`; a `Mutex` only if tests ever run concurrently, which the
-//! runner's sequential model rules out). A `RefCell` borrow must not be held
-//! across an `.await`, or a capability that records mid-await re-enters the
-//! borrow and panics. Keep a record as borrow / push / drop.
+//! `registry::TestFn` both take a shared reference), so the sink records
+//! through a shared `&self` and is interior-mutable (a `RefCell`; a `Mutex`
+//! only if tests ever run concurrently, which the runner's sequential model
+//! rules out). A `RefCell` borrow must not be held across an `.await`:
+//! `record` is borrow / push / drop, with no await in between.
+
+use std::cell::RefCell;
+use std::fmt::Debug;
 
 use crate::capability::Capability;
 use crate::error::{Error, Result};
 use crate::evidence::Evidence;
+use crate::expectation::{Expectation, Judgement, judge};
 use crate::intensity::Intensity;
-use crate::observation::Observation;
+use crate::observation::{Confidence, Observation};
 use crate::scope::{Scope, ScopedTarget};
+use crate::verdict::Verdict;
 
 /// What a `#[security_test]` receives: `async fn NAME(ctx: &TestContext) -> redstep::Result<()>`.
 pub struct TestContext {
     scope: Scope,
+    judgements: RefCell<Vec<Judgement>>,
 }
 
 impl TestContext {
-    /// Build a context over a resolved scope. The runner builds one per run;
+    /// Build a context over a resolved scope. The runner builds one per test;
     /// a test constructs one directly.
     pub fn new(scope: Scope) -> Self {
-        Self { scope }
+        Self {
+            scope,
+            judgements: RefCell::new(Vec::new()),
+        }
     }
 
     /// Resolve a `host:port` target through the scope gate. An out-of-scope or
@@ -40,16 +50,59 @@ impl TestContext {
         self.scope.resolve(spec)
     }
 
-    /// The minimal assertion for the runner MVP: `Ok(())` when the condition
-    /// holds, [`Error::Check`] otherwise. The verdict oracle (Decision J)
-    /// replaces this with Observation and Expectation; it exists now so a test
-    /// can fail as an `Err` rather than a panic.
+    /// A bare boolean assertion, for a plain condition that is not an
+    /// observation: records a `Pass` judgement when it holds and a `Fail`
+    /// (returning [`Error::Check`], which stops the test) when it does not. It
+    /// is confidence-blind, so a weak signal gets a confident verdict; use
+    /// [`expect`](Self::expect) for anything observed, where the confidence gate
+    /// applies. A test that records no judgement at all is `Inconclusive`, so a
+    /// passing `check` is what makes a check-only test `Pass`.
     pub fn check(&self, condition: bool, message: &str) -> Result<()> {
+        let verdict = if condition {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        };
+        self.record(Judgement {
+            verdict,
+            expected: "condition holds".to_owned(),
+            actual: message.to_owned(),
+            confidence: Confidence::High,
+        });
         if condition {
             Ok(())
         } else {
             Err(Error::Check(message.to_owned()))
         }
+    }
+
+    /// Declare an expectation over an observation. The oracle judges it, records
+    /// the [`Judgement`] (the runner aggregates the recorded judgements into the
+    /// test's verdict), and returns the [`Verdict`]. The body continues, so
+    /// several expectations accumulate (See Decision J).
+    ///
+    /// ```ignore
+    /// let verdict = ctx.expect(&observation).to_be(false);                      // requires High by default
+    /// let verdict = ctx.expect(&observation).min_confidence(Confidence::Low).to_be(false);  // opt down
+    /// ```
+    pub fn expect<'a, T>(&'a self, observation: &'a Observation<T>) -> ExpectationBuilder<'a, T> {
+        ExpectationBuilder {
+            ctx: self,
+            observation,
+            min_confidence: Confidence::High,
+        }
+    }
+
+    /// Record a judgement in the sink. Borrow, push, drop: no await is held
+    /// across the borrow.
+    fn record(&self, judgement: Judgement) {
+        self.judgements.borrow_mut().push(judgement);
+    }
+
+    /// Drain the judgements recorded during one test. The runner calls this
+    /// after the test body to aggregate them into the verdict.
+    pub(crate) fn take_judgements(&self) -> Vec<Judgement> {
+        std::mem::take(&mut self.judgements.borrow_mut())
     }
 
     /// Run a capability and return its observation and evidence.
@@ -77,6 +130,39 @@ impl TestContext {
             });
         }
         capability.execute().await
+    }
+}
+
+/// Builds an expectation over an observation and judges it. Returned by
+/// [`TestContext::expect`]; `min_confidence` is optional (default: require
+/// `High`), and `to_be` is the terminal that judges, records the judgement, and
+/// returns the verdict.
+///
+/// `#[must_use]`: a builder dropped without calling `to_be` records nothing, so
+/// a forgotten terminal would silently assert nothing. The warning turns that
+/// into a compile-time catch rather than a vacuous `Inconclusive`.
+#[must_use = "call .to_be(expected) to judge and record the expectation"]
+pub struct ExpectationBuilder<'a, T> {
+    ctx: &'a TestContext,
+    observation: &'a Observation<T>,
+    min_confidence: Confidence,
+}
+
+impl<'a, T: PartialEq + Debug> ExpectationBuilder<'a, T> {
+    /// Require at least this confidence; a weaker observation is `Inconclusive`.
+    pub fn min_confidence(mut self, minimum: Confidence) -> Self {
+        self.min_confidence = minimum;
+        self
+    }
+
+    /// Expect the observed value to be `expected`. Judges, records the
+    /// judgement, and returns the verdict.
+    pub fn to_be(self, expected: T) -> Verdict {
+        let expectation = Expectation::to_be(expected).min_confidence(self.min_confidence);
+        let judgement = judge(self.observation, &expectation);
+        let verdict = judgement.verdict;
+        self.ctx.record(judgement);
+        verdict
     }
 }
 
