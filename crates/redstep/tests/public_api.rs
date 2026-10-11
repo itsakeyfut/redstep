@@ -53,6 +53,10 @@ fn registered_tests_are_discovered_and_executed_with_mapped_outcomes() {
             .outcome
     };
 
+    // Discovery and outcome mapping. Mutation: make the macro omit its
+    // `inventory::submit!` -> the demos are absent -> the lookups panic. The
+    // caught panic (panicking_demo) does not abort the run, so the later
+    // tautology_demo still reports Passed.
     assert_eq!(*outcome("::tautology_demo"), Outcome::Passed);
     assert!(matches!(outcome("::failing_demo"), Outcome::Failed(_)));
     assert!(matches!(outcome("::panicking_demo"), Outcome::Errored(_)));

@@ -94,8 +94,7 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
         .map_err(RunError::Runtime)?;
     let ctx = TestContext::new(scope);
 
-    let mut tests: Vec<&'static registry::RegisteredTest> = registry::all().collect();
-    tests.sort_by_key(|t| t.name);
+    let tests = ordered(registry::all().collect());
 
     let runs = tests
         .into_iter()
@@ -110,6 +109,14 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
         .collect();
 
     Ok(RunSummary { runs })
+}
+
+/// Order tests by name, so a run reports in a stable, deterministic order
+/// rather than the registry's (unspecified) submission order. Pure, so the
+/// ordering is tested without the registry.
+fn ordered(mut tests: Vec<&registry::RegisteredTest>) -> Vec<&registry::RegisteredTest> {
+    tests.sort_by_key(|t| t.name);
+    tests
 }
 
 /// Map a caught test result to an [`Outcome`]. Pure, so the mapping is tested
@@ -225,5 +232,51 @@ mod tests {
     fn classify_panic_is_errored() {
         let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
         assert_eq!(classify(Err(payload)), Outcome::Errored("kaboom".into()));
+    }
+
+    /// Guard: each outcome has its own report label. Mutation: return the same
+    /// label for every variant (e.g. `""`) -> this fails. The label is what a
+    /// reader greps a run's output for.
+    #[test]
+    fn outcome_labels_are_distinct() {
+        assert_eq!(Outcome::Passed.label(), "ok");
+        assert_eq!(Outcome::Failed("x".into()).label(), "FAIL");
+        assert_eq!(Outcome::Errored("y".into()).label(), "ERROR");
+    }
+
+    /// Guard: only a failed or errored outcome carries a reason, and it is the
+    /// carried string. Mutation: return `Some` for Passed, or `None` for a
+    /// failure -> this fails.
+    #[test]
+    fn outcome_reason_is_the_failure_message() {
+        assert_eq!(Outcome::Passed.reason(), None);
+        assert_eq!(Outcome::Failed("boom".into()).reason(), Some("boom"));
+        assert_eq!(Outcome::Errored("boom".into()).reason(), Some("boom"));
+    }
+
+    /// Guard: `ordered` sorts tests by name regardless of input order.
+    /// Mutation: drop the `sort_by_key` -> the unsorted input comes back
+    /// unsorted -> this fails. An end-to-end order check cannot catch this: the
+    /// registry's iteration order is unspecified and happened to be sorted.
+    #[test]
+    fn ordered_sorts_by_name() {
+        fn stub(_: &TestContext) -> registry::TestFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+        let c = registry::RegisteredTest {
+            name: "c",
+            run: stub,
+        };
+        let a = registry::RegisteredTest {
+            name: "a",
+            run: stub,
+        };
+        let b = registry::RegisteredTest {
+            name: "b",
+            run: stub,
+        };
+
+        let names: Vec<&str> = ordered(vec![&c, &a, &b]).iter().map(|t| t.name).collect();
+        assert_eq!(names, ["a", "b", "c"]);
     }
 }

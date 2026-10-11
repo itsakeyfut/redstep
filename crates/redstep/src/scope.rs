@@ -125,16 +125,40 @@ mod tests {
         assert!(matches!(err, Error::OutOfScope { .. }));
     }
 
-    /// Guard: an allowed host:port resolves to a target carrying that host and
-    /// port. Mutation: break the membership check (e.g. compare host only) ->
-    /// the port mismatch no longer rejects -> a later assertion on `port` or an
-    /// out-of-scope case fails.
+    /// Guard: an allowed host:port resolves to a target carrying that exact host
+    /// and port. Mutation: make `ScopedTarget` carry a fixed host or port -> an
+    /// accessor assertion fails. (Membership itself is guarded by the two tests
+    /// below.)
     #[test]
     fn in_scope_host_port_resolves() {
         let scope = scope_allowing("web:80");
         let target = scope.resolve("web:80").expect("web:80 is allowed");
         assert_eq!(target.host(), "web");
         assert_eq!(target.port(), 80);
+    }
+
+    /// Guard: membership compares the port, not only the host. Mutation: match
+    /// on the host alone -> `web:81` resolves against an allowlist of `web:80`
+    /// -> fails. Without this a capability could reach a port never allowed.
+    #[test]
+    fn resolve_rejects_allowed_host_wrong_port() {
+        let scope = scope_allowing("web:80");
+        let err = scope
+            .resolve("web:81")
+            .expect_err("wrong port is out of scope");
+        assert!(matches!(err, Error::OutOfScope { .. }));
+    }
+
+    /// Guard: membership compares the host, not only the port. Mutation: match
+    /// on the port alone -> `api:80` resolves against an allowlist of `web:80`
+    /// -> fails. Without this a capability could reach a host never allowed.
+    #[test]
+    fn resolve_rejects_wrong_host_allowed_port() {
+        let scope = scope_allowing("web:80");
+        let err = scope
+            .resolve("api:80")
+            .expect_err("wrong host is out of scope");
+        assert!(matches!(err, Error::OutOfScope { .. }));
     }
 
     /// Guard: the empty (default) scope allows nothing. Mutation: default the
