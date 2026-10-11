@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same PR/branch; never cancel pushes to main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: these jobs only read the tree. Nothing here comments on a
+# PR, pushes a tag, or touches a release, so the token gets read and no more.
+# Declared at the top so it is the ceiling for every job.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Third-party actions are pinned to a commit SHA, not a tag or a branch, so a
+# retag or a branch move cannot change what runs in CI (docs/rules/security.md
+# section 9). The human-readable version is in the trailing comment; bump both
+# together. `checkout` runs with `persist-credentials: false` because no job
+# here needs the token after checkout, and a build step should not inherit it.
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Format. Split out so a misformatted PR fails in seconds rather than after
+  # a full build. This mirrors the first line of `.claude/scripts/gate.sh`.
+  # --------------------------------------------------------------------------
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # --------------------------------------------------------------------------
+  # Clippy, with warnings as errors. `-D warnings` is passed to clippy rather
+  # than set as a global RUSTFLAGS, which would apply to dependencies as well
+  # and let an upstream warning break this repository's CI. `--all-features`
+  # matches the gate: a feature-gated path that does not compile is a defect
+  # whether or not the default build reaches it.
+  # --------------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          # Only main writes the shared cache. A pull request restores it but
+          # does not save, so a build running untrusted PR code cannot poison
+          # the cache that a later main run restores.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # --------------------------------------------------------------------------
+  # Tests. The author develops on Windows while the lab and CI are Linux, so
+  # the pure model layer is built and tested on both: path handling, line
+  # endings, and `io::ErrorKind` differ across the two, and a portability
+  # regression should fail here rather than on the author's machine.
+  #
+  # The integration tests self-skip where Docker or a pinned tool is absent
+  # (see docs/rules/test.md), so a bare runner still goes green while the
+  # real attack paths run only where a lab can be built. Discovery tests are
+  # `#[ignore]` and never gate; the deterministic replays and unit tests are
+  # what `cargo test` runs here.
+  # --------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace
+
+  # --------------------------------------------------------------------------
+  # Docs. The modules lean on intra-doc links, and a broken link silently
+  # drops that guidance. Private items too, because most of the tree is
+  # private and a link in one of them is read by exactly the person this
+  # project asks to read the code. This mirrors the `doc` line of the gate.
+  # --------------------------------------------------------------------------
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # --------------------------------------------------------------------------
+  # Aggregation gate: the single required check for branch protection. It
+  # fails closed: any required job that failed, was cancelled, or was skipped
+  # fails the gate, so a job that silently stops running cannot turn the gate
+  # green. A false green here is the CI equivalent of CLAUDE.md row 6.
+  # Referencing just this check keeps branch protection stable as jobs are
+  # added or renamed.
+  #
+  # An MSRV job belongs in `needs` once an MSRV is set in Cargo.toml, to match
+  # the note in `.claude/scripts/gate.sh`. It is left out until then rather
+  # than pinned to a toolchain nobody has agreed to.
+  # --------------------------------------------------------------------------
+  ci:
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test
+      - docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every required job succeeded
+        if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped')
+        run: exit 1
+      - name: Success
+        run: exit 0

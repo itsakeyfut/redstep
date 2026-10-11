@@ -1,0 +1,79 @@
+name: Finding
+description: Something wrong or worth doing that turned up during other work and is not being fixed now.
+title: "fix: "
+labels: ["T-Bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a defect, a gap, or an observation found while doing something else.
+
+        A finding that can be fixed in ten minutes should be fixed, not filed.
+        This is for the ones that are real, are not this change's business, and
+        would otherwise survive only in a conversation that ends.
+
+        Change `T-Bug` if it is not one, and add `S-Needs-Design` or
+        `S-Ready-For-Implementation` when it becomes work rather than a note. A
+        finding that a verdict could be wrong, or that an action could reach
+        outside its scope, is `P-Critical` and is not a deferral: it is fixed
+        before the work that uncovered it lands.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What is wrong
+      description: One or two sentences. What the code does, and what it should do.
+      placeholder: |
+        A capability that times out against a dead target records the run as
+        PASS. A timeout is an absence of signal, not a boundary that held, so it
+        should produce an Inconclusive observation (CLAUDE.md row 4, not row 6).
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >
+        The command and its real output, or the failing test. Not a description
+        of what would happen. A finding nobody demonstrated is a finding nobody
+        can act on, and it will be re-investigated from scratch.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: why_not_now
+    attributes:
+      label: Why it is not being fixed now
+      description: >
+        The interesting field. Out of scope, needs a decision, needs a milestone
+        that does not exist yet, or cheap to leave and expensive to do badly. A
+        deferral without a reason is a deferral nobody can overturn later.
+      placeholder: |
+        Mapping a timeout to Inconclusive is the oracle's job, and the oracle
+        does not yet distinguish absence-of-signal from a held boundary. That is
+        Decision J work scheduled for a later issue; the change that surfaced
+        this was an adapter change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proof
+    attributes:
+      label: What would prove it fixed
+      description: >
+        Which test, and which mutation would make it fail. Writing this now is
+        cheaper than writing it later, because the context is in your head now.
+      placeholder: |
+        A test `timeout_should_be_inconclusive_not_pass`. Reverting the
+        timeout-to-Inconclusive branch makes it verdict PASS and the test fails.
+    validations:
+      required: true
+
+  - type: input
+    id: origin
+    attributes:
+      label: Where it came from
+      description: The review lens, the pull request, or the session that turned it up.
+      placeholder: "review-verdict-soundness, during the adapter review"
