@@ -1,0 +1,17 @@
+[package]
+name = "redstep-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0.87", features = ["full"] }
+quote = "1.0.37"
+proc-macro2 = "1.0.89"

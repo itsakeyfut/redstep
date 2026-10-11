@@ -1,0 +1,22 @@
+[package]
+name = "redstep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+redstep-macros = { path = "../redstep-macros" }
+# Test discovery: the attribute macro registers each test into a distributed
+# collection that `run` iterates. See docs/specs/design-decisions.md Decision A.
+inventory = "0.3.25"
+thiserror = "2.0.21"
+# The runner drives async tests to completion on one current-thread runtime.
+# Only `rt` is needed until a capability does real I/O (Decision B).
+tokio = { version = "1.53.2", features = ["rt"] }
+
+[dev-dependencies]
+proptest = "1.12.0"
