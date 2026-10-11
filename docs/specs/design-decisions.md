@@ -353,6 +353,14 @@ ctx.expect(obs.reachable()).to_be(false).min_confidence(Confidence::High);
 
 **未決(今後詰める)**: 能力ごとの Signal 種別と裏取り規則の定義、confidence の算出方法、Inconclusive を CI でどう扱うかの既定(O で確定)、Observation 型の共通設計。
 
+**MVP implementation note (settled in #4)**: the oracle's MVP shape is fixed. Reporting (#6) and later corroboration build on it.
+
+- `Verdict { Pass, Fail, Inconclusive, Error }` (model layer) is the per-test result. It replaces the runner's placeholder `Outcome`, so the naming reconciliation the #2 and #3 notes deferred to "when J lands" is done.
+- `Expectation<T> { expected, min_confidence }` and the pure `judge(&Observation<T>, &Expectation<T>) -> Judgement`. `Judgement { verdict, expected, actual, confidence }` carries the machine-readable reason. The sign is in the expectation: a test declares the safe value, so a mismatch (the attack succeeded) is a `Fail`.
+- `judge` yields Pass / Fail / Inconclusive; a signal below the required confidence is `Inconclusive` whatever its value. `Error` is a run-level state (a body that errored or panicked), not produced by the oracle. Corroboration across signals stays deferred (noisy real tools), so a capability sets the confidence directly for now.
+- `ctx.expect(&obs).min_confidence(c).to_be(v)` records a `Judgement` in an interior-mutable sink; the runner builds a `TestContext` per test and aggregates the recorded judgements (a `Fail` dominates, then `Inconclusive`, else `Pass`; a body error or panic is `Error`).
+- The run's exit code is `0` only when at least one test ran and every verdict is `Pass`; `Inconclusive` is non-zero (fail-closed), because an unconfirmed result must not read as a green gate. Decision O's informational treatment of `Inconclusive` is at the discovery-vs-replay layer, not this deterministic runner's exit.
+
 ---
 
 ### Decision N — 境界強制の実装方式: Layered + 境界セルフチェック(確定)
