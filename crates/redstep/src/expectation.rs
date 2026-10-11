@@ -120,6 +120,25 @@ mod tests {
         );
     }
 
+    /// Guard: with no `min_confidence`, the gate is off and the verdict is by
+    /// value even for a Low observation. Mutation: change `to_be`'s default from
+    /// `Low` to `High` -> a Low observation becomes Inconclusive instead of
+    /// Pass/Fail -> fails.
+    #[test]
+    fn default_expectation_accepts_any_confidence() {
+        let expect_unreachable = Expectation::to_be(false);
+        assert_eq!(
+            judge(&observed(false, Confidence::Low), &expect_unreachable).verdict,
+            Verdict::Pass,
+            "a Low match passes when no minimum is required"
+        );
+        assert_eq!(
+            judge(&observed(true, Confidence::Low), &expect_unreachable).verdict,
+            Verdict::Fail,
+            "a Low mismatch fails when no minimum is required"
+        );
+    }
+
     /// Guard: the judgement records the expected and actual values for the
     /// report. Mutation: swap `expected` and `actual` in `judge` -> fails.
     #[test]

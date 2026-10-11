@@ -61,5 +61,8 @@ mod tests {
         assert!(!Confidence::Low.meets(Confidence::High));
         assert!(Confidence::Medium.meets(Confidence::Low));
         assert!(!Confidence::Low.meets(Confidence::Medium));
+        // High outranks Medium (so a High/Medium rank swap is caught):
+        assert!(Confidence::High.meets(Confidence::Medium));
+        assert!(!Confidence::Medium.meets(Confidence::High));
     }
 }
