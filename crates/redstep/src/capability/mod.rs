@@ -1,9 +1,14 @@
 //! The capability layer: an active action against a scope-resolved target.
 //!
-//! A capability is where force lives (See Decision B). It accepts only a
-//! [`ScopedTarget`](crate::ScopedTarget), which nothing but the scope resolver
-//! produces, so an action cannot reach a target that did not pass the gate
-//! (docs/rules/security.md section 2). It reports its [`Intensity`], which the
+//! A capability is where force lives (See Decision B). The shipped
+//! [`TcpConnect`] takes a [`ScopedTarget`](crate::ScopedTarget), which nothing
+//! but the scope resolver produces, so it cannot reach a target that did not
+//! pass the gate (docs/rules/security.md section 2). That is a property of that
+//! capability, not of the trait: the trait below does not require holding a
+//! `ScopedTarget`, so a hand-written capability could hold a raw address.
+//! Forcing scope and intensity through the type, rather than by each
+//! capability's discipline, is scheduled before the first tool adapter or
+//! external capability lands. A capability reports its [`Intensity`], which the
 //! run path checks before executing. This unit builds only the native, `Safe`
 //! side; tool adapters and higher intensities are later units.
 

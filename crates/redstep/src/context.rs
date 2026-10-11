@@ -54,12 +54,19 @@ impl TestContext {
 
     /// Run a capability and return its observation and evidence.
     ///
-    /// This is the one invocation path. It checks the intensity as a value
-    /// before executing and refuses anything but `Safe`, because the
-    /// authorization and isolation proof the higher rungs require are not built
-    /// yet (See Decision F). The capability already holds a
-    /// [`ScopedTarget`], so the scope gate is enforced by the type: this cannot
-    /// be handed a raw address.
+    /// This is the intended invocation path: it checks the intensity as a value
+    /// and refuses anything but `Safe`, because the authorization and isolation
+    /// proof the higher rungs require are not built yet (See Decision F). The
+    /// check lives here rather than in the type system: `Capability::execute` is
+    /// a public trait method a hand-written capability could call directly, so
+    /// the gate is a runtime check this one place holds. Making it unbypassable
+    /// (sealing the trait, a crate-private `execute`) is scheduled before the
+    /// first non-Safe capability lands.
+    ///
+    /// The shipped [`TcpConnect`](crate::TcpConnect) holds a
+    /// [`ScopedTarget`] (only the resolver produces one), so for it the scope
+    /// gate is type-enforced; the trait does not require that of every
+    /// capability, so that guarantee is per-capability, not trait-wide.
     pub async fn run<C: Capability>(
         &self,
         capability: C,
@@ -98,9 +105,29 @@ mod tests {
         }
     }
 
-    /// Guard: `run` refuses a non-Safe capability and does not execute it.
-    /// Mutation: drop the intensity check in `run` -> `execute` runs, panics,
-    /// and the test fails. The panicking stub is what proves "does not execute".
+    /// An Aggressive capability that panics if executed.
+    struct Aggressive;
+
+    impl Capability for Aggressive {
+        type Value = ();
+
+        fn name(&self) -> &'static str {
+            "aggressive_stub"
+        }
+
+        fn intensity(&self) -> Intensity {
+            Intensity::Aggressive
+        }
+
+        async fn execute(&self) -> Result<(Observation<()>, Evidence)> {
+            panic!("a refused capability must not execute");
+        }
+    }
+
+    /// Guard: `run` refuses a Controlled capability without executing it, and
+    /// reports the intensity it saw. Mutation: drop the intensity check -> the
+    /// panicking stub runs and the test fails; hard-code `got` -> the pair of
+    /// this and `aggressive_capability_is_refused` disagree, so one fails.
     #[test]
     fn non_safe_capability_is_refused() {
         let ctx = TestContext::new(Scope::default());
@@ -112,6 +139,25 @@ mod tests {
             result,
             Err(Error::IntensityRefused {
                 got: Intensity::Controlled
+            })
+        ));
+    }
+
+    /// Guard: Aggressive is refused too, not only Controlled. Mutation: narrow
+    /// the gate to refuse only Controlled (`intensity() == Controlled`) -> the
+    /// Aggressive stub runs, panics, and this fails. Without it the gate could
+    /// let the most dangerous rung through.
+    #[test]
+    fn aggressive_capability_is_refused() {
+        let ctx = TestContext::new(Scope::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.run(Aggressive));
+        assert!(matches!(
+            result,
+            Err(Error::IntensityRefused {
+                got: Intensity::Aggressive
             })
         ));
     }

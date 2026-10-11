@@ -10,7 +10,9 @@
 /// transient result (a timeout) cannot read as a confident answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
-    /// Corroborated or unambiguous.
+    /// Unambiguous for the capability that set it: a completed handshake, or a
+    /// connection the target explicitly refused. Corroboration across signals,
+    /// which the oracle (#4) adds, is not yet a source of this.
     High,
     /// Plausible, not certain.
     Medium,

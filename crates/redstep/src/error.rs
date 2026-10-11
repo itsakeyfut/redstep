@@ -33,12 +33,14 @@ pub enum Error {
     #[error("check failed: {0}")]
     Check(String),
 
-    /// A capability was run at an intensity that is not unlocked. Only `Safe`
-    /// is exercisable yet; `Controlled` and `Aggressive` require the
-    /// authorization and isolation proof a later unit adds (See Decision F).
-    /// Carried here, in the model error, because it names only `Intensity` (a
-    /// model type), so the dependency still points downward.
-    #[error("intensity {got:?} is not unlocked; only Safe runs in this build")]
+    /// A capability was run at an intensity that is not permitted. Only `Safe`
+    /// is allowed yet; `Controlled` and `Aggressive` require the authorization
+    /// and isolation proof a later unit adds (See Decision F), not a different
+    /// build. Carried here, in the model error, because it names only
+    /// `Intensity` (a model type), so the dependency still points downward.
+    #[error(
+        "capability intensity {got:?} is not permitted; only Safe is allowed until authorization and an isolation proof are in place"
+    )]
     IntensityRefused {
         /// The intensity the capability reported.
         got: crate::intensity::Intensity,
@@ -47,3 +49,28 @@ pub enum Error {
 
 /// The result type carried through a security test.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intensity::Intensity;
+
+    /// Guard: the refusal message names the offending intensity and the allowed
+    /// one, so a user reads what to do. Mutation: drop `{got:?}` or the "Safe"
+    /// mention -> this fails.
+    #[test]
+    fn intensity_refused_message_names_the_intensity_and_safe() {
+        let message = Error::IntensityRefused {
+            got: Intensity::Aggressive,
+        }
+        .to_string();
+        assert!(
+            message.contains("Aggressive"),
+            "names the intensity: {message:?}"
+        );
+        assert!(
+            message.contains("Safe"),
+            "names the allowed rung: {message:?}"
+        );
+    }
+}

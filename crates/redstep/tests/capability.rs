@@ -39,8 +39,9 @@ fn tcp_connect_open_port_observes_reachable() {
     assert_eq!(evidence.target, spec);
     assert_eq!(evidence.intensity, Intensity::Safe);
     assert!(evidence.reachable);
-    // The evidence mirrors the observation it was built from. Mutation: set
-    // evidence.confidence to a fixed value in execute -> this fails.
+    // Both sides are High here, so this cannot tell "mirrors the observation"
+    // from "hard-coded High"; the decisive Low case is pinned by the unit test
+    // build_evidence_mirrors_the_observation.
     assert_eq!(evidence.confidence, observation.confidence);
 }
 
