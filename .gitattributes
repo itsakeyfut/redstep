@@ -1,0 +1,8 @@
+# The lab and CI are Linux while the author develops on Windows, so a checkout
+# must not rewrite line endings and hand Linux a CRLF file. Store every text
+# file with LF and check it out with LF on every platform. This matters most
+# for anything run or parsed byte for byte: a shell script with CRLF fails its
+# shebang on Linux, and a recorded tool-output fixture (docs/rules/test.md)
+# must match what the tool really emits. Binary files are detected by
+# `text=auto` and left untouched.
+* text=auto eol=lf
