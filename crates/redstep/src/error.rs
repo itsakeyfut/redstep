@@ -32,6 +32,17 @@ pub enum Error {
     /// supersedes it.
     #[error("check failed: {0}")]
     Check(String),
+
+    /// A capability was run at an intensity that is not unlocked. Only `Safe`
+    /// is exercisable yet; `Controlled` and `Aggressive` require the
+    /// authorization and isolation proof a later unit adds (See Decision F).
+    /// Carried here, in the model error, because it names only `Intensity` (a
+    /// model type), so the dependency still points downward.
+    #[error("intensity {got:?} is not unlocked; only Safe runs in this build")]
+    IntensityRefused {
+        /// The intensity the capability reported.
+        got: crate::intensity::Intensity,
+    },
 }
 
 /// The result type carried through a security test.

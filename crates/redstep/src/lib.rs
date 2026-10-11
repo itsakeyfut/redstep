@@ -23,8 +23,12 @@
 // a doctest could use the macro too.
 extern crate self as redstep;
 
+mod capability;
 mod context;
 mod error;
+mod evidence;
+mod intensity;
+mod observation;
 // `#[doc(hidden)]`: the `#[security_test]` expansion reaches these by path, but
 // they are not a surface for a downstream crate to build on. See registry.rs.
 #[doc(hidden)]
@@ -32,8 +36,12 @@ pub mod registry;
 mod runner;
 mod scope;
 
+pub use capability::{Capability, TcpConnect};
 pub use context::TestContext;
 pub use error::{Error, Result};
+pub use evidence::Evidence;
+pub use intensity::Intensity;
+pub use observation::{Confidence, Observation};
 pub use redstep_macros::security_test;
 pub use runner::{Outcome, RunError, RunSummary, TestRun, run};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};

@@ -14,9 +14,10 @@ redstep-macros = { path = "../redstep-macros" }
 # collection that `run` iterates. See docs/specs/design-decisions.md Decision A.
 inventory = "0.3.25"
 thiserror = "2.0.21"
-# The runner drives async tests to completion on one current-thread runtime.
-# Only `rt` is needed until a capability does real I/O (Decision B).
-tokio = { version = "1.53.2", features = ["rt"] }
+# The runner drives async tests on one current-thread runtime (`rt`); the
+# native TcpConnect capability adds TCP connect (`net`) and a bounded connect
+# timeout (`time`, docs/rules/perf.md).
+tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 proptest = "1.12.0"
