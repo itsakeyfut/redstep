@@ -1,6 +1,14 @@
-[package]
-name = "redstep"
+[workspace]
+resolver = "2"
+members = ["crates/redstep", "crates/redstep-macros"]
+
+# unsafe is off by default across the tree; a future -sys binding or raw-socket
+# primitive opts a single module back in. See docs/rules/unsafe.md.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/itsakeyfut/redstep"

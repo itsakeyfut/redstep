@@ -34,6 +34,13 @@
 
 **未決(今後詰める)**: DSL の具体フォーマット(YAML か独自か)、エスケープハッチの境界ガイドライン、Rust/DSL どちらで書くべきかの判断基準。
 
+**MVP implementation note (settled in #2)**: the mechanics of the Rust Security Test API are fixed as follows. The later units (#3 to #6) build on this topology.
+
+- `#[security_test]` is a proc-macro in the crate `redstep-macros`, and tests are discovered through `inventory` (a proc-macro has to live in its own crate).
+- Crate topology is a workspace: `crates/redstep` (core + thin CLI) and `crates/redstep-macros`.
+- A test is `async fn(ctx: &TestContext) -> redstep::Result<()>`. The runner runs tests sequentially in name order on one current-thread runtime, maps `Ok` to Passed, `Err(Check)` to Failed, any other `Err` or a panic to Errored, and exits zero only when every test passed.
+- Scope is resolved at run level. The CLI's `--allow host:port` is an interim source; the durable origin is the environment definition (Decision C). A `ScopedTarget` is constructible only through the resolver (Decision F, security.md section 2).
+
 ---
 
 ### Decision B — Attacker Capability: Hybrid(確定)
