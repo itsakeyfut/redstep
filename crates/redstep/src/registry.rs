@@ -2,7 +2,11 @@
 //!
 //! Pure of I/O. The macro expansion references the items here by path
 //! (`::redstep::registry::...`), including the re-exported `inventory`, so a
-//! crate that writes tests needs only `redstep` as a dependency.
+//! crate that writes tests needs only `redstep` as a dependency. The module is
+//! `#[doc(hidden)]` (see lib.rs): the macro has to reach these items, but they
+//! are not a stable surface for a downstream crate to build on, so later fields
+//! on `RegisteredTest` (Decision K tags, an intensity marker) stay an internal,
+//! coordinated change rather than a semver break.
 
 use crate::context::TestContext;
 use crate::error::Result;
@@ -32,7 +36,8 @@ pub struct RegisteredTest {
 
 inventory::collect!(RegisteredTest);
 
-/// Every registered test, in submission order (the runner sorts them).
-pub fn all() -> impl Iterator<Item = &'static RegisteredTest> {
+/// Every registered test, in the registry's unspecified iteration order (the
+/// runner sorts them by name). Crate-internal: only the runner reads it.
+pub(crate) fn all() -> impl Iterator<Item = &'static RegisteredTest> {
     inventory::iter::<RegisteredTest>.into_iter()
 }

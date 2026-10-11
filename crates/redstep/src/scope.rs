@@ -86,6 +86,14 @@ impl ScopeBuilder {
 
 /// Parse a `host:port` specification. MVP matches a literal host and port; a
 /// named target (`web`) comes with the environment unit (Decision C).
+///
+/// The host is validated rather than accepted verbatim, so a malformed spec is
+/// a visible error instead of a silently unmatchable entry. In particular a
+/// host must not contain a colon, whitespace, or a slash: IPv6 (`::1`,
+/// `[::1]:80`) is not supported yet, and without this check `rsplit_once(':')`
+/// would quietly store `::1`'s `:` or `a:1:2`'s `a:1` as a "host" that can
+/// never match, so a user writing `--allow ::1` would get no error and no
+/// coverage. Port 0 is rejected: it is not a connectable target.
 fn parse_host_port(spec: &str) -> Result<(String, u16)> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: spec.to_owned(),
@@ -98,9 +106,17 @@ fn parse_host_port(spec: &str) -> Result<(String, u16)> {
     if host.is_empty() {
         return Err(invalid("empty host"));
     }
+    if host.contains(|c: char| c == ':' || c == '/' || c.is_whitespace()) {
+        return Err(invalid(
+            "host must not contain a colon, slash, or whitespace (IPv6 is not supported yet)",
+        ));
+    }
     let port: u16 = port_str
         .parse()
         .map_err(|_| invalid(&format!("invalid port {port_str:?}")))?;
+    if port == 0 {
+        return Err(invalid("port 0 is not a target"));
+    }
     Ok((host.to_owned(), port))
 }
 
@@ -115,11 +131,13 @@ mod tests {
             .build()
     }
 
-    /// Guard: resolving a target that is not in the allowlist is a hard error,
-    /// returned before any action. Mutation: make `resolve` return the target
-    /// regardless of membership -> this returns `Ok` -> fails.
+    /// Guard: resolving a target that is not in the allowlist is a hard error
+    /// and yields no target. Mutation: make `resolve` return the target
+    /// regardless of membership -> this returns `Ok` -> fails. (The name does
+    /// not claim "before acting": no action exists yet to order against; the
+    /// guarantee is that no `ScopedTarget` is produced.)
     #[test]
-    fn out_of_scope_target_should_error_before_acting() {
+    fn out_of_scope_target_is_rejected() {
         let scope = scope_allowing("web:80");
         let err = scope.resolve("db:5432").expect_err("db is not allowed");
         assert!(matches!(err, Error::OutOfScope { .. }));
@@ -170,15 +188,59 @@ mod tests {
         assert!(matches!(err, Error::OutOfScope { .. }));
     }
 
-    /// Guard: a malformed spec is an error, not a panic. Mutation: `unwrap` the
-    /// port parse -> this panics instead of returning `Err` -> fails.
+    /// Guard: a malformed spec is an error, not a panic, and a host with a
+    /// colon, slash, or whitespace is rejected rather than silently stored as
+    /// an unmatchable entry. Mutation: `unwrap` the port parse -> panic -> fails;
+    /// drop the host-character check -> `::1`, `a:1:2`, ` web:80`, `http://web:80`
+    /// parse to odd hosts and are no longer `InvalidTarget` -> fails; drop the
+    /// port-0 check -> `web:0` becomes valid -> fails.
     #[test]
     fn invalid_target_spec_is_error_not_panic() {
         let scope = Scope::default();
-        for bad in ["not-a-target", "web:", ":80", "web:http", "web:99999"] {
-            let err = scope.resolve(bad).expect_err("malformed spec");
-            assert!(matches!(err, Error::InvalidTarget { .. }), "spec {bad:?}");
+        let bad = [
+            "not-a-target",
+            "web:",
+            ":80",
+            "web:http",
+            "web:99999",
+            "::1",
+            "a:1:2",
+            " web:80",
+            "web :80",
+            "http://web:80",
+            "web:0",
+        ];
+        for spec in bad {
+            let err = scope.resolve(spec).expect_err("malformed spec");
+            assert!(
+                matches!(err, Error::InvalidTarget { .. }),
+                "spec {spec:?} should be InvalidTarget, got {err:?}"
+            );
         }
+    }
+
+    /// Guard: the builder rejects a malformed spec at build time, not resolve
+    /// time (its doc says so). Mutation: drop the `parse_host_port(spec)?` in
+    /// `ScopeBuilder::allow` (accept anything) -> this returns `Ok` -> fails.
+    #[test]
+    fn builder_rejects_malformed_allow_spec() {
+        assert!(Scope::builder().allow("not-a-target").is_err());
+        assert!(Scope::builder().allow("::1").is_err());
+    }
+
+    /// Guard: the builder keeps every allowed entry, not only the last.
+    /// Mutation: replace `push` with an assignment (`self.allow = vec![..]`) ->
+    /// the first entry is lost -> resolving `web:80` fails -> this fails.
+    #[test]
+    fn builder_keeps_multiple_entries() {
+        let scope = Scope::builder()
+            .allow("web:80")
+            .expect("valid")
+            .allow("api:8080")
+            .expect("valid")
+            .build();
+        assert!(scope.resolve("web:80").is_ok());
+        assert!(scope.resolve("api:8080").is_ok());
     }
 
     proptest::proptest! {

@@ -7,9 +7,11 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The target was not in the scope allowlist. Reaching it would be an action
-    /// outside the declared scope, so resolution fails before any action runs
-    /// (docs/rules/security.md section 2). This is always fatal to the test.
+    /// The target was not in the scope allowlist. Resolution yields no
+    /// `ScopedTarget`, so nothing can act on it (docs/rules/security.md section
+    /// 2); the runner maps a test that returns this to `Errored`. A test that
+    /// matches on the `Result` could handle it instead of propagating, but it
+    /// can never turn it into a reachable target.
     #[error("target {spec:?} is out of scope")]
     OutOfScope {
         /// The rejected target specification, as given.

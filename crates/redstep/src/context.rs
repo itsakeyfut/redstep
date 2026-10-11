@@ -3,6 +3,14 @@
 //! For the runner MVP it holds the scope and offers resolution and a minimal
 //! assertion. The capability registry (Decision B) and the evidence sink
 //! (Decision D) are later fields; they are deliberately absent here.
+//!
+//! A test holds `&TestContext` (the `#[security_test]` signature and
+//! `registry::TestFn` both take a shared reference), so the evidence sink, when
+//! it lands, records through a shared `&self` and must be interior-mutable
+//! (a `RefCell`; a `Mutex` only if tests ever run concurrently, which the
+//! runner's sequential model rules out). A `RefCell` borrow must not be held
+//! across an `.await`, or a capability that records mid-await re-enters the
+//! borrow and panics. Keep a record as borrow / push / drop.
 
 use crate::error::{Error, Result};
 use crate::scope::{Scope, ScopedTarget};

@@ -13,9 +13,14 @@ use std::panic::AssertUnwindSafe;
 
 /// What became of one test.
 ///
-/// `#[non_exhaustive]` for downstream matches, but matched totally inside this
-/// crate (no `_` arm) so a new variant is a compile error at every decision
-/// site (docs/rules/design.md section 5).
+/// `#[non_exhaustive]`, so a downstream match needs a wildcard. Inside this
+/// crate `label` and `reason` match it totally, so a new variant is a compile
+/// error there (docs/rules/design.md section 5). `RunSummary::exit_code` does
+/// not match it; it compares to `Passed`, so it fails closed, counting any new
+/// variant as non-passing until that site is updated. The names (`Outcome`,
+/// `Passed`/`Failed`/`Errored`) are MVP placeholders to reconcile with the
+/// verdict model (Decision J) and `Evidence`'s own `Outcome` (Decision D) when
+/// those land.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
@@ -66,11 +71,17 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    /// `0` only when every test passed; non-zero when any failed or errored.
-    /// Errored is non-passing on purpose: a test that could not run must not
-    /// read as safe.
+    /// `0` only when at least one test ran and every one passed; non-zero when
+    /// any failed or errored, and non-zero for an empty run.
+    ///
+    /// An empty run is not a pass. "Nothing was discovered" must not read as
+    /// "all clear": a vacuous `all()` over no tests would return `0`, and since
+    /// the shipped binary links no tests and any discovery failure yields an
+    /// empty run, that would turn a non-run into a green CI gate (a false PASS,
+    /// CLAUDE.md row 6). Errored is non-passing for the same reason: a test that
+    /// could not run must not read as safe.
     pub fn exit_code(&self) -> i32 {
-        if self.runs.iter().all(|r| r.outcome == Outcome::Passed) {
+        if !self.runs.is_empty() && self.runs.iter().all(|r| r.outcome == Outcome::Passed) {
             0
         } else {
             1
@@ -185,6 +196,17 @@ mod tests {
         assert_ne!(summary.exit_code(), 0);
     }
 
+    /// Guard: an empty run (nothing discovered) is not a pass. Mutation: drop
+    /// the `!is_empty()` term from `exit_code` -> a run that discovered nothing
+    /// exits zero -> fails. This is the row-6 false PASS an empty discovery
+    /// (the shipped binary, a broken registration, a filter that matches
+    /// nothing) would otherwise report as all-clear.
+    #[test]
+    fn empty_run_does_not_pass() {
+        let summary = RunSummary { runs: vec![] };
+        assert_ne!(summary.exit_code(), 0);
+    }
+
     /// Guard: an all-passed summary exits zero. Mutation: make `exit_code`
     /// always return 1 -> fails.
     #[test]
@@ -225,13 +247,38 @@ mod tests {
         assert!(matches!(out, Outcome::Errored(_)));
     }
 
-    /// Guard: classify maps a panic to Errored carrying the panic message.
+    /// Guard: classify maps a `&str` panic to Errored carrying the message.
     /// Mutation: map the panic arm to Passed -> a panicking test reads as safe
     /// -> fails.
     #[test]
     fn classify_panic_is_errored() {
         let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
         assert_eq!(classify(Err(payload)), Outcome::Errored("kaboom".into()));
+    }
+
+    /// Guard: a `String` panic payload keeps its message. Mutation: replace the
+    /// `String` arm of `panic_message` -> the message is lost -> fails.
+    /// `panic!("{}", x)` produces a `String`, not a `&str`, so this arm is the
+    /// common one.
+    #[test]
+    fn classify_string_panic_keeps_message() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
+        assert_eq!(
+            classify(Err(payload)),
+            Outcome::Errored("owned boom".into())
+        );
+    }
+
+    /// Guard: a non-string panic payload still errors, with a generic message.
+    /// Mutation: change the fallback string -> fails; map the fallback to Passed
+    /// -> a `panic_any(non_string)` reads as safe -> fails.
+    #[test]
+    fn classify_nonstring_panic_is_generic_errored() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(
+            classify(Err(payload)),
+            Outcome::Errored("test panicked".into())
+        );
     }
 
     /// Guard: each outcome has its own report label. Mutation: return the same
