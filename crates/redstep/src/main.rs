@@ -1,20 +1,22 @@
-//! The thin CLI: run every registered security test and report each one's
-//! verdict, with its failure reasons indented beneath it.
+//! The thin CLI: run every registered security test, print a `cargo test`-style
+//! summary, and optionally write the canonical JSON.
 //!
-//! The argument surface is deliberately minimal; it grows with the runner in a
-//! later unit (see Decision A's MVP note in docs/specs/design-decisions.md).
-//! `--allow host:port` (repeatable) is the interim scope source; the
-//! environment unit (Decision C) later supplies scope from the lab definition.
+//! The terminal summary and the JSON are two renderers over one canonical
+//! [`Report`](redstep::report::Report), so they cannot disagree (Decision E). The
+//! argument surface is deliberately minimal; it grows with the environment unit
+//! (Decision C), which later supplies scope from the lab definition rather than
+//! from `--allow`.
 
+use redstep::report;
 use redstep::{Scope, run};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let scope = match parse_scope(std::env::args().skip(1)) {
-        Ok(scope) => scope,
+    let (scope, json_path) = match parse_args(std::env::args().skip(1)) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("error: {message}");
-            eprintln!("usage: redstep [--allow host:port]...");
+            eprintln!("usage: redstep [--allow host:port]... [--json path]");
             return ExitCode::from(2);
         }
     };
@@ -27,50 +29,45 @@ fn main() -> ExitCode {
         }
     };
 
-    if summary.runs.is_empty() {
+    let report = report::build(&summary);
+
+    if report.findings.is_empty() {
         // Say so rather than exit silently: an empty run is not a pass, and a
-        // bare non-zero exit with no output looks like a crash (see
-        // RunSummary::exit_code, CLAUDE.md row 6).
+        // bare non-zero exit with no output looks like a crash (the exit code is
+        // still non-zero, see Report::exit_code, CLAUDE.md row 6).
         eprintln!("no security tests were discovered");
     }
 
-    for test in &summary.runs {
-        println!("{:<12} {}", test.verdict.label(), test.name);
-        if let Some(reason) = &test.error {
-            println!("             {reason}");
-        }
-        for judgement in &test.judgements {
-            // Only the non-Pass judgements are a reason worth printing; a Pass
-            // judgement is the absence of a problem, not a line to read.
-            if judgement.verdict != redstep::Verdict::Pass {
-                println!(
-                    "             {}: expected {}, observed {} ({:?})",
-                    judgement.verdict.label(),
-                    judgement.expected,
-                    judgement.actual,
-                    judgement.confidence,
-                );
-            }
-        }
+    print!("{}", report::render_terminal(&report));
+
+    if let Some(path) = &json_path
+        && let Err(err) = std::fs::write(path, report::to_json(&report))
+    {
+        eprintln!("error: could not write {path}: {err}");
+        return ExitCode::FAILURE;
     }
 
-    // 0 only if at least one test ran and all passed; non-zero otherwise.
-    // exit_code is 0 or 1.
-    ExitCode::from(summary.exit_code() as u8)
+    // The status is a field of the canonical JSON (Decision E). exit_code is 0 or 1.
+    ExitCode::from(report.exit_code as u8)
 }
 
-/// Parse `--allow host:port` flags into a scope. Default-deny: no flags yields
-/// an empty scope that allows nothing.
-fn parse_scope(mut args: impl Iterator<Item = String>) -> Result<Scope, String> {
+/// Parse `--allow host:port` (repeatable) and an optional `--json path` into a
+/// scope and a JSON destination. Default-deny: no `--allow` yields an empty
+/// scope that allows nothing.
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<(Scope, Option<String>), String> {
     let mut builder = Scope::builder();
+    let mut json_path = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow" => {
                 let spec = args.next().ok_or("--allow needs a host:port")?;
                 builder = builder.allow(&spec).map_err(|e| e.to_string())?;
             }
+            "--json" => {
+                json_path = Some(args.next().ok_or("--json needs a path")?);
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(builder.build())
+    Ok((builder.build(), json_path))
 }
