@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use crate::capability::Capability;
-use crate::evidence::Evidence;
+use crate::evidence::{EvidenceDraft, Reproduction};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::scope::ScopedTarget;
@@ -65,7 +65,7 @@ impl Capability for TcpConnect {
         Intensity::Safe
     }
 
-    async fn execute(&self) -> crate::Result<(Observation<bool>, Evidence)> {
+    async fn execute(&self) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
         let target = format!("{}:{}", self.target.host(), self.target.port());
         let dial = target.clone();
         let outcome = connect_outcome(self.timeout, async move {
@@ -74,8 +74,14 @@ impl Capability for TcpConnect {
         .await;
 
         let observation = classify_connect(outcome);
-        let evidence = build_evidence(self.name(), target, self.intensity(), &observation);
-        Ok((observation, evidence))
+        let draft = build_draft(
+            self.name(),
+            target,
+            self.intensity(),
+            self.timeout,
+            &observation,
+        );
+        Ok((observation, draft))
     }
 }
 
@@ -132,21 +138,35 @@ fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
     }
 }
 
-/// Compose the evidence record from the observation. Pure, so that the record
+/// Compose the evidence draft from the observation. Pure, so that the draft
 /// mirroring the observation (not a hard-coded value) is testable without a
-/// socket.
-fn build_evidence(
+/// socket. The observed value is erased to a JSON bool so the record stays
+/// capability-neutral (Decision D); the reproduction restates the target and the
+/// timeout, which together re-run the same connect (Decision V's witness).
+fn build_draft(
     capability: &'static str,
     target: String,
     intensity: Intensity,
+    timeout: Duration,
     observation: &Observation<bool>,
-) -> Evidence {
-    Evidence {
+) -> EvidenceDraft {
+    EvidenceDraft {
         capability,
-        target,
+        target: target.clone(),
         intensity,
-        reachable: observation.value,
+        observed: serde_json::Value::Bool(observation.value),
         confidence: observation.confidence,
+        summary: if observation.value {
+            "reachable"
+        } else {
+            "unreachable"
+        }
+        .to_owned(),
+        reproduction: Reproduction {
+            capability: capability.to_owned(),
+            target,
+            params: serde_json::json!({ "timeout_ms": timeout.as_millis() as u64 }),
+        },
     }
 }
 
@@ -232,26 +252,68 @@ mod tests {
         );
     }
 
-    /// Guard: the evidence mirrors the observation, including on the decisive
-    /// Low path. Mutation: set `confidence` to a fixed `High` in `build_evidence`
-    /// -> this fails (the integration tests only reach High, so they cannot).
+    /// Guard: the draft mirrors the observation, including on the decisive Low
+    /// path: `observed` tracks the value, `confidence` is not hard-coded, and the
+    /// summary matches. Mutation: set `confidence` to a fixed `High`, hard-code
+    /// `observed` to `true`, or fix `summary` to `"reachable"` in `build_draft`
+    /// -> this fails (the integration tests only reach the reachable/High case,
+    /// so they cannot catch it). The reproduction restates the timeout so a
+    /// witness can re-run the same connect.
     #[test]
-    fn build_evidence_mirrors_the_observation() {
+    fn build_draft_mirrors_the_observation() {
         let observation = Observation {
             value: false,
             confidence: Confidence::Low,
         };
-        let evidence = build_evidence(
+        let draft = build_draft(
             "tcp_connect",
             "web:80".to_owned(),
             Intensity::Safe,
+            Duration::from_millis(250),
             &observation,
         );
-        assert_eq!(evidence.capability, "tcp_connect");
-        assert_eq!(evidence.target, "web:80");
-        assert_eq!(evidence.intensity, Intensity::Safe);
-        assert!(!evidence.reachable);
-        assert_eq!(evidence.confidence, Confidence::Low);
+        assert_eq!(draft.capability, "tcp_connect");
+        assert_eq!(draft.target, "web:80");
+        assert_eq!(draft.intensity, Intensity::Safe);
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.summary, "unreachable");
+        assert_eq!(draft.reproduction.target, "web:80");
+        assert_eq!(draft.reproduction.params["timeout_ms"], 250);
+    }
+
+    /// Guard: `execute` against a bound port wires the live observation into the
+    /// draft (observed/true, confidence mirrored) with a reproduction that
+    /// restates the target. Mutation: have `execute` build the draft from a
+    /// constant, or pass a different observation to `build_draft`, than the one it
+    /// returns -> the observed value, target, or confidence disagrees -> fails.
+    /// This proves the `execute` -> `build_draft` wiring end to end, which the
+    /// isolated `build_draft` test cannot.
+    #[test]
+    fn execute_emits_a_mirrored_draft_for_a_live_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener.local_addr().expect("local addr").port();
+        let spec = format!("127.0.0.1:{port}");
+
+        let scope = crate::scope::Scope::builder()
+            .allow(&spec)
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve(&spec).expect("in scope");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime with net builds");
+        let (observation, draft) = rt
+            .block_on(TcpConnect::new(target).execute())
+            .expect("the capability runs");
+
+        assert!(observation.value, "a bound port is reachable");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.target, spec);
+        assert_eq!(draft.reproduction.target, spec);
+        assert_eq!(draft.confidence, observation.confidence);
     }
 
     /// Guard: `with_timeout` sets the timeout the capability will use. Mutation:

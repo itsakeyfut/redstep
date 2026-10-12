@@ -7,7 +7,8 @@
 //! crate as `::redstep`.
 
 use redstep::{
-    Confidence, Observation, RunSummary, Scope, TestContext, Verdict, run, security_test,
+    Capability, Confidence, EvidenceDraft, Intensity, Observation, Reproduction, RunSummary, Scope,
+    TestContext, Verdict, run, security_test,
 };
 
 /// A tautology: should pass.
@@ -104,6 +105,55 @@ async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
+/// A Safe capability an external crate implements against the public trait,
+/// observing a reachable target with no socket. Proves the evidence shape
+/// (`EvidenceDraft`, `Reproduction`) is publicly constructible, and gives
+/// `run_collects_evidence_into_the_store` a deterministic record to find.
+struct StubReachable;
+
+impl Capability for StubReachable {
+    type Value = bool;
+
+    fn name(&self) -> &'static str {
+        "stub_reachable"
+    }
+
+    fn intensity(&self) -> Intensity {
+        Intensity::Safe
+    }
+
+    async fn execute(&self) -> redstep::Result<(Observation<bool>, EvidenceDraft)> {
+        Ok((
+            Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            EvidenceDraft {
+                capability: self.name(),
+                target: "stub:0".to_owned(),
+                intensity: Intensity::Safe,
+                observed: serde_json::Value::Bool(true),
+                confidence: Confidence::High,
+                summary: "reachable".to_owned(),
+                reproduction: Reproduction {
+                    capability: self.name().to_owned(),
+                    target: "stub:0".to_owned(),
+                    params: serde_json::json!({}),
+                },
+            },
+        ))
+    }
+}
+
+/// Runs a Safe capability, so the run produces exactly one evidence record the
+/// store collects.
+#[security_test]
+async fn records_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let observation = ctx.run(StubReachable).await?;
+    ctx.expect(&observation).to_be(true);
+    Ok(())
+}
+
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
@@ -175,6 +225,28 @@ fn run_passes_the_scope_to_tests() {
         Verdict::Pass
     );
     assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
+}
+
+/// Guard: a run collects each capability execution's evidence into the summary's
+/// store, as the single source of truth a report projects from (Decision D).
+/// Mutation: drop the `for draft in ctx.take_evidence()` loop in `run` -> the
+/// store is empty and `records_evidence_demo`'s record is not found -> fails.
+/// The record carries the observed value and the reproduction target, so a
+/// hard-coded or dropped field is caught here end to end.
+#[test]
+fn run_collects_evidence_into_the_store() {
+    let summary = run(Scope::default()).expect("the runtime starts");
+
+    let record = summary
+        .evidence
+        .records()
+        .iter()
+        .find(|e| e.capability == "stub_reachable")
+        .expect("the capability execution's evidence was collected into the store");
+
+    assert_eq!(record.observed, serde_json::Value::Bool(true));
+    assert_eq!(record.summary, "reachable");
+    assert_eq!(record.reproduction.target, "stub:0");
 }
 
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's

@@ -8,6 +8,7 @@
 
 use crate::TestContext;
 use crate::error::Error;
+use crate::evidence::EvidenceStore;
 use crate::expectation::Judgement;
 use crate::registry;
 use crate::scope::Scope;
@@ -33,6 +34,10 @@ pub struct TestRun {
 pub struct RunSummary {
     /// One entry per test, in the order they ran (sorted by name).
     pub runs: Vec<TestRun>,
+    /// Every evidence record produced during the run, in execution order: the
+    /// single source of truth the reports and the canonical JSON project from
+    /// (Decision D, E).
+    pub evidence: EvidenceStore,
 }
 
 impl RunSummary {
@@ -63,7 +68,9 @@ pub enum RunError {
 }
 
 /// Discover every registered test and run it, each against its own context over
-/// a clone of `scope`.
+/// a clone of `scope`. The evidence each test produced is collected into one
+/// run-level [`EvidenceStore`], in test-then-execution order; the store assigns
+/// the ids and stamps the timestamps from this runner's clock (Decision D).
 pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -71,28 +78,41 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
 
     let tests = ordered(registry::all().collect());
 
-    let runs = tests
-        .into_iter()
-        .map(|test| {
-            let ctx = TestContext::new(scope.clone());
-            // AssertUnwindSafe is sound here: `ctx`'s judgement sink is only
-            // ever touched by `record`/`take_judgements`, which borrow, mutate
-            // and drop within one statement and never across an `.await`, so an
-            // unwind cannot leave the `RefCell` borrowed or half-written.
-            let result =
-                std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
-            let judgements = ctx.take_judgements();
-            let (verdict, error) = classify(result, &judgements);
-            TestRun {
-                name: test.name,
-                verdict,
-                judgements,
-                error,
-            }
-        })
-        .collect();
+    let mut runs = Vec::with_capacity(tests.len());
+    let mut evidence = EvidenceStore::new();
+    for test in tests {
+        let ctx = TestContext::new(scope.clone());
+        // AssertUnwindSafe is sound here: `ctx`'s sinks are only ever touched by
+        // `record`/`take_judgements` and the evidence push/`take_evidence`, which
+        // borrow, mutate and drop within one statement and never across an
+        // `.await`, so an unwind cannot leave a `RefCell` borrowed or
+        // half-written.
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
+        let judgements = ctx.take_judgements();
+        for draft in ctx.take_evidence() {
+            evidence.append(draft, now_ms());
+        }
+        let (verdict, error) = classify(result, &judgements);
+        runs.push(TestRun {
+            name: test.name,
+            verdict,
+            judgements,
+            error,
+        });
+    }
 
-    Ok(RunSummary { runs })
+    Ok(RunSummary { runs, evidence })
+}
+
+/// The current time as epoch milliseconds, the one wall-clock read in the crate.
+/// The store takes the timestamp as a parameter so it stays pure; this supplies
+/// it. A clock before the Unix epoch (not reachable in practice) stamps `0`.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Order tests by name, so a run reports in a stable, deterministic order
@@ -185,6 +205,7 @@ mod tests {
     fn fail_run_exits_nonzero() {
         let summary = RunSummary {
             runs: vec![run_of("a", Verdict::Pass), run_of("b", Verdict::Fail)],
+            evidence: EvidenceStore::new(),
         };
         assert_ne!(summary.exit_code(), 0);
     }
@@ -199,6 +220,7 @@ mod tests {
                 run_of("a", Verdict::Pass),
                 run_of("b", Verdict::Inconclusive),
             ],
+            evidence: EvidenceStore::new(),
         };
         assert_ne!(summary.exit_code(), 0);
     }
@@ -209,6 +231,7 @@ mod tests {
     fn errored_run_exits_nonzero() {
         let summary = RunSummary {
             runs: vec![run_of("a", Verdict::Error)],
+            evidence: EvidenceStore::new(),
         };
         assert_ne!(summary.exit_code(), 0);
     }
@@ -219,6 +242,7 @@ mod tests {
     fn all_passed_run_exits_zero() {
         let summary = RunSummary {
             runs: vec![run_of("a", Verdict::Pass)],
+            evidence: EvidenceStore::new(),
         };
         assert_eq!(summary.exit_code(), 0);
     }
@@ -227,7 +251,10 @@ mod tests {
     /// -> an empty run exits zero -> fails.
     #[test]
     fn empty_run_does_not_pass() {
-        let summary = RunSummary { runs: vec![] };
+        let summary = RunSummary {
+            runs: vec![],
+            evidence: EvidenceStore::new(),
+        };
         assert_ne!(summary.exit_code(), 0);
     }
 

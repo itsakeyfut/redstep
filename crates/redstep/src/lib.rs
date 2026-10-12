@@ -7,16 +7,16 @@
 //! #[redstep::security_test]
 //! async fn db_is_unreachable(ctx: &redstep::TestContext) -> redstep::Result<()> {
 //!     let target = ctx.resolve("db:5432")?;
-//!     let (observation, _evidence) = ctx.run(redstep::TcpConnect::new(target)).await?;
+//!     let observation = ctx.run(redstep::TcpConnect::new(target)).await?;
 //!     ctx.expect(&observation).to_be(false); // require High confidence by default
 //!     Ok(())
 //! }
 //! ```
 //!
-//! The `Capability` trait (Decision B) and a minimal `Evidence` (Decision D)
-//! exist here; the verdict oracle's corroboration (Decision J), the append-only
-//! evidence store (Decision D) and the environment (Decision C) are later
-//! units, and this crate leaves a named seam for each.
+//! The `Capability` trait (Decision B), the verdict oracle (Decision J) and the
+//! append-only evidence store (Decision D) exist here; the oracle's corroboration
+//! (Decision J) and the environment (Decision C) are later units, and this crate
+//! leaves a named seam for each.
 
 // Lets the `#[security_test]` expansion, which refers to this crate as
 // `::redstep`, compile from inside this crate's own `src/`. A test written in
@@ -43,7 +43,7 @@ mod verdict;
 pub use capability::{Capability, TcpConnect};
 pub use context::{ExpectationBuilder, TestContext};
 pub use error::{Error, Result};
-pub use evidence::Evidence;
+pub use evidence::{Evidence, EvidenceDraft, EvidenceId, EvidenceStore, Reproduction};
 pub use expectation::{Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};

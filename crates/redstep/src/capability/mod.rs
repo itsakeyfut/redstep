@@ -16,7 +16,7 @@ pub mod tcp_connect;
 
 pub use tcp_connect::TcpConnect;
 
-use crate::evidence::Evidence;
+use crate::evidence::EvidenceDraft;
 use crate::intensity::Intensity;
 use crate::observation::Observation;
 
@@ -41,8 +41,11 @@ pub trait Capability {
     /// `Safe` in the current build.
     fn intensity(&self) -> Intensity;
 
-    /// Act against the held target, returning the observation and the evidence.
-    /// A capability holds its [`ScopedTarget`](crate::ScopedTarget), so this
-    /// takes no raw target.
-    async fn execute(&self) -> crate::Result<(Observation<Self::Value>, Evidence)>;
+    /// Act against the held target, returning the observation and a draft of the
+    /// evidence of what happened. A capability holds its
+    /// [`ScopedTarget`](crate::ScopedTarget), so this takes no raw target. It
+    /// returns an [`EvidenceDraft`], not an [`Evidence`](crate::Evidence):
+    /// a capability cannot know the id or timestamp of its own record, which the
+    /// store assigns on append (Decision D).
+    async fn execute(&self) -> crate::Result<(Observation<Self::Value>, EvidenceDraft)>;
 }

@@ -3,24 +3,24 @@
 //! It holds the scope and offers resolution, a bare assertion (`check`),
 //! running a capability (`run`), and declaring an expectation over an
 //! observation (`expect`, the oracle entry). It records each expectation's
-//! [`Judgement`] in an interior-mutable sink the runner drains per test; a
-//! capability *registry* (the plugin side of Decision B) and the *evidence*
-//! sink (Decision D, recording the evidence record rather than returning it)
-//! are still later.
+//! [`Judgement`] and each capability execution's [`EvidenceDraft`] in two
+//! interior-mutable sinks the runner drains per test; a capability *registry*
+//! (the plugin side of Decision B) is still later.
 //!
 //! A test holds `&TestContext` (the `#[security_test]` signature and
-//! `registry::TestFn` both take a shared reference), so the sink records
-//! through a shared `&self` and is interior-mutable (a `RefCell`; a `Mutex`
+//! `registry::TestFn` both take a shared reference), so the sinks record
+//! through a shared `&self` and are interior-mutable (a `RefCell`; a `Mutex`
 //! only if tests ever run concurrently, which the runner's sequential model
 //! rules out). A `RefCell` borrow must not be held across an `.await`:
-//! `record` is borrow / push / drop, with no await in between.
+//! `record` and the evidence push are borrow / push / drop, with no await in
+//! between.
 
 use std::cell::RefCell;
 use std::fmt::Debug;
 
 use crate::capability::Capability;
 use crate::error::{Error, Result};
-use crate::evidence::Evidence;
+use crate::evidence::EvidenceDraft;
 use crate::expectation::{Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
@@ -31,6 +31,7 @@ use crate::verdict::Verdict;
 pub struct TestContext {
     scope: Scope,
     judgements: RefCell<Vec<Judgement>>,
+    evidence: RefCell<Vec<EvidenceDraft>>,
 }
 
 impl TestContext {
@@ -40,6 +41,7 @@ impl TestContext {
         Self {
             scope,
             judgements: RefCell::new(Vec::new()),
+            evidence: RefCell::new(Vec::new()),
         }
     }
 
@@ -105,7 +107,15 @@ impl TestContext {
         std::mem::take(&mut self.judgements.borrow_mut())
     }
 
-    /// Run a capability and return its observation and evidence.
+    /// Drain the evidence drafts recorded during one test, in execution order.
+    /// The runner calls this after the test body and appends each to the run's
+    /// [`EvidenceStore`](crate::EvidenceStore), which assigns the ids (Decision
+    /// D).
+    pub(crate) fn take_evidence(&self) -> Vec<EvidenceDraft> {
+        std::mem::take(&mut self.evidence.borrow_mut())
+    }
+
+    /// Run a capability and return its observation, recording one evidence draft.
     ///
     /// This is the intended invocation path: it checks the intensity as a value
     /// and refuses anything but `Safe`, because the authorization and isolation
@@ -116,20 +126,23 @@ impl TestContext {
     /// (sealing the trait, a crate-private `execute`) is scheduled before the
     /// first non-Safe capability lands.
     ///
-    /// The shipped [`TcpConnect`](crate::TcpConnect) holds a
-    /// [`ScopedTarget`] (only the resolver produces one), so for it the scope
-    /// gate is type-enforced; the trait does not require that of every
-    /// capability, so that guarantee is per-capability, not trait-wide.
-    pub async fn run<C: Capability>(
-        &self,
-        capability: C,
-    ) -> Result<(Observation<C::Value>, Evidence)> {
+    /// The capability's [`EvidenceDraft`] is recorded in the evidence sink; the
+    /// runner drains it and the store assigns the id (Decision D), so `run`
+    /// returns the observation the test asserts on, not the draft. The shipped
+    /// [`TcpConnect`](crate::TcpConnect) holds a [`ScopedTarget`] (only the
+    /// resolver produces one), so for it the scope gate is type-enforced; the
+    /// trait does not require that of every capability, so that guarantee is
+    /// per-capability, not trait-wide.
+    pub async fn run<C: Capability>(&self, capability: C) -> Result<Observation<C::Value>> {
         if capability.intensity() != Intensity::Safe {
             return Err(Error::IntensityRefused {
                 got: capability.intensity(),
             });
         }
-        capability.execute().await
+        let (observation, draft) = capability.execute().await?;
+        // Borrow / push / drop, with no await across the borrow.
+        self.evidence.borrow_mut().push(draft);
+        Ok(observation)
     }
 }
 
@@ -186,7 +199,7 @@ mod tests {
             Intensity::Controlled
         }
 
-        async fn execute(&self) -> Result<(Observation<()>, Evidence)> {
+        async fn execute(&self) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
     }
@@ -205,7 +218,7 @@ mod tests {
             Intensity::Aggressive
         }
 
-        async fn execute(&self) -> Result<(Observation<()>, Evidence)> {
+        async fn execute(&self) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
     }
@@ -248,44 +261,73 @@ mod tests {
         ));
     }
 
-    /// Guard: a Safe capability is run and its observation and evidence are
-    /// returned. Mutation: make `run` refuse Safe too -> this fails.
+    /// A Safe stub capability that observes a reachable target, for the run path.
+    struct AlwaysReachable;
+    impl Capability for AlwaysReachable {
+        type Value = bool;
+        fn name(&self) -> &'static str {
+            "always_reachable_stub"
+        }
+        fn intensity(&self) -> Intensity {
+            Intensity::Safe
+        }
+        async fn execute(&self) -> Result<(Observation<bool>, EvidenceDraft)> {
+            Ok((
+                Observation {
+                    value: true,
+                    confidence: Confidence::High,
+                },
+                EvidenceDraft {
+                    capability: self.name(),
+                    target: "stub:0".to_owned(),
+                    intensity: self.intensity(),
+                    observed: serde_json::Value::Bool(true),
+                    confidence: Confidence::High,
+                    summary: "reachable".to_owned(),
+                    reproduction: crate::evidence::Reproduction {
+                        capability: self.name().to_owned(),
+                        target: "stub:0".to_owned(),
+                        params: serde_json::json!({}),
+                    },
+                },
+            ))
+        }
+    }
+
+    /// Guard: a Safe capability is run and its observation is returned. Mutation:
+    /// make `run` refuse Safe too -> this fails.
     #[test]
     fn safe_capability_runs() {
-        struct AlwaysReachable;
-        impl Capability for AlwaysReachable {
-            type Value = bool;
-            fn name(&self) -> &'static str {
-                "always_reachable_stub"
-            }
-            fn intensity(&self) -> Intensity {
-                Intensity::Safe
-            }
-            async fn execute(&self) -> Result<(Observation<bool>, Evidence)> {
-                Ok((
-                    Observation {
-                        value: true,
-                        confidence: Confidence::High,
-                    },
-                    Evidence {
-                        capability: self.name(),
-                        target: "stub:0".to_owned(),
-                        intensity: self.intensity(),
-                        reachable: true,
-                        confidence: Confidence::High,
-                    },
-                ))
-            }
-        }
-
         let ctx = TestContext::new(Scope::default());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime builds");
-        let (observation, evidence) = runtime
+        let observation = runtime
             .block_on(ctx.run(AlwaysReachable))
             .expect("a Safe capability runs");
         assert!(observation.value);
-        assert_eq!(evidence.capability, "always_reachable_stub");
+    }
+
+    /// Guard: `run` records exactly one evidence draft per execution, mirroring
+    /// the capability's result, and `take_evidence` drains it. Mutation: make
+    /// `run` skip the `evidence.push`, or push twice -> the count is not 1 ->
+    /// fails. This pins the "exactly one record per execution" criterion before
+    /// the runner collects it.
+    #[test]
+    fn run_records_exactly_one_evidence_draft() {
+        let ctx = TestContext::new(Scope::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        runtime
+            .block_on(ctx.run(AlwaysReachable))
+            .expect("a Safe capability runs");
+
+        let drafts = ctx.take_evidence();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].capability, "always_reachable_stub");
+        assert_eq!(drafts[0].observed, serde_json::Value::Bool(true));
+        // Drained, not left behind: a second drain is empty.
+        assert!(ctx.take_evidence().is_empty());
     }
 }
