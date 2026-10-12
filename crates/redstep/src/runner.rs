@@ -210,6 +210,7 @@ mod tests {
             actual: "y".to_owned(),
             confidence: Confidence::High,
             evidence: None,
+            diagnostic: None,
         }
     }
 

@@ -36,6 +36,8 @@ mod observation;
 // they are not a surface for a downstream crate to build on. See registry.rs.
 #[doc(hidden)]
 pub mod registry;
+/// The canonical JSON and its terminal renderer (Decision E, H-2).
+pub mod report;
 mod runner;
 mod scope;
 mod verdict;
@@ -44,7 +46,7 @@ pub use capability::{Capability, TcpConnect};
 pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
 pub use error::{Error, Result};
 pub use evidence::{DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore, Reproduction};
-pub use expectation::{Expectation, Judgement, judge};
+pub use expectation::{Diagnostic, Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
 pub use redstep_macros::security_test;

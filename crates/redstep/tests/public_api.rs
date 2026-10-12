@@ -356,7 +356,7 @@ fn run_links_judgements_to_their_evidence() {
 
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's
 /// usage-error `ExitCode::from(2)`, or drop the unknown-argument arm of
-/// `parse_scope` -> the process exits 0 -> fails.
+/// `parse_args` -> the process exits 0 -> fails.
 #[test]
 fn cli_rejects_unknown_argument_with_exit_2() {
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_redstep"))
@@ -369,8 +369,8 @@ fn cli_rejects_unknown_argument_with_exit_2() {
 /// Guard: the shipped binary links no `#[security_test]`, so every invocation
 /// discovers nothing, and a run that discovered nothing must not exit 0
 /// (CLAUDE.md row 6). Mutation: let `exit_code` pass an empty run, or make main
-/// return `ExitCode::SUCCESS` regardless of the summary -> the process exits 0
-/// -> fails. This ties the process exit to `RunSummary::exit_code`.
+/// return `ExitCode::SUCCESS` regardless of the report -> the process exits 0
+/// -> fails. This ties the process exit to the report's `exit_code`.
 #[test]
 fn cli_empty_run_does_not_exit_zero() {
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_redstep"))
@@ -378,6 +378,37 @@ fn cli_empty_run_does_not_exit_zero() {
         .status()
         .expect("spawn the redstep binary");
     assert_ne!(status.code(), Some(0));
+}
+
+/// Guard: `--json <path>` writes the canonical JSON, and it parses with the
+/// contract's keys. The shipped binary links no test, so the findings are empty,
+/// but the document and its keys are still present. Mutation: drop the
+/// `--json` arm of `parse_args`, or the `fs::write` in main -> the file is absent
+/// -> fails.
+#[test]
+fn cli_json_flag_writes_the_canonical_json() {
+    let path = std::env::temp_dir().join(format!("redstep-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_redstep"))
+        .args(["--json".as_ref(), path.as_os_str()])
+        .status()
+        .expect("spawn the redstep binary");
+    assert!(!status.success(), "an empty run is still non-zero");
+
+    let written = std::fs::read_to_string(&path).expect("the JSON was written");
+    let value: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    assert!(
+        value.get("schema_version").is_some(),
+        "the contract is versioned"
+    );
+    assert!(value.get("results").is_some(), "the contract has results");
+    assert!(value.get("evidence").is_some(), "the contract has evidence");
+    assert!(
+        value.get("exit_code").is_some(),
+        "the contract has exit_code"
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Guard: the public items are reachable on an external crate path. Mutation:

@@ -23,7 +23,7 @@ use std::fmt::Debug;
 use crate::capability::Capability;
 use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
-use crate::expectation::{Expectation, Judgement, judge};
+use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::scope::{Scope, ScopedTarget};
@@ -73,6 +73,12 @@ impl TestContext {
         } else {
             Verdict::Fail
         };
+        // The built-in check produces the FAIL diagnostic (Decision H-2); a bare
+        // check knows only its own condition, so the cause restates it.
+        let diagnostic = (!condition).then(|| Diagnostic {
+            probable_cause: format!("the asserted condition did not hold: {message}"),
+            remediation: "review the condition and the state it checks".to_owned(),
+        });
         self.record(
             Judgement {
                 verdict,
@@ -80,6 +86,7 @@ impl TestContext {
                 actual: message.to_owned(),
                 confidence: Confidence::High,
                 evidence: None,
+                diagnostic,
             },
             // A bare check came from no capability, so it rests on no evidence.
             None,
@@ -486,6 +493,35 @@ mod tests {
                 .iter()
                 .all(|(judgement, _)| judgement.evidence.is_none()),
             "the recorded Judgement.evidence is unresolved until the runner fills it"
+        );
+    }
+
+    /// Guard: a failing `check` records a `Fail` judgement carrying a FAIL
+    /// diagnostic whose cause names the assertion, and a passing `check` carries
+    /// none (Decision H-2; the built-in check produces it, on failure only).
+    /// Mutation: leave `diagnostic` `None` on failure -> the failing assert fails;
+    /// fill it unconditionally -> the passing assert fails; drop the message from
+    /// the cause -> the content assert fails.
+    #[test]
+    fn check_failure_carries_a_diagnostic() {
+        let ctx = TestContext::new(Scope::default());
+        let _ = ctx.check(false, "the boundary must hold");
+        ctx.check(true, "a tautology").expect("the check passes");
+
+        let pairs = ctx.take_judgements();
+        let (failed, _) = &pairs[0];
+        assert_eq!(failed.verdict, Verdict::Fail);
+        let diagnostic = failed
+            .diagnostic
+            .as_ref()
+            .expect("a failing check carries a diagnostic");
+        assert!(diagnostic.probable_cause.contains("the boundary must hold"));
+
+        let (passed, _) = &pairs[1];
+        assert_eq!(passed.verdict, Verdict::Pass);
+        assert!(
+            passed.diagnostic.is_none(),
+            "a passing check carries no diagnostic"
         );
     }
 }

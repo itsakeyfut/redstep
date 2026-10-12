@@ -203,6 +203,13 @@ Evidence Store ──> Canonical JSON (= 機械可読の真実の輸出形)
 
 **未決(今後詰める)**: 正規 JSON スキーマの確定(D の Evidence/Graph との対応)、SARIF の severity マッピング規則、HTML 可視化の実装方法、CI アノテーション(GitHub/GitLab)の具体形式。
 
+**MVP implementation note (settled in #6)**: the canonical JSON and its terminal renderer are the `report` module.
+
+- A `Report { schema_version, results: Vec<TestResult>, evidence: Vec<Evidence>, exit_code: i32 }` is projected once from a `RunSummary` by `report::build`; `report::to_json` (serde, pretty, newline-terminated) and `report::render_terminal` are the two renderers over it, so the file and the terminal cannot drift (the single-intermediate-representation point). SARIF and the HTML attack graph are later renderers over the same `Report` (M2). The published types carry `schema_version` (1) and are `#[non_exhaustive]`, so the contract can grow without a break; it is named `TestResult`, not `Finding`, because a `Finding` (Decision G) is a scanner's discovered issue whereas this is a test outcome that may be a PASS.
+- A `TestResult` is one security test: `test`, `verdict` (the `Verdict::label` string, an explicit contract rather than the internal enum's serde), `reasons` (the judgements), `error`, and `evidence_ids` (a list aggregated from the reasons that actually rest on evidence). `evidence_ids` being a list resolves the #14 cardinality note at the contract level: a result can rest on several records even though each `Reason` references one, so corroboration does not force a scalar-to-array break here.
+- The `evidence` section reuses the store's `Evidence` records as they are (already canonical, #5). `exit_code` is `RunSummary::exit_code` carried as a field, so a CI gate judges from the JSON without re-deriving the fail-closed rule.
+- MVP only: terminal + JSON. The JSON destination is the CLI's `--json <path>`; the library always produces the string. SARIF/HTML/attack-graph and CI annotations stay deferred (M2 / Phase 6).
+
 ---
 
 ### Decision F — Safety / Scope: Defense-in-Depth(確定)
@@ -312,7 +319,13 @@ FAIL  internet から database へ到達可能（本来は到達不可である�
 
 **理由**: これは「教育メタデータ層」とは別物で、フレームワークの**診断品質**の問題。組み込みチェックは FAIL の意味(例: セグメンテーション違反)を知っているので、作者の記述なしに実行可能な指針を出せる。開発者がセキュリティを意識するようになるという動機に、システムを汚さず自然に寄与する。
 
-**位置づけ**: 領域 E(Reporting / Canonical JSON Pivot)と、アサーション / Capability の設計に属する横断的方針。正規 JSON の finding に `expected` / `actual` / `probable_cause` / `remediation` フィールドを持たせ、terminal/SARIF/HTML の全出力がそれをレンダリングする。
+**MVP implementation note (settled in #6)**: the diagnostic is produced by the oracle, not the renderer or the test author.
+
+- `Judgement` gains `diagnostic: Option<Diagnostic { probable_cause, remediation }>`, which the built-in check fills on a `Fail` (`judge` for a value expectation, `check` for a bare assertion) and leaves `None` otherwise. The renderer only displays it.
+- In the MVP the only check is the generic value expectation, so the text is generic (it names the expected-vs-observed mismatch and points at the linked evidence). A later domain check that knows the meaning (segmentation, authorization) sets the richer text H-2's example shows, with no change to the renderer, because the field lives on the oracle's output.
+- `.hint()` (the author's optional addition) is deferred: H-2 makes it optional and no acceptance criterion needs it, so it waits for the first test that does.
+
+**位置づけ**: 領域 E(Reporting / Canonical JSON Pivot)と、アサーション / Capability の設計に属する横断的方針。正規 JSON の各テスト結果(result)が、その `reasons[]` に `expected` / `actual` / Evidence ID を、FAIL の `reasons[].diagnostic` に `probable_cause` / `remediation` を持ち、terminal/SARIF/HTML の全出力がそれをレンダリングする(実装の形は #6 ノート参照。当初は finding にフラットに持たせる想定だったが、1 テスト=1 結果・その下に複数の判定という構造に合わせて reasons/diagnostic 配下へ)。
 
 **未決(今後詰める)**: 組み込みチェックごとの remediation テンプレートの整備方針、ヒントの精度をどう担保するか、多言語(日本語/英語)対応の是非。
 

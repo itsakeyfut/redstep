@@ -9,6 +9,8 @@
 
 use std::fmt::Debug;
 
+use serde::{Deserialize, Serialize};
+
 use crate::evidence::EvidenceId;
 use crate::observation::{Confidence, Observation};
 use crate::verdict::Verdict;
@@ -44,6 +46,17 @@ impl<T> Expectation<T> {
     }
 }
 
+/// A rustc-style FAIL diagnostic: why the test failed and how to fix it, produced
+/// by the built-in check rather than authored per test (Decision H-2). Present on
+/// a `Fail`, absent otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    /// The probable cause, in the check's own terms.
+    pub probable_cause: String,
+    /// An actionable remediation hint.
+    pub remediation: String,
+}
+
 /// A judged expectation: the verdict and why, in a form a report can render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judgement {
@@ -62,13 +75,18 @@ pub struct Judgement {
     /// not assign until the runner drains the test's drafts (Decision J, issue
     /// #14). The runner fills it from the per-test reference the test carried.
     pub evidence: Option<EvidenceId>,
+    /// The FAIL diagnostic the built-in check produced (Decision H-2), or `None`
+    /// when the verdict is not `Fail`.
+    pub diagnostic: Option<Diagnostic>,
 }
 
 /// Compare an observation against an expectation.
 ///
 /// A signal below the required confidence is `Inconclusive`, whatever its value,
 /// so a weak signal cannot read as a confident `Pass` or `Fail`. Otherwise a
-/// value that matches the expectation is a `Pass`, and a mismatch is a `Fail`.
+/// value that matches the expectation is a `Pass`, and a mismatch is a `Fail`. A
+/// `Fail` also carries a generic [`Diagnostic`] (Decision H-2, produced by the
+/// check); a `Pass` or `Inconclusive` carries none.
 pub fn judge<T: PartialEq + Debug>(
     observation: &Observation<T>,
     expectation: &Expectation<T>,
@@ -80,14 +98,29 @@ pub fn judge<T: PartialEq + Debug>(
     } else {
         Verdict::Fail
     };
+    let expected = format!("{:?}", expectation.expected);
+    let actual = format!("{:?}", observation.value);
+    // The built-in check produces the FAIL diagnostic (Decision H-2). This value
+    // expectation knows only the mismatch, so the text is generic; a domain check
+    // (segmentation, authorization) that knows the meaning sets richer text with
+    // no change to the renderer.
+    let diagnostic = (verdict == Verdict::Fail).then(|| Diagnostic {
+        probable_cause: format!(
+            "the observed value was {actual}, but the test required {expected}; whatever should enforce {expected} did not hold"
+        ),
+        remediation:
+            "inspect the linked evidence for the exact action, then close the configuration or path that allowed it"
+                .to_owned(),
+    });
     Judgement {
         verdict,
-        expected: format!("{:?}", expectation.expected),
-        actual: format!("{:?}", observation.value),
+        expected,
+        actual,
         confidence: observation.confidence,
         // The link is attached at the `ExpectationBuilder` seam and resolved by
         // the runner, not here (Decision J): `judge` is pure and id-blind.
         evidence: None,
+        diagnostic,
     }
 }
 
@@ -188,5 +221,42 @@ mod tests {
         assert_eq!(judgement.actual, "true");
         assert_eq!(judgement.confidence, Confidence::High);
         assert_eq!(judgement.evidence, None);
+    }
+
+    /// Guard: the built-in value check produces a FAIL diagnostic and none on a
+    /// Pass or an Inconclusive (Decision H-2, produced by the check not the
+    /// author), and the cause names both the observed and the expected value.
+    /// Mutation: leave `diagnostic` `None` on a `Fail` -> the FAIL expect fails;
+    /// widen it to `!= Pass` -> the Inconclusive assert fails; set it on a Pass ->
+    /// the Pass assert fails; swap the `{actual}`/`{expected}` placeholders -> the
+    /// cause-content assert fails.
+    #[test]
+    fn fail_judge_produces_a_diagnostic() {
+        let fail = judge(
+            &observed(true, Confidence::High),
+            &Expectation::to_be(false),
+        );
+        let diagnostic = fail.diagnostic.expect("a FAIL carries a diagnostic");
+        assert!(
+            diagnostic.probable_cause.contains("true")
+                && diagnostic.probable_cause.contains("false"),
+            "the cause names the observed and the expected value, got {:?}",
+            diagnostic.probable_cause
+        );
+        assert!(!diagnostic.remediation.is_empty());
+
+        let pass = judge(
+            &observed(false, Confidence::High),
+            &Expectation::to_be(false),
+        );
+        assert!(pass.diagnostic.is_none(), "a PASS carries no diagnostic");
+
+        // Low confidence under the default High gate is Inconclusive, not Fail.
+        let inconclusive = judge(&observed(true, Confidence::Low), &Expectation::to_be(false));
+        assert_eq!(inconclusive.verdict, Verdict::Inconclusive);
+        assert!(
+            inconclusive.diagnostic.is_none(),
+            "an Inconclusive carries no diagnostic"
+        );
     }
 }
