@@ -11,8 +11,10 @@
 //! a positive control.
 
 use bollard::Docker;
+
 use bollard::models::NetworkConnectRequest;
 use bollard::query_parameters::{InspectContainerOptions, InspectNetworkOptions};
+
 use redstep::{Environment, Error, boundary_self_check, bring_up};
 
 /// A tiny pinned image for the stand-in workloads (#18 proves orchestration, not

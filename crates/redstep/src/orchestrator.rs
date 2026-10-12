@@ -22,6 +22,15 @@
 //! path is blocked at the membership level is [`boundary_self_check`] (Decision
 //! N step 4), which probes it behaviourally with a positive control and refuses
 //! a run whose forbidden path is reachable.
+//!
+//! It also *executes* a capability from the attacker's vantage:
+//! [`tcp_reachable_from`] runs a TCP-connect probe from a container on a lab
+//! network and reuses `tcp_connect`'s classification (#27, a Decision B
+//! refinement). That is a downward dependency on the capability layer, which the
+//! design permits: capability sits below environment, so the orchestrator may
+//! call its classification down. A host-run native connect is not usable here,
+//! because the host has a route to every segment and so cannot observe an
+//! inter-segment boundary; the attack must originate inside the lab.
 
 use std::collections::HashMap;
 
@@ -32,8 +41,15 @@ use bollard::models::{
 };
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
+use std::time::Duration;
+
+use crate::capability::tcp_connect::{ConnectOutcome, classify_connect, connect_summary};
 use crate::environment::Environment;
 use crate::error::{Error, Result};
+use crate::evidence::{EvidenceDraft, Reproduction};
+use crate::intensity::Intensity;
+use crate::observation::Observation;
+use crate::scope::ScopedTarget;
 
 /// A segment's Docker network, paired with the segment it was built from so the
 /// boundary self-check (and later units) can map a segment to its network
@@ -291,8 +307,9 @@ async fn remove_all(
     }
 }
 
-/// A tiny pinned image that can `ping`, for the self-check's probe containers (a
-/// workload image like `postgres:16` may not carry `ping`).
+/// A tiny pinned image carrying `ping` and `nc`, for the probe containers: the
+/// self-check's ICMP probe and the vantage TCP-connect probe (#27). A workload
+/// image like `postgres:16` may not carry either.
 const PROBE_IMAGE: &str = "busybox:1.37";
 
 /// Something that tests whether a probe placed on `network` can reach `target`
@@ -395,27 +412,59 @@ struct DockerProber<'a> {
 
 impl Prober for DockerProber<'_> {
     async fn reaches(&self, network: &str, target: &str) -> Result<bool> {
-        // A fresh name per probe (run_id's counter guarantees uniqueness within
-        // the process), removed after the run even on error. A probe dropped
-        // mid-run by a cancelled future can leak an egress-less container (row 5,
-        // not a scope escape); the run path does not cancel it.
-        let name = format!("{}-probe", run_id());
-        let result = run_probe(self.docker, &name, network, target).await;
-        let _ = self
-            .docker
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        result
+        // Two packets within a 2s deadline: one lost packet should not read a
+        // reachable target as blocked (the false-negative, row-6 direction). The
+        // dominant correct case fails instantly on name resolution.
+        let cmd = vec![
+            "ping".to_owned(),
+            "-c".to_owned(),
+            "2".to_owned(),
+            "-w".to_owned(),
+            "2".to_owned(),
+            target.to_owned(),
+        ];
+        // `-c 2 -w 2` exits within a few seconds; 10s of polling is ample slack
+        // for container create/start/exit latency and fails closed past that.
+        let state = run_probe_cmd(self.docker, network, cmd, Duration::from_secs(10)).await?;
+        classify_probe(&state)
     }
 }
 
-async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> Result<bool> {
+/// Run `cmd` in a disposable busybox container on `network`, wait up to
+/// `max_wait` for it to exit, and return its final state. `max_wait` is derived
+/// from the probe's own deadline by the caller (the ping's `-w`, the connect's
+/// `-w`), so a probe that does not exit fails closed rather than hanging. The
+/// container is removed before returning, even on error. Shared by the boundary
+/// self-check (ping) and the vantage reachability probe (nc). A probe dropped
+/// mid-run by a cancelled future can leak an egress-less container (row 5, not a
+/// scope escape); the run paths do not cancel it.
+async fn run_probe_cmd(
+    docker: &Docker,
+    network: &str,
+    cmd: Vec<String>,
+    max_wait: Duration,
+) -> Result<ContainerState> {
+    let name = format!("{}-probe", run_id());
+    let result = run_probe_to_exit(docker, &name, network, cmd, max_wait).await;
+    let _ = docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    result
+}
+
+async fn run_probe_to_exit(
+    docker: &Docker,
+    name: &str,
+    network: &str,
+    cmd: Vec<String>,
+    max_wait: Duration,
+) -> Result<ContainerState> {
     let endpoints = HashMap::from([(network.to_owned(), EndpointSettings::default())]);
     docker
         .create_container(
@@ -425,18 +474,7 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
             }),
             ContainerCreateBody {
                 image: Some(PROBE_IMAGE.to_owned()),
-                // Two packets within a 2s deadline: one lost packet should not
-                // read a reachable target as blocked (the false-negative, row-6
-                // direction). The dominant correct case fails instantly on name
-                // resolution, not on this deadline.
-                cmd: Some(vec![
-                    "ping".to_owned(),
-                    "-c".to_owned(),
-                    "2".to_owned(),
-                    "-w".to_owned(),
-                    "2".to_owned(),
-                    target.to_owned(),
-                ]),
+                cmd: Some(cmd),
                 networking_config: Some(NetworkingConfig {
                     endpoints_config: Some(endpoints),
                 }),
@@ -452,14 +490,10 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
         )
         .await
         .map_err(lab_unavailable)?;
-    probe_exit(docker, name).await
-}
-
-/// Poll until the probe container exits, then classify it. Bounded at 40 polls x
-/// 500ms (~20s against `ping -w 2`) so a stuck probe fails closed rather than
-/// hanging the check.
-async fn probe_exit(docker: &Docker, name: &str) -> Result<bool> {
-    for _ in 0..40 {
+    // Poll every 500ms up to `max_wait` (derived from the probe's own deadline),
+    // so a stuck probe fails closed rather than hanging.
+    let polls = (max_wait.as_millis() / 500).max(1) as usize;
+    for _ in 0..polls {
         let info = docker
             .inspect_container(
                 name,
@@ -469,33 +503,161 @@ async fn probe_exit(docker: &Docker, name: &str) -> Result<bool> {
             .map_err(lab_unavailable)?;
         let state = info.state.unwrap_or_default();
         if state.running != Some(true) {
-            return classify_probe(&state);
+            return Ok(state);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(Error::LabUnavailable {
-        reason: format!("boundary self-check probe {name:?} did not exit within the timeout"),
+        reason: format!("probe {name:?} did not exit within the timeout"),
     })
 }
 
-/// Read a finished probe's state as reachable (ping got a reply, exit 0) or not
-/// (clean no-reply/unresolved, busybox exit 1). Anything else, a non-`exited`
-/// state or a code that is not a clean ping outcome, is `Err(LabUnavailable)`:
-/// an undeterminable probe must refuse rather than be read as "blocked" (the
-/// row-6 direction).
+/// A finished probe's exit code, or `Err(LabUnavailable)` if it did not cleanly
+/// exit: an undeterminable probe must fail closed, never be read as a result.
+fn finished_exit_code(state: &ContainerState) -> Result<i64> {
+    if state.status == Some(ContainerStateStatusEnum::EXITED)
+        && let Some(code) = state.exit_code
+    {
+        return Ok(code);
+    }
+    Err(Error::LabUnavailable {
+        reason: format!(
+            "probe exited abnormally (status {:?}, code {:?})",
+            state.status, state.exit_code
+        ),
+    })
+}
+
+/// Read a finished ping probe as reachable (a reply, exit 0) or not (clean
+/// no-reply/unresolved, busybox exit 1). Any other code is `Err(LabUnavailable)`:
+/// the self-check must refuse rather than read an abnormal probe as "blocked".
 fn classify_probe(state: &ContainerState) -> Result<bool> {
-    let exited = state.status == Some(ContainerStateStatusEnum::EXITED);
-    match (exited, state.exit_code) {
-        (true, Some(0)) => Ok(true),
-        (true, Some(1)) => Ok(false),
-        _ => Err(Error::LabUnavailable {
+    match finished_exit_code(state)? {
+        0 => Ok(true),
+        1 => Ok(false),
+        other => Err(Error::LabUnavailable {
             reason: format!(
-                "boundary self-check probe exited abnormally (status {:?}, code {:?}); \
-                 isolation cannot be certified",
-                state.status, state.exit_code
+                "boundary self-check ping probe exited with {other}; isolation cannot be certified"
             ),
         }),
     }
+}
+
+/// The busybox `nc` connect probe as argv (never a shell line): connect to
+/// `host:port`, giving up after `secs`, reading nothing. Passing argv directly
+/// rather than through `sh -c` means a crafted host or port is one argument to
+/// `nc`, not text a shell could interpret, so it cannot inject a command into the
+/// probe container. Pure, so the argv shape is unit-tested without Docker.
+// A helper of `tcp_reachable_from`, which has no non-test caller until #28; see
+// there. `allow` not `expect`, because the test build does use it.
+#[allow(dead_code)]
+fn nc_cmd(host: &str, port: u16, secs: u64) -> Vec<String> {
+    vec![
+        "nc".to_owned(),
+        "-w".to_owned(),
+        secs.to_string(),
+        host.to_owned(),
+        port.to_string(),
+    ]
+}
+
+/// Read a finished busybox `nc` connect probe as a connect outcome: exit 0 is a
+/// completed connect; exit 1 is `Indeterminate`, because busybox `nc` dies with 1
+/// on a refusal, a timeout, or no route without distinguishing them, so it cannot
+/// surface a `Refused`. Any other code, or a probe that did not cleanly exit
+/// (crashed, killed, never ran), is `Err(LabUnavailable)`: an abnormal probe must
+/// fail closed, never be read as a clean "unreachable" (CLAUDE.md row 6). Taking
+/// the state (not a bare code) folds the exited-cleanly check in, so the whole
+/// fail-closed mapping is unit-tested without Docker.
+// A helper of `tcp_reachable_from`, which has no non-test caller until #28; see
+// there. `allow` not `expect`, because the test build does use it.
+#[allow(dead_code)]
+fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
+    match finished_exit_code(state)? {
+        0 => Ok(ConnectOutcome::Connected),
+        1 => Ok(ConnectOutcome::Indeterminate),
+        other => Err(Error::LabUnavailable {
+            reason: format!(
+                "vantage nc probe exited with {other}; reachability cannot be determined"
+            ),
+        }),
+    }
+}
+
+/// Observe whether a scope-resolved `target` is reachable by TCP from the
+/// attacker's vantage, running a busybox `nc` connect from a container on the
+/// `vantage` network (#27). A host-run native connect is not usable: the host has
+/// a route to every segment and so cannot observe an inter-segment boundary, so
+/// the attack must originate inside the lab. The types are the gate: a
+/// [`LabNetwork`] is only produced by `bring_up` (so the probe runs on a real,
+/// egress-less lab network, not an arbitrary one like `bridge`), and a
+/// [`ScopedTarget`] is only produced by the scope resolver (so the probe cannot
+/// be aimed at a raw address outside scope).
+///
+/// The observation reuses `tcp_connect`'s classification (a completed connect is
+/// reachable at `High`; a failure is unreachable at `Low`, because busybox `nc`
+/// cannot prove the port closed), so the native and vantage paths agree on what a
+/// connect means. The confidence still differs by path in the one way that
+/// matters: a `Low` "unreachable" from a single vantage connect cannot by itself
+/// certify that a boundary held (the oracle's default `High` keeps it out of a
+/// confident PASS); that certification is [`boundary_self_check`]'s job, with its
+/// positive control. The draft is *not* a native `tcp_connect` record: it carries
+/// a distinct capability name and records the vantage network, so a reader cannot
+/// mistake an in-lab vantage probe for a host-run connect. An abnormal probe is
+/// `Error::LabUnavailable`, fail-closed.
+///
+/// The recorded reproduction is minimal and not yet a faithful replay witness
+/// (Decision D's `source` node and Decision V's pinned replay are a follow-up):
+/// it records the applied timeout and the vantage network, not the full lab the
+/// probe ran against.
+// No non-test caller yet: the lab-wired run path (#28, the next sub-issue of this
+// parent) is the consumer, and #27 is scoped to the executor plus its own test so
+// each sub-issue leaves the tree green. `allow` not `expect`: the in-crate Docker
+// test does use it, so the expectation would be unfulfilled in the test build.
+#[allow(dead_code)]
+pub(crate) async fn tcp_reachable_from(
+    docker: &Docker,
+    vantage: &LabNetwork,
+    target: &ScopedTarget,
+    timeout: Duration,
+) -> Result<(Observation<bool>, EvidenceDraft)> {
+    // Whole seconds for `nc -w`; record this applied value, not the requested
+    // `timeout`, so the reproduction restates what actually ran.
+    let secs = timeout.as_secs().max(1);
+    let applied = Duration::from_secs(secs);
+    let host = target.host();
+    let port = target.port();
+
+    let cmd = nc_cmd(host, port, secs);
+    // `nc` waits up to `secs`; allow that plus container create/start/exit slack.
+    let state = run_probe_cmd(
+        docker,
+        vantage.name(),
+        cmd,
+        applied + Duration::from_secs(5),
+    )
+    .await?;
+    let outcome = nc_result(&state)?;
+    let observation = classify_connect(outcome);
+
+    let spec = format!("{host}:{port}");
+    let draft = EvidenceDraft {
+        capability: "tcp_connect_vantage",
+        target: spec.clone(),
+        intensity: Intensity::Safe,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary: connect_summary(outcome).to_owned(),
+        reproduction: Reproduction {
+            capability: "tcp_connect_vantage".to_owned(),
+            target: spec,
+            params: serde_json::json!({
+                "timeout_ms": applied.as_millis() as u64,
+                "vantage_network": vantage.name(),
+            }),
+        },
+    };
+    Ok((observation, draft))
 }
 
 impl RunningLab {
@@ -801,6 +963,63 @@ mod tests {
         );
     }
 
+    /// Guard: `nc_result` reads exit 0 as a completed connect, exit 1 as
+    /// indeterminate (busybox `nc` cannot surface a refusal), and any other code
+    /// or an abnormal probe fails closed rather than reading as a clean
+    /// "unreachable" (CLAUDE.md row 6). Mutation: the exit-1 arm to `Connected`
+    /// -> an unreachable target reads as reachable -> this fails; the `other =>
+    /// Err` arm to `Ok(Indeterminate)` -> a crashed probe reads as a clean
+    /// not-reachable -> the Err assertion fails.
+    #[test]
+    fn nc_result_reads_a_finished_probe_and_fails_closed() {
+        use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
+        let state = |status, code| ContainerState {
+            status,
+            exit_code: code,
+            ..Default::default()
+        };
+        assert_eq!(
+            nc_result(&state(Some(EXITED), Some(0))).unwrap(),
+            ConnectOutcome::Connected
+        );
+        assert_eq!(
+            nc_result(&state(Some(EXITED), Some(1))).unwrap(),
+            ConnectOutcome::Indeterminate
+        );
+        for abnormal in [
+            state(Some(EXITED), Some(137)), // crashed / OOM-killed
+            state(Some(EXITED), None),      // exited without a code
+            state(Some(CREATED), Some(0)),  // never ran
+        ] {
+            assert!(
+                matches!(nc_result(&abnormal), Err(Error::LabUnavailable { .. })),
+                "an abnormal probe must fail closed: {:?}",
+                abnormal.status
+            );
+        }
+    }
+
+    /// Guard: the vantage probe command is argv run directly, never a shell line,
+    /// so a crafted host or port cannot inject a command into the probe container.
+    /// Mutation: build the command as `["sh", "-c", format!(...)]` -> the no-shell
+    /// assertion fails; drop the host argument -> the host-is-one-argument
+    /// assertion fails.
+    #[test]
+    fn nc_cmd_is_argv_not_a_shell_line() {
+        let hostile = "db; rm -rf /";
+        let cmd = nc_cmd(hostile, 5432, 2);
+        assert_eq!(cmd[0], "nc", "the probe runs nc directly");
+        assert!(
+            !cmd.iter().any(|a| a == "sh" || a == "-c"),
+            "no shell wrapper, got {cmd:?}"
+        );
+        assert!(
+            cmd.contains(&hostile.to_owned()),
+            "the host is one argument, not interpreted: {cmd:?}"
+        );
+        assert!(cmd.contains(&"5432".to_owned()) && cmd.contains(&"2".to_owned()));
+    }
+
     /// Guard: `classify_probe` reads a clean ping outcome and fails closed on
     /// anything else. Mutation: change the `_ => Err` arm to `Ok(false)` -> the
     /// abnormal cases read as "blocked" -> the Err assertions fail; flip the
@@ -834,5 +1053,152 @@ mod tests {
                 abnormal.status
             );
         }
+    }
+
+    /// The vantage executor is Linux containers (egress-less bridge networks,
+    /// busybox `nc`), so its integration test needs a daemon in Linux-container
+    /// mode, not merely a reachable one: a Windows-container daemon reports
+    /// success for `docker info` but cannot run the probe. Skip unless `OSType`
+    /// is `linux`. (Mirrors the gate in `tests/environment.rs`.)
+    fn linux_docker_available() -> bool {
+        std::process::Command::new("docker")
+            .args(["info", "--format", "{{.OSType}}"])
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
+            .unwrap_or(false)
+    }
+
+    /// Guard (Docker, Linux CI leg; self-skips without a daemon): the vantage TCP
+    /// executor observes a listening target as reachable from a probe on the
+    /// target's own network, and unreachable from a probe on a different,
+    /// isolated network where the target's name does not even resolve, matching
+    /// what the attacker's vantage would see (#27). It also checks the draft does
+    /// not masquerade as a native host-run connect: the capability name marks it
+    /// as a vantage probe and the reproduction records the vantage network.
+    /// Mutation: in `tcp_reachable_from`, run the probe on a hard-coded network
+    /// rather than the `vantage` passed -> the cross-network probe resolves and
+    /// reaches the listener -> the unreachable assertion fails.
+    ///
+    /// It builds its own two egress-less networks and a listening busybox target
+    /// rather than a full lab, because a TCP probe is meaningful only against a
+    /// listener and the MVP stand-ins do not listen (the end-to-end demo with a
+    /// listening db is #28). It lives in-crate, not in `tests/`, because the typed
+    /// signature takes a `LabNetwork` (private fields) and a `ScopedTarget` (only
+    /// the resolver builds one), neither constructible from an external crate.
+    #[test]
+    fn tcp_reachable_from_sees_a_listener_on_its_own_network_only() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping tcp_reachable_from_sees_a_listener_on_its_own_network_only: no Linux Docker daemon"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let tag = format!("redstep-vantage-{}", std::process::id());
+            let net_a = format!("{tag}-a");
+            let net_b = format!("{tag}-b");
+            let listener = format!("{tag}-listener");
+            let port = 9000u16;
+
+            // The probe and the listener both run from PROBE_IMAGE; pull it once
+            // (`run_probe_cmd`'s create path does not pull, unlike `bring_up`).
+            pull_image(&docker, PROBE_IMAGE)
+                .await
+                .expect("pull the probe image");
+
+            for name in [&net_a, &net_b] {
+                docker
+                    .create_network(NetworkCreateRequest {
+                        name: name.clone(),
+                        internal: Some(true),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("create network");
+            }
+
+            // A re-listening busybox target on net_a.
+            docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: Some(listener.clone()),
+                        ..Default::default()
+                    }),
+                    ContainerCreateBody {
+                        image: Some(PROBE_IMAGE.to_owned()),
+                        cmd: Some(vec![
+                            "sh".to_owned(),
+                            "-c".to_owned(),
+                            format!("while true; do nc -l -p {port} >/dev/null 2>&1; done"),
+                        ]),
+                        networking_config: Some(NetworkingConfig {
+                            endpoints_config: Some(HashMap::from([(
+                                net_a.clone(),
+                                EndpointSettings::default(),
+                            )])),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create listener");
+            docker
+                .start_container(
+                    &listener,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .expect("start listener");
+
+            let spec = format!("{listener}:{port}");
+            let scope = crate::scope::Scope::builder()
+                .allow(&spec)
+                .expect("valid spec")
+                .build();
+            let target = scope.resolve(&spec).expect("in scope");
+
+            let same_net =
+                tcp_reachable_from(&docker, &net("a", &net_a), &target, Duration::from_secs(2))
+                    .await;
+            let cross_net =
+                tcp_reachable_from(&docker, &net("b", &net_b), &target, Duration::from_secs(2))
+                    .await;
+
+            // Clean up before asserting so a failed assertion does not leak.
+            let _ = docker
+                .remove_container(
+                    &listener,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            for name in [&net_a, &net_b] {
+                let _ = docker.remove_network(name).await;
+            }
+
+            let (same, same_draft) = same_net.expect("same-network probe ran");
+            assert!(
+                same.value,
+                "a listener on the probe's own network is reachable"
+            );
+            // The draft marks itself a vantage probe and records the vantage
+            // network, so it is not mistaken for a native host-run tcp_connect.
+            assert_eq!(same_draft.capability, "tcp_connect_vantage");
+            assert_eq!(same_draft.target, spec);
+            assert_eq!(
+                same_draft.reproduction.params["vantage_network"].as_str(),
+                Some(net_a.as_str()),
+                "the reproduction records which vantage the probe ran from"
+            );
+
+            let (cross, _) = cross_net.expect("cross-network probe ran");
+            assert!(
+                !cross.value,
+                "a listener whose name does not resolve on a different, isolated network is not reachable from the vantage"
+            );
+        });
     }
 }
