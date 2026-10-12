@@ -52,7 +52,7 @@ pub use evidence::{DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore,
 pub use expectation::{Diagnostic, Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
-pub use orchestrator::{LabContainer, LabNetwork, RunningLab, bring_up};
+pub use orchestrator::{LabContainer, LabNetwork, RunningLab, boundary_self_check, bring_up};
 pub use redstep_macros::security_test;
 pub use runner::{RunError, RunSummary, TestRun, run};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};

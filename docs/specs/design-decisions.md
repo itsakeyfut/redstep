@@ -438,6 +438,13 @@ ctx.expect(obs.reachable()).to_be(false).min_confidence(Confidence::High);
 
 **未決(今後詰める)**: FW ゲートウェイの実装(nftables/iptables の構成、特権コンテナと隔離の両立)、境界セルフチェックの具体的な検査項目と頻度、membership/FW のハイブリッド構成の内部表現、VPN 境界の表現方法(「Attack Tooling Survey」 の ike-scan 検証と接続)。
 
+**MVP implementation note (settled in #18, #19)**: the membership-only layer and the minimal self-check.
+
+- Bring-up (#18): `orchestrator::bring_up` creates one Docker network per segment, each `internal: true` (egress-less, Decision F layer 1), and attaches each workload to its segment's network only. Separate networks are the membership boundary: `internet` and `internal` are unconnected, so `internet -> internal` is blocked by construction, with no firewall gateway (that is Phase 4 / M3). The egress-less flag is checked structurally (inspecting `Internal == true`), since proving the flag actually blocks real egress would mean reaching real infrastructure.
+- Self-check (#19): `orchestrator::boundary_self_check` verifies each declared-forbidden path *behaviourally* before a run. For every workload in the `to` segment (not a representative: the break it catches is one workload wrongly attached to `from`), a probe container in the `from` segment must fail to reach the workload by container name over ICMP, while a positive-control probe in the `to` segment reaches it, so a broken probe cannot read as isolation. `Ok(())` only when every such path is blocked; a reachable forbidden path is `Error::BoundaryViolated`, a failed control or an undeterminable probe is `Error::LabUnavailable` (fail-closed). The result is distinct from a test verdict (Decision J).
+- The check verifies *membership* isolation only. ICMP-by-container-name tracks Docker's per-network DNS, so it detects a workload attached to the wrong network (the MVP's all-or-nothing boundary), but not a routed path without a co-located DNS record, nor a port-level allow/deny (ICMP dropped while a TCP port is open reads as blocked). The Phase 4 / M3 firewall gateway adds routed and port-level boundaries and will need a TCP-to-port probe, not name-based ICMP; this is the still-open "具体的な検査項目" above.
+- Gating is deferred: `run` is not yet lab-wired, so the self-check is a function a caller gates on (`Ok` is the only way past); wiring it before the runner's tests is the M1 vertical-slice assembly, with scope-from-lab (#20), the H-slice app, and capability-against-lab. The behavioural proof of a blocked path lives here, not in #18's bring-up test, where a second-bridge rendezvous is confounded by Docker's inter-network isolation.
+
 ---
 
 ### Decision L — シナリオ状態モデル: Attacker State Graph(確定)
