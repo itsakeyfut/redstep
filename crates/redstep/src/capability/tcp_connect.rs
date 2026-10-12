@@ -89,7 +89,7 @@ impl Capability for TcpConnect {
 /// What a connection attempt established. Only a completed handshake and an
 /// explicit refusal are confident; everything else is ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectOutcome {
+pub(crate) enum ConnectOutcome {
     /// The handshake completed: the port accepts a connection.
     Connected,
     /// The target refused the connection (an RST): the port is closed.
@@ -122,7 +122,7 @@ where
 /// is tested without a socket. Connected and Refused are `High`; Indeterminate
 /// (timeout or any non-refusal error) is unreachable at `Low`, so an unrelated
 /// failure cannot read as a confident boundary hold.
-fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
+pub(crate) fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
     match outcome {
         ConnectOutcome::Connected => Observation {
             value: true,
@@ -152,7 +152,7 @@ fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
 /// projection that reads the summary without the confidence read a probe-side
 /// non-result as a confident boundary hold (a false PASS, CLAUDE.md row 6). The
 /// `confidence` already distinguishes them; the summary must not contradict it.
-fn build_draft(
+pub(crate) fn build_draft(
     capability: &'static str,
     target: String,
     intensity: Intensity,

@@ -32,8 +32,14 @@ use bollard::models::{
 };
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
+use std::time::Duration;
+
+use crate::capability::tcp_connect::{ConnectOutcome, build_draft, classify_connect};
 use crate::environment::Environment;
 use crate::error::{Error, Result};
+use crate::evidence::EvidenceDraft;
+use crate::intensity::Intensity;
+use crate::observation::Observation;
 
 /// A segment's Docker network, paired with the segment it was built from so the
 /// boundary self-check (and later units) can map a segment to its network
@@ -395,27 +401,49 @@ struct DockerProber<'a> {
 
 impl Prober for DockerProber<'_> {
     async fn reaches(&self, network: &str, target: &str) -> Result<bool> {
-        // A fresh name per probe (run_id's counter guarantees uniqueness within
-        // the process), removed after the run even on error. A probe dropped
-        // mid-run by a cancelled future can leak an egress-less container (row 5,
-        // not a scope escape); the run path does not cancel it.
-        let name = format!("{}-probe", run_id());
-        let result = run_probe(self.docker, &name, network, target).await;
-        let _ = self
-            .docker
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        result
+        // Two packets within a 2s deadline: one lost packet should not read a
+        // reachable target as blocked (the false-negative, row-6 direction). The
+        // dominant correct case fails instantly on name resolution.
+        let cmd = vec![
+            "ping".to_owned(),
+            "-c".to_owned(),
+            "2".to_owned(),
+            "-w".to_owned(),
+            "2".to_owned(),
+            target.to_owned(),
+        ];
+        let state = run_probe_cmd(self.docker, network, cmd).await?;
+        classify_probe(&state)
     }
 }
 
-async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> Result<bool> {
+/// Run `cmd` in a disposable busybox container on `network`, wait for it to exit
+/// (bounded), and return its final state. The container is removed before
+/// returning, even on error. Shared by the boundary self-check (ping) and the
+/// vantage reachability probe (nc). A probe dropped mid-run by a cancelled
+/// future can leak an egress-less container (row 5, not a scope escape); the run
+/// paths do not cancel it.
+async fn run_probe_cmd(docker: &Docker, network: &str, cmd: Vec<String>) -> Result<ContainerState> {
+    let name = format!("{}-probe", run_id());
+    let result = run_probe_to_exit(docker, &name, network, cmd).await;
+    let _ = docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    result
+}
+
+async fn run_probe_to_exit(
+    docker: &Docker,
+    name: &str,
+    network: &str,
+    cmd: Vec<String>,
+) -> Result<ContainerState> {
     let endpoints = HashMap::from([(network.to_owned(), EndpointSettings::default())]);
     docker
         .create_container(
@@ -425,18 +453,7 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
             }),
             ContainerCreateBody {
                 image: Some(PROBE_IMAGE.to_owned()),
-                // Two packets within a 2s deadline: one lost packet should not
-                // read a reachable target as blocked (the false-negative, row-6
-                // direction). The dominant correct case fails instantly on name
-                // resolution, not on this deadline.
-                cmd: Some(vec![
-                    "ping".to_owned(),
-                    "-c".to_owned(),
-                    "2".to_owned(),
-                    "-w".to_owned(),
-                    "2".to_owned(),
-                    target.to_owned(),
-                ]),
+                cmd: Some(cmd),
                 networking_config: Some(NetworkingConfig {
                     endpoints_config: Some(endpoints),
                 }),
@@ -452,13 +469,8 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
         )
         .await
         .map_err(lab_unavailable)?;
-    probe_exit(docker, name).await
-}
-
-/// Poll until the probe container exits, then classify it. Bounded at 40 polls x
-/// 500ms (~20s against `ping -w 2`) so a stuck probe fails closed rather than
-/// hanging the check.
-async fn probe_exit(docker: &Docker, name: &str) -> Result<bool> {
+    // Bounded at 40 polls x 500ms (~20s against a `-w 2` probe) so a stuck probe
+    // fails closed rather than hanging.
     for _ in 0..40 {
         let info = docker
             .inspect_container(
@@ -469,33 +481,93 @@ async fn probe_exit(docker: &Docker, name: &str) -> Result<bool> {
             .map_err(lab_unavailable)?;
         let state = info.state.unwrap_or_default();
         if state.running != Some(true) {
-            return classify_probe(&state);
+            return Ok(state);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(Error::LabUnavailable {
-        reason: format!("boundary self-check probe {name:?} did not exit within the timeout"),
+        reason: format!("probe {name:?} did not exit within the timeout"),
     })
 }
 
-/// Read a finished probe's state as reachable (ping got a reply, exit 0) or not
-/// (clean no-reply/unresolved, busybox exit 1). Anything else, a non-`exited`
-/// state or a code that is not a clean ping outcome, is `Err(LabUnavailable)`:
-/// an undeterminable probe must refuse rather than be read as "blocked" (the
-/// row-6 direction).
+/// A finished probe's exit code, or `Err(LabUnavailable)` if it did not cleanly
+/// exit: an undeterminable probe must fail closed, never be read as a result.
+fn finished_exit_code(state: &ContainerState) -> Result<i64> {
+    if state.status == Some(ContainerStateStatusEnum::EXITED)
+        && let Some(code) = state.exit_code
+    {
+        return Ok(code);
+    }
+    Err(Error::LabUnavailable {
+        reason: format!(
+            "probe exited abnormally (status {:?}, code {:?})",
+            state.status, state.exit_code
+        ),
+    })
+}
+
+/// Read a finished ping probe as reachable (a reply, exit 0) or not (clean
+/// no-reply/unresolved, busybox exit 1). Any other code is `Err(LabUnavailable)`:
+/// the self-check must refuse rather than read an abnormal probe as "blocked".
 fn classify_probe(state: &ContainerState) -> Result<bool> {
-    let exited = state.status == Some(ContainerStateStatusEnum::EXITED);
-    match (exited, state.exit_code) {
-        (true, Some(0)) => Ok(true),
-        (true, Some(1)) => Ok(false),
-        _ => Err(Error::LabUnavailable {
+    match finished_exit_code(state)? {
+        0 => Ok(true),
+        1 => Ok(false),
+        other => Err(Error::LabUnavailable {
             reason: format!(
-                "boundary self-check probe exited abnormally (status {:?}, code {:?}); \
-                 isolation cannot be certified",
-                state.status, state.exit_code
+                "boundary self-check ping probe exited with {other}; isolation cannot be certified"
             ),
         }),
     }
+}
+
+/// Map a busybox `nc` exit code to a connect outcome: 0 is a completed connect;
+/// anything else is indeterminate, because busybox `nc` dies non-zero on a
+/// refusal, a timeout, or no route without distinguishing them, so it cannot
+/// surface a `Refused`. Pure, so the mapping is unit-tested without Docker.
+fn nc_outcome(exit_code: i64) -> ConnectOutcome {
+    if exit_code == 0 {
+        ConnectOutcome::Connected
+    } else {
+        ConnectOutcome::Indeterminate
+    }
+}
+
+/// Observe whether `target_host:target_port` is reachable by TCP from the
+/// attacker's vantage, running a busybox `nc` connect from a container on
+/// `vantage_network` (#27). The result maps to the same `Observation` and
+/// `EvidenceDraft` `TcpConnect` produces (Decision B, D), so the native and
+/// vantage paths are indistinguishable downstream: a completed connect is
+/// reachable at `High`, a failure is unreachable at `Low` (busybox `nc` cannot
+/// prove the port closed). An abnormal probe (it did not cleanly exit) is
+/// `Error::LabUnavailable`, fail-closed. A host-run native connect is not used:
+/// the host reaches every segment and so cannot act from the vantage.
+pub async fn tcp_reachable_from(
+    docker: &Docker,
+    vantage_network: &str,
+    target_host: &str,
+    target_port: u16,
+    timeout: Duration,
+) -> Result<(Observation<bool>, EvidenceDraft)> {
+    let secs = timeout.as_secs().max(1);
+    let cmd = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("nc -w {secs} {target_host} {target_port} </dev/null"),
+    ];
+    let state = run_probe_cmd(docker, vantage_network, cmd).await?;
+    let outcome = nc_outcome(finished_exit_code(&state)?);
+    let observation = classify_connect(outcome);
+    let target = format!("{target_host}:{target_port}");
+    let draft = build_draft(
+        "tcp_connect",
+        target,
+        Intensity::Safe,
+        timeout,
+        outcome,
+        &observation,
+    );
+    Ok((observation, draft))
 }
 
 impl RunningLab {
@@ -799,6 +871,18 @@ mod tests {
             matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "b" && to == "a"),
             "got {result:?}"
         );
+    }
+
+    /// Guard: `nc_outcome` reads exit 0 as a completed connect and anything else
+    /// as indeterminate (busybox `nc` cannot surface a refusal). Mutation: the
+    /// non-zero arm to `Connected` -> an unreachable target reads as reachable ->
+    /// this fails; the zero arm to `Indeterminate` -> a reachable target reads as
+    /// not -> this fails.
+    #[test]
+    fn nc_outcome_reads_exit_zero_as_connected() {
+        assert_eq!(nc_outcome(0), ConnectOutcome::Connected);
+        assert_eq!(nc_outcome(1), ConnectOutcome::Indeterminate);
+        assert_eq!(nc_outcome(137), ConnectOutcome::Indeterminate);
     }
 
     /// Guard: `classify_probe` reads a clean ping outcome and fails closed on
