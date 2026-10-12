@@ -156,12 +156,44 @@ pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> 
     }
 }
 
+/// Pull `image` so `create_container` finds it. The Docker API's
+/// `create_container` does not pull and returns 404 for an absent image, so the
+/// orchestrator pulls first. Idempotent: a present image streams quickly and
+/// succeeds. The image reference is split on its last `:` into name and tag
+/// (the MVP's `busybox:1.37`, `postgres:16`); a registry-with-port reference is
+/// not an MVP shape.
+async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
+    use futures_util::StreamExt;
+
+    let (from_image, tag) = match image.rsplit_once(':') {
+        Some((name, tag)) => (name.to_owned(), tag.to_owned()),
+        None => (image.to_owned(), "latest".to_owned()),
+    };
+    let options = bollard::query_parameters::CreateImageOptionsBuilder::default()
+        .from_image(&from_image)
+        .tag(&tag)
+        .build();
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(item) = stream.next().await {
+        item.map_err(lab_unavailable)?;
+    }
+    Ok(())
+}
+
 async fn provision(
     docker: &Docker,
     env: &Environment,
     run_id: &str,
     lab: &mut RunningLab,
 ) -> Result<()> {
+    // Pull each distinct workload image before any container is created.
+    let mut pulled = std::collections::HashSet::new();
+    for workload in env.workloads() {
+        if pulled.insert(workload.image()) {
+            pull_image(docker, workload.image()).await?;
+        }
+    }
+
     for segment in env.segments() {
         let name = network_name(run_id, segment.name());
         docker

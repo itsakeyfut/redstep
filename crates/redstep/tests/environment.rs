@@ -20,11 +20,15 @@ use redstep::{Environment, bring_up};
 /// real services; the real vulnerable images are the H slice).
 const STANDIN_IMAGE: &str = "busybox:1.37";
 
-fn docker_available() -> bool {
+/// The lab is Linux containers (egress-less bridge networks, busybox), so it
+/// needs a daemon in Linux-container mode, not merely a reachable daemon: a
+/// Windows-container daemon reports success for `docker info` but cannot run the
+/// lab. Skip unless `OSType` is `linux`.
+fn linux_docker_available() -> bool {
     std::process::Command::new("docker")
-        .arg("info")
+        .args(["info", "--format", "{{.OSType}}"])
         .output()
-        .map(|o| o.status.success())
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
         .unwrap_or(false)
 }
 
@@ -60,8 +64,8 @@ fn mvp() -> Environment {
 /// post-teardown `inspect_network` assertion fails.
 #[test]
 fn brings_up_and_tears_down_the_mvp_lab() {
-    if !docker_available() {
-        eprintln!("skipping brings_up_and_tears_down_the_mvp_lab: no Docker daemon");
+    if !linux_docker_available() {
+        eprintln!("skipping brings_up_and_tears_down_the_mvp_lab: no Linux Docker daemon");
         return;
     }
     runtime().block_on(async {

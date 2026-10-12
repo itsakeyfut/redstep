@@ -24,6 +24,9 @@ tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
 # (Decision C, F layer 1, N). Used only in `orchestrator`; the model stays
 # bollard-free.
 bollard = "0.21.1"
+# The orchestrator drains bollard's image-pull stream (create_image) to
+# completion; StreamExt::next is the only use.
+futures-util = { version = "0.3.31", default-features = false }
 # Evidence is the single source of truth every report and the canonical JSON
 # project from (Decision D, E), so it serializes; `serde_json::Value` is the
 # capability-neutral carrier for an observed value and the reproduction params.

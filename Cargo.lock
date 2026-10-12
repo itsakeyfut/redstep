@@ -689,6 +689,7 @@ name = "redstep"
 version = "0.1.0"
 dependencies = [
  "bollard",
+ "futures-util",
  "inventory",
  "proptest",
  "redstep-macros",
