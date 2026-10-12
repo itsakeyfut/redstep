@@ -174,7 +174,10 @@ mod tests {
     }
 
     /// Guard: the judgement records the expected and actual values for the
-    /// report. Mutation: swap `expected` and `actual` in `judge` -> fails.
+    /// report, and `judge` leaves `evidence` unresolved (`None`): it is pure and
+    /// cannot know the run-scoped id, which the runner fills (issue #14).
+    /// Mutation: swap `expected` and `actual` in `judge` -> fails; set
+    /// `evidence: Some(..)` in `judge` -> the `evidence` assert fails.
     #[test]
     fn judgement_carries_expected_and_actual() {
         let judgement = judge(
@@ -184,5 +187,6 @@ mod tests {
         assert_eq!(judgement.expected, "false");
         assert_eq!(judgement.actual, "true");
         assert_eq!(judgement.confidence, Confidence::High);
+        assert_eq!(judgement.evidence, None);
     }
 }
