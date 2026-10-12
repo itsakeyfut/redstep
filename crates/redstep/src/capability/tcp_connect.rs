@@ -12,6 +12,14 @@
 //! `High` confidence by default before a verdict rests on a signal (a test opts
 //! down explicitly with `min_confidence(Low)`), which is what keeps a `Low`
 //! observation out of a confident conclusion.
+//!
+//! The classification is shared, not host-only: [`ConnectOutcome`],
+//! [`classify_connect`] and [`connect_summary`] are `pub(crate)` because the
+//! vantage executor (`orchestrator`, #27) runs the same connect from an attacker
+//! container and reuses this mapping, so the native and vantage paths agree on
+//! what a connect means. It builds its own draft (a distinct capability name,
+//! recording the vantage network), so [`build_draft`] stays private to this
+//! host-run path.
 
 use std::time::Duration;
 
@@ -139,20 +147,29 @@ pub(crate) fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
     }
 }
 
-/// Compose the evidence draft. Pure, so that the draft mirroring the observation
-/// (not a hard-coded value) is testable without a socket. The observed value is
-/// erased to a JSON bool so the record stays capability-neutral (Decision D); the
-/// reproduction restates the target and the timeout, which together re-run the
-/// same connect (Decision V's witness).
-///
-/// The summary is derived from the three-valued `outcome`, not from the bool: a
-/// refusal (the port is closed) and an indeterminate result (a timeout or a
-/// probe-side error, which established nothing) both erase to `observed: false`,
-/// so a summary keyed off the bool would phrase both as "unreachable" and let a
-/// projection that reads the summary without the confidence read a probe-side
-/// non-result as a confident boundary hold (a false PASS, CLAUDE.md row 6). The
-/// `confidence` already distinguishes them; the summary must not contradict it.
-pub(crate) fn build_draft(
+/// The human-readable summary for a connect outcome, keyed off the three-valued
+/// `outcome` rather than the erased bool: a refusal (the port is closed) and an
+/// indeterminate result (a timeout or a probe-side error, which established
+/// nothing) both erase to `observed: false`, so a summary keyed off the bool
+/// would phrase both as "unreachable" and let a projection that reads the summary
+/// without the confidence read a probe-side non-result as a confident boundary
+/// hold (a false PASS, CLAUDE.md row 6). The `confidence` already distinguishes
+/// them; the summary must not contradict it. `pub(crate)` so the vantage executor
+/// (#27) phrases its own draft the same way.
+pub(crate) fn connect_summary(outcome: ConnectOutcome) -> &'static str {
+    match outcome {
+        ConnectOutcome::Connected => "reachable",
+        ConnectOutcome::Refused => "connection refused",
+        ConnectOutcome::Indeterminate => "not established (timeout or probe error)",
+    }
+}
+
+/// Compose the evidence draft for the host-run connect. Pure, so that the draft
+/// mirroring the observation (not a hard-coded value) is testable without a
+/// socket. The observed value is erased to a JSON bool so the record stays
+/// capability-neutral (Decision D); the reproduction restates the target and the
+/// timeout, which together re-run the same connect (Decision V's witness).
+fn build_draft(
     capability: &'static str,
     target: String,
     intensity: Intensity,
@@ -160,18 +177,13 @@ pub(crate) fn build_draft(
     outcome: ConnectOutcome,
     observation: &Observation<bool>,
 ) -> EvidenceDraft {
-    let summary = match outcome {
-        ConnectOutcome::Connected => "reachable",
-        ConnectOutcome::Refused => "connection refused",
-        ConnectOutcome::Indeterminate => "not established (timeout or probe error)",
-    };
     EvidenceDraft {
         capability,
         target: target.clone(),
         intensity,
         observed: serde_json::Value::Bool(observation.value),
         confidence: observation.confidence,
-        summary: summary.to_owned(),
+        summary: connect_summary(outcome).to_owned(),
         reproduction: Reproduction {
             capability: capability.to_owned(),
             target,

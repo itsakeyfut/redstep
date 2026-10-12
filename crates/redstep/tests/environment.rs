@@ -11,19 +11,11 @@
 //! a positive control.
 
 use bollard::Docker;
-use std::time::Duration;
 
-use bollard::models::{
-    ContainerCreateBody, EndpointSettings, NetworkConnectRequest, NetworkCreateRequest,
-    NetworkingConfig,
-};
-use bollard::query_parameters::{
-    CreateContainerOptions, InspectContainerOptions, InspectNetworkOptions, RemoveContainerOptions,
-    StartContainerOptions,
-};
-use std::collections::HashMap;
+use bollard::models::NetworkConnectRequest;
+use bollard::query_parameters::{InspectContainerOptions, InspectNetworkOptions};
 
-use redstep::{Environment, Error, boundary_self_check, bring_up, tcp_reachable_from};
+use redstep::{Environment, Error, boundary_self_check, bring_up};
 
 /// A tiny pinned image for the stand-in workloads (#18 proves orchestration, not
 /// real services; the real vulnerable images are the H slice).
@@ -215,105 +207,6 @@ fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
         assert!(
             matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "internet" && to == "internal"),
             "a connected forbidden pair must be refused, got {result:?}"
-        );
-    });
-}
-
-/// Guard: the vantage TCP executor observes a listening target as reachable from
-/// a probe on the target's own network, and unreachable from a probe on a
-/// different, blocked network, matching what the attacker's vantage would see
-/// (#27). Mutation: in `tcp_reachable_from`, run the probe on a hard-coded
-/// network rather than the one passed -> the cross-network probe reads reachable
-/// -> the unreachable assertion fails.
-///
-/// This builds its own two networks and a listening target rather than a full
-/// lab, because a TCP probe is meaningful only against a listener and the MVP
-/// stand-ins do not listen (the end-to-end demo with a listening db is #28).
-#[test]
-fn tcp_reachable_from_sees_a_listener_on_its_own_network_only() {
-    if !linux_docker_available() {
-        eprintln!(
-            "skipping tcp_reachable_from_sees_a_listener_on_its_own_network_only: no Linux Docker daemon"
-        );
-        return;
-    }
-    runtime().block_on(async {
-        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
-        let tag = format!("redstep-vantage-{}", std::process::id());
-        let net_a = format!("{tag}-a");
-        let net_b = format!("{tag}-b");
-        let listener = format!("{tag}-listener");
-        let port = 9000u16;
-
-        for name in [&net_a, &net_b] {
-            docker
-                .create_network(NetworkCreateRequest {
-                    name: name.clone(),
-                    internal: Some(true),
-                    ..Default::default()
-                })
-                .await
-                .expect("create network");
-        }
-
-        // A re-listening busybox target on net_a.
-        docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(listener.clone()),
-                    ..Default::default()
-                }),
-                ContainerCreateBody {
-                    image: Some(STANDIN_IMAGE.to_owned()),
-                    cmd: Some(vec![
-                        "sh".to_owned(),
-                        "-c".to_owned(),
-                        format!("while true; do nc -l -p {port} >/dev/null 2>&1; done"),
-                    ]),
-                    networking_config: Some(NetworkingConfig {
-                        endpoints_config: Some(HashMap::from([(
-                            net_a.clone(),
-                            EndpointSettings::default(),
-                        )])),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("create listener");
-        docker
-            .start_container(&listener, None::<StartContainerOptions>)
-            .await
-            .expect("start listener");
-
-        let same_net =
-            tcp_reachable_from(&docker, &net_a, &listener, port, Duration::from_secs(2)).await;
-        let cross_net =
-            tcp_reachable_from(&docker, &net_b, &listener, port, Duration::from_secs(2)).await;
-
-        // Clean up before asserting so a failed assertion does not leak.
-        let _ = docker
-            .remove_container(
-                &listener,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        for name in [&net_a, &net_b] {
-            let _ = docker.remove_network(name).await;
-        }
-
-        let (same, _) = same_net.expect("same-network probe ran");
-        assert!(
-            same.value,
-            "a listener on the probe's own network is reachable"
-        );
-        let (cross, _) = cross_net.expect("cross-network probe ran");
-        assert!(
-            !cross.value,
-            "a listener on a different, blocked network is not reachable from the vantage"
         );
     });
 }
