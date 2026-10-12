@@ -83,14 +83,14 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
     for test in tests {
         let ctx = TestContext::new(scope.clone());
         // AssertUnwindSafe is sound here: `ctx`'s sinks are only ever touched by
-        // `record`/`take_judgements` and the evidence push/`take_evidence`, which
-        // borrow, mutate and drop within one statement and never across an
+        // `record`/`take_judgements` and the draft push/`take_evidence_drafts`,
+        // which borrow, mutate and drop within one statement and never across an
         // `.await`, so an unwind cannot leave a `RefCell` borrowed or
         // half-written.
         let result =
             std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
         let judgements = ctx.take_judgements();
-        for draft in ctx.take_evidence() {
+        for draft in ctx.take_evidence_drafts() {
             evidence.append(draft, now_ms());
         }
         let (verdict, error) = classify(result, &judgements);

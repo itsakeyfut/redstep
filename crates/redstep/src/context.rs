@@ -31,7 +31,7 @@ use crate::verdict::Verdict;
 pub struct TestContext {
     scope: Scope,
     judgements: RefCell<Vec<Judgement>>,
-    evidence: RefCell<Vec<EvidenceDraft>>,
+    evidence_drafts: RefCell<Vec<EvidenceDraft>>,
 }
 
 impl TestContext {
@@ -41,7 +41,7 @@ impl TestContext {
         Self {
             scope,
             judgements: RefCell::new(Vec::new()),
-            evidence: RefCell::new(Vec::new()),
+            evidence_drafts: RefCell::new(Vec::new()),
         }
     }
 
@@ -109,10 +109,11 @@ impl TestContext {
 
     /// Drain the evidence drafts recorded during one test, in execution order.
     /// The runner calls this after the test body and appends each to the run's
-    /// [`EvidenceStore`](crate::EvidenceStore), which assigns the ids (Decision
-    /// D).
-    pub(crate) fn take_evidence(&self) -> Vec<EvidenceDraft> {
-        std::mem::take(&mut self.evidence.borrow_mut())
+    /// [`EvidenceStore`](crate::EvidenceStore), which mints the
+    /// [`Evidence`](crate::Evidence) and assigns the ids (Decision D). It returns
+    /// drafts, not records: only the store gives a record its id and timestamp.
+    pub(crate) fn take_evidence_drafts(&self) -> Vec<EvidenceDraft> {
+        std::mem::take(&mut self.evidence_drafts.borrow_mut())
     }
 
     /// Run a capability and return its observation, recording one evidence draft.
@@ -126,9 +127,11 @@ impl TestContext {
     /// (sealing the trait, a crate-private `execute`) is scheduled before the
     /// first non-Safe capability lands.
     ///
-    /// The capability's [`EvidenceDraft`] is recorded in the evidence sink; the
-    /// runner drains it and the store assigns the id (Decision D), so `run`
-    /// returns the observation the test asserts on, not the draft. The shipped
+    /// On a successful execution the capability's [`EvidenceDraft`] is recorded
+    /// in the evidence sink; the runner drains it and the store assigns the id
+    /// (Decision D), so `run` returns the observation the test asserts on, not the
+    /// draft. An `execute` that errors records nothing, because the draft is the
+    /// product of a completed action. The shipped
     /// [`TcpConnect`](crate::TcpConnect) holds a [`ScopedTarget`] (only the
     /// resolver produces one), so for it the scope gate is type-enforced; the
     /// trait does not require that of every capability, so that guarantee is
@@ -141,7 +144,7 @@ impl TestContext {
         }
         let (observation, draft) = capability.execute().await?;
         // Borrow / push / drop, with no await across the borrow.
-        self.evidence.borrow_mut().push(draft);
+        self.evidence_drafts.borrow_mut().push(draft);
         Ok(observation)
     }
 }
@@ -309,10 +312,10 @@ mod tests {
     }
 
     /// Guard: `run` records exactly one evidence draft per execution, mirroring
-    /// the capability's result, and `take_evidence` drains it. Mutation: make
-    /// `run` skip the `evidence.push`, or push twice -> the count is not 1 ->
-    /// fails. This pins the "exactly one record per execution" criterion before
-    /// the runner collects it.
+    /// the capability's result, and `take_evidence_drafts` drains it. Mutation:
+    /// make `run` skip the `evidence_drafts.push`, or push twice -> the count is
+    /// not 1 -> fails. This pins the "exactly one record per execution" criterion
+    /// before the runner collects it.
     #[test]
     fn run_records_exactly_one_evidence_draft() {
         let ctx = TestContext::new(Scope::default());
@@ -323,11 +326,11 @@ mod tests {
             .block_on(ctx.run(AlwaysReachable))
             .expect("a Safe capability runs");
 
-        let drafts = ctx.take_evidence();
+        let drafts = ctx.take_evidence_drafts();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].capability, "always_reachable_stub");
         assert_eq!(drafts[0].observed, serde_json::Value::Bool(true));
         // Drained, not left behind: a second drain is empty.
-        assert!(ctx.take_evidence().is_empty());
+        assert!(ctx.take_evidence_drafts().is_empty());
     }
 }
