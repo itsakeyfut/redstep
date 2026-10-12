@@ -27,10 +27,15 @@ standard. Copy [`adr-template.md`](./adr-template.md) to start one.
 | [0004](./0004-record-evidence-as-an-append-only-fact-project-the-graph-from-it.md) | Record evidence as an append-only atomic fact, and project the attack graph from it | accepted | the JSON-shape, append-only, and id-resolution guards in `evidence.rs`, `context.rs`, and `tests/public_api.rs` |
 | [0005](./0005-render-every-report-from-one-canonical-json.md) | Render every report from one canonical JSON | accepted | the canonical-JSON, exit-code, and two-renderer guards in `report.rs` and `tests/public_api.rs` |
 | [0006](./0006-guarantee-safety-in-independent-layers.md) | Guarantee safety in independent layers, not one check | accepted | the scope near-miss and intensity-gate guards in `scope.rs`/`context.rs`, and the egress-less structural guard in `tests/environment.rs` (Docker, CI leg) |
+| [0007](./0007-integrate-tools-as-a-plugin-with-three-role-contracts.md) | Integrate existing tools as a plugin with three role contracts | accepted | nothing yet (Phase 4+); the first adapter's ADR will name the guard |
+| [0008](./0008-reuse-vulnerable-apps-and-own-the-reference-topology.md) | Reuse existing vulnerable apps, own the reference topology, no education layer | accepted | nothing yet (Phase 5+); the MVP three-tier is a fixture |
+| [0009](./0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md) | Emit an executable, rustc-style FAIL diagnostic from the oracle | accepted | `check_failure_carries_a_diagnostic` in `context.rs` (mutation: leave `diagnostic` None on a failing check) |
+| [0010](./0010-separate-observation-from-verdict-and-default-to-high-confidence.md) | Separate observation from verdict, and require High confidence by default | accepted | `default_requires_high_confidence` in `expectation.rs`, `aggregate_is_fail_closed` / `inconclusive_run_exits_nonzero` in `runner.rs` |
+| [0011](./0011-enforce-boundaries-by-membership-and-self-check-before-any-test.md) | Enforce boundaries by membership, add a firewall only where needed, self-check before any test | accepted | `check_refuses_when_a_non_first_workload_is_reachable` and `a_connected_lab_is_refused_before_any_test_runs` (Docker, CI leg); `check_boundaries` offline with an injected prober |
 
-**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006 · proposed: none · superseded: none
+**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011 · proposed: none · superseded: none
 
-Records are numbered consecutively from `0001`. The remaining lettered decisions (G, H, L, M, O, U, K, P, Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
+Records are numbered consecutively from `0001`. The remaining lettered decisions (L, M, O, U, K, P, Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
 
 ## Where each kind of writing belongs
 
