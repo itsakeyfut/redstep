@@ -244,6 +244,12 @@ Evidence Store ──> Canonical JSON (= 機械可読の真実の輸出形)
 
 **未決(今後詰める)**: isolation proof の具体的な実装(何をもって「隔離環境」と証明するか)、隔離の抜け道(DNS / サイドチャネル / 共有カーネル経由)の塞ぎ方と継続検証、Scope allowlist の記法、Aggressive opt-in の UX(CLI フラグ / 環境定義 / 両方)。
 
+**MVP implementation note (settled in #20)**: the layer-2 scope gate resolves against the environment's membership, not its reachability.
+
+- `Scope::from_environment(&Environment)` builds the allowlist from the lab's workload names: host membership, any port, because the lab is egress-less (layer 1) so any port on an in-lab host is still inside the lab, and a `Workload` carries no port to match on. A target whose host is not a declared workload is `Error::OutOfScope`, the same refusal an out-of-allowlist `--allow` target gets.
+- The gate is membership in the lab, not reachability within it, and it must not pre-enforce a boundary. A blocked path (the `internet -> internal` boundary) is observed as unreachable at run time by the capability (the network layer, #18/#19), never denied at the gate. Denying it here would make the boundary demo ("the attacker cannot reach the DB") unrunnable and turn a scope denial into a false "the boundary held" (row 6). The vantage does not shape the MVP scope for the same reason.
+- `--allow host:port` stays the interim binary source (see the Decision A note); wiring the runner to a running lab's `Environment` belongs to the bring-up unit (#18), which has a lab to hand over.
+
 ---
 
 ### Decision G — Tool Integration: Plugin + Role 階層(確定)

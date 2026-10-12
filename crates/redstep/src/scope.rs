@@ -7,6 +7,7 @@
 //! (docs/rules/security.md section 2). The default [`Scope`] is empty, which
 //! denies everything.
 
+use crate::environment::Environment;
 use crate::error::{Error, Result};
 
 /// A target that has passed the scope gate. Constructible only by
@@ -29,11 +30,16 @@ impl ScopedTarget {
     }
 }
 
-/// An allowlist of `host:port` targets. Default-deny: an empty scope allows
-/// nothing.
+/// An allowlist of targets. Default-deny: an empty scope allows nothing. The
+/// allowlist has two sources that a resolve matches against together: exact
+/// `host:port` entries from `--allow`, and workload-name hosts from the
+/// environment ([`from_environment`](Self::from_environment)).
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
+    /// Exact `host:port` entries, from `--allow`.
     allow: Vec<(String, u16)>,
+    /// Workload-name hosts, from the environment: host membership, any port.
+    allow_hosts: Vec<String>,
 }
 
 impl Scope {
@@ -53,12 +59,35 @@ impl Scope {
     /// outside the crate resolves a target by any other route.
     pub(crate) fn resolve(&self, spec: &str) -> Result<ScopedTarget> {
         let (host, port) = parse_host_port(spec)?;
-        if self.allow.iter().any(|(h, p)| h == &host && *p == port) {
+        let allowed = self.allow.iter().any(|(h, p)| h == &host && *p == port)
+            || self.allow_hosts.iter().any(|h| h == &host);
+        if allowed {
             Ok(ScopedTarget { host, port })
         } else {
             Err(Error::OutOfScope {
                 spec: spec.to_owned(),
             })
+        }
+    }
+
+    /// A scope whose allowlist is the lab's workloads, matched by host
+    /// membership: a target resolves iff its host names a declared workload, and
+    /// any port on an in-lab host is in scope because the lab is egress-less, so
+    /// such a target is still inside the lab (and a `Workload` carries no port to
+    /// match on). A target not in the lab is [`Error::OutOfScope`].
+    ///
+    /// The scope gate is membership in the lab, not reachability within it (See
+    /// Decision F): a blocked boundary is observed as unreachable at run time, in
+    /// the network layer, never denied here, or a test could never attempt the
+    /// target it is meant to prove unreachable.
+    pub fn from_environment(env: &Environment) -> Scope {
+        Scope {
+            allow: Vec::new(),
+            allow_hosts: env
+                .workloads()
+                .iter()
+                .map(|w| w.name().to_owned())
+                .collect(),
         }
     }
 }
@@ -80,12 +109,16 @@ impl ScopeBuilder {
 
     /// Finish building. The scope is valid by construction.
     pub fn build(self) -> Scope {
-        Scope { allow: self.allow }
+        Scope {
+            allow: self.allow,
+            allow_hosts: Vec::new(),
+        }
     }
 }
 
-/// Parse a `host:port` specification. MVP matches a literal host and port; a
-/// named target (`web`) comes with the environment unit (Decision C).
+/// Parse a `host:port` specification. The host is matched against the allowlist
+/// by the caller; a named target (`web`) is a workload-name host that resolves
+/// against a scope built with [`Scope::from_environment`] (Decision C).
 ///
 /// The host is validated rather than accepted verbatim, so a malformed spec is
 /// a visible error instead of a silently unmatchable entry. In particular a
@@ -241,6 +274,61 @@ mod tests {
             .build();
         assert!(scope.resolve("web:80").is_ok());
         assert!(scope.resolve("api:8080").is_ok());
+    }
+
+    fn mvp_environment() -> crate::Environment {
+        crate::Environment::builder()
+            .segment("internal")
+            .segment("internet")
+            .workload("web", "redstep/web:mvp", "internal")
+            .workload("api", "redstep/api:mvp", "internal")
+            .workload("db", "postgres:16", "internal")
+            .vantage("internet")
+            .boundary("internet", "internal", &[])
+            .build()
+            .expect("the MVP topology is valid")
+    }
+
+    /// Guard: a scope from the environment admits every declared workload, each
+    /// resolving to its `host:port`. Mutation: have `from_environment` collect no
+    /// hosts (empty `allow_hosts`) -> `web`/`api`/`db` all deny -> this fails.
+    #[test]
+    fn environment_scope_admits_every_workload() {
+        let scope = Scope::from_environment(&mvp_environment());
+        for spec in ["web:80", "api:8080", "db:5432"] {
+            assert!(
+                scope.resolve(spec).is_ok(),
+                "{spec} names a declared workload and should be in scope"
+            );
+        }
+    }
+
+    /// Guard: a target whose host is not a declared workload yields no
+    /// `ScopedTarget`, the scope-safety guarantee that an out-of-lab target
+    /// cannot be acted on. Mutation: make `resolve` admit any host (the
+    /// membership check always true) -> `evil:443` resolves -> this fails.
+    #[test]
+    fn environment_scope_denies_a_target_not_in_the_lab() {
+        let scope = Scope::from_environment(&mvp_environment());
+        let err = scope
+            .resolve("evil:443")
+            .expect_err("evil is not a lab workload");
+        assert!(matches!(err, Error::OutOfScope { .. }));
+    }
+
+    /// Guard: host membership admits any port on an in-lab host, since the lab is
+    /// egress-less so any port stays inside it (and a `Workload` carries no port
+    /// to match on). Mutation: drop the `allow_hosts` union in `resolve` so only
+    /// exact `(host, port)` pairs match -> `db` set no pair, so it denies on
+    /// every port -> this fails.
+    #[test]
+    fn environment_scope_admits_any_port_on_a_lab_host() {
+        let scope = Scope::from_environment(&mvp_environment());
+        assert!(scope.resolve("db:1").is_ok(), "any port on db is in scope");
+        assert!(
+            scope.resolve("db:65535").is_ok(),
+            "any port on db is in scope"
+        );
     }
 
     proptest::proptest! {
