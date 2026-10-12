@@ -175,7 +175,7 @@ impl EnvironmentBuilder {
     /// Validate the topology and build the environment. Every reference must
     /// name a declared segment, names must be unique, the vantage segment must
     /// be set and declared, every segment and workload name must be a valid lab
-    /// identifier (see `is_valid_identifier`), and every boundary's `allow`
+    /// name (see `is_valid_lab_name`), and every boundary's `allow`
     /// must be empty (the membership-only MVP cannot enforce a port-level allow,
     /// so the model refuses one fail-closed); otherwise
     /// [`Error::InvalidEnvironment`].
@@ -184,10 +184,10 @@ impl EnvironmentBuilder {
 
         let mut segments: Vec<String> = Vec::new();
         for name in self.segments {
-            if !is_valid_identifier(&name) {
+            if !is_valid_lab_name(&name) {
                 return Err(invalid(format!(
-                    "segment name {name:?} is not a valid lab identifier \
-                     (lowercase letters, digits, interior hyphens)"
+                    "segment name {name:?} is not a valid lab name \
+                     (a lowercase letter, then lowercase letters, digits, interior hyphens)"
                 )));
             }
             if segments.contains(&name) {
@@ -208,10 +208,10 @@ impl EnvironmentBuilder {
 
         let mut workloads: Vec<Workload> = Vec::new();
         for (name, image, segment) in self.workloads {
-            if !is_valid_identifier(&name) {
+            if !is_valid_lab_name(&name) {
                 return Err(invalid(format!(
-                    "workload name {name:?} is not a valid lab identifier \
-                     (lowercase letters, digits, interior hyphens)"
+                    "workload name {name:?} is not a valid lab name \
+                     (a lowercase letter, then lowercase letters, digits, interior hyphens)"
                 )));
             }
             if workloads.iter().any(|w| w.name == name) {
@@ -261,22 +261,27 @@ impl EnvironmentBuilder {
     }
 }
 
-/// Whether `name` is usable as a lab-internal host and a Docker network or
-/// container identifier: non-empty, at most 63 bytes, lowercase ASCII letters,
-/// digits, and interior hyphens (no leading or trailing hyphen).
+/// Whether `name` is a valid lab name: a DNS-label-like identifier of at most 63
+/// bytes (the DNS label limit), starting with a lowercase ASCII letter, then
+/// lowercase ASCII letters, digits, and interior hyphens, with no trailing
+/// hyphen.
 ///
-/// This is the subset that is both a valid `host:port` host and a valid Docker
-/// name, so a declared workload name is always resolvable by
-/// [`Scope::from_environment`](crate::Scope::from_environment) (closing the seam
-/// the #20 review found: a routable name like an IP address that the scope gate
-/// would admit on membership alone) and is usable verbatim as a container name
-/// by the bring-up unit (#18).
-fn is_valid_identifier(name: &str) -> bool {
+/// This subset is both a valid `host:port` host and a valid Docker network alias
+/// and name. The leading-letter rule is what keeps a numeric or hex address
+/// literal (`16909060`, which `inet_aton` reads as `1.2.3.4`) from being a
+/// declared workload, so a routable address cannot enter the scope gate's
+/// allowlist on membership alone through
+/// [`Scope::from_environment`](crate::Scope::from_environment). The
+/// bring-up unit uses the name as a network alias (the container itself is named
+/// with a run prefix), so a workload `db` is reachable in the lab as `db`.
+///
+/// The guard is `name_with_an_invalid_lab_name_is_rejected`.
+fn is_valid_lab_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 63 {
         return false;
     }
-    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+    if !bytes[0].is_ascii_lowercase() || bytes[bytes.len() - 1] == b'-' {
         return false;
     }
     name.bytes()
@@ -425,29 +430,66 @@ mod tests {
         );
     }
 
-    /// Guard: a segment or workload name that is not a valid lab identifier is
+    /// Guard: a segment or workload name that is not a valid lab name is
     /// rejected, so a routable or Docker-illegal name cannot become an allowlist
-    /// host or a container identifier (the seam the #20 review found). Mutation:
-    /// drop either `is_valid_identifier` check in `build` -> the matching bad
-    /// name builds -> this fails.
+    /// host or a network alias. Mutation: drop the leading-letter check -> the
+    /// all-digit `16909060` (which `inet_aton` reads as `1.2.3.4`) builds;
+    /// change `len() > 63` to `> 64` -> the 64-byte name builds; drop the
+    /// trailing-hyphen check -> `web-` builds; drop digits or hyphens from the
+    /// allowed set -> a valid name below fails to build. Each makes this fail.
     #[test]
-    fn name_with_invalid_characters_is_rejected() {
-        // uppercase, dot, space, an IP-like name, a leading hyphen, empty.
-        for bad in ["Web", "web.evil", "my web", "169.254.169.254", "-web", ""] {
-            let as_segment = Environment::builder().segment(bad).vantage(bad).build();
+    fn name_with_an_invalid_lab_name_is_rejected() {
+        let sixty_four = "a".repeat(64);
+        // uppercase, dot, space, dotted IP, decimal IP literal, leading digit,
+        // leading hyphen, trailing hyphen, empty, over 63 bytes.
+        let bad = [
+            "Web",
+            "web.evil",
+            "my web",
+            "169.254.169.254",
+            "16909060",
+            "0web",
+            "-web",
+            "web-",
+            "",
+            sixty_four.as_str(),
+        ];
+        for name in bad {
+            let as_segment = Environment::builder().segment(name).vantage(name).build();
             assert!(
-                matches!(&as_segment, Err(Error::InvalidEnvironment { reason }) if reason.contains("identifier")),
-                "segment name {bad:?}: {as_segment:?}"
+                matches!(&as_segment, Err(Error::InvalidEnvironment { reason }) if reason.contains("lab name")),
+                "segment name {name:?}: {as_segment:?}"
             );
 
             let as_workload = Environment::builder()
                 .segment("internet")
                 .vantage("internet")
-                .workload(bad, "busybox:1", "internet")
+                .workload(name, "busybox:1", "internet")
                 .build();
             assert!(
-                matches!(&as_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("identifier")),
-                "workload name {bad:?}: {as_workload:?}"
+                matches!(&as_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("lab name")),
+                "workload name {name:?}: {as_workload:?}"
+            );
+        }
+    }
+
+    /// Guard: a valid lab name builds, so the rejection above is not so strict it
+    /// refuses legitimate names (digits, interior hyphens, and a 63-byte name are
+    /// allowed). Mutation: drop digits from the allowed set -> `db2` fails to
+    /// build; drop hyphens -> `web-1` fails; change `len() > 63` to `> 62` -> the
+    /// 63-byte name fails. Each makes this fail.
+    #[test]
+    fn a_valid_lab_name_builds() {
+        let sixty_three = "a".repeat(63);
+        for name in ["web", "db2", "web-1", "a1", sixty_three.as_str()] {
+            let built = Environment::builder()
+                .segment("internet")
+                .vantage("internet")
+                .workload(name, "busybox:1", "internet")
+                .build();
+            assert!(
+                built.is_ok(),
+                "workload name {name:?} should build: {built:?}"
             );
         }
     }
