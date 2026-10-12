@@ -117,5 +117,7 @@ Report
 
 を出せた時点を最初の大きなマイルストーンとする。
 
+**M1 vs M3 (clarified, #33)**: of the three Expected lines, M1 proves "Database unreachable" natively (the boundary Security Test, #28) and reaches a single Web target for a real-tool single-hop (the nmap/sqlmap adapter mechanism and Decision V), so "Web reachable" is demonstrated for that one hop. "Internal API reachable only through the intended path" is the M3 port boundary (the firewall gateway). The full external -> web -> api -> db chain the Attack Scenario draws is the M3 / Phase 5 end-state (the gateway for the port boundary, the Decision L pivot for the chain), not an M1 checklist.
+
 ---
 
