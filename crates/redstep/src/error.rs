@@ -46,12 +46,14 @@ pub enum Error {
         got: crate::intensity::Intensity,
     },
 
-    /// A lab definition did not validate: a boundary or workload referenced an
-    /// undeclared segment, the attacker's segment was missing or undeclared, or a
-    /// name was duplicated (See Decision C). Reported by `Lab`'s builder before
-    /// anything is stood up, so an invalid topology never reaches bollard.
-    #[error("invalid lab: {reason}")]
-    InvalidLab {
+    /// An environment definition did not validate: a boundary or workload
+    /// referenced an undeclared segment, the vantage segment was missing or
+    /// undeclared, a name was duplicated, or a boundary carried a port-level
+    /// `allow` the membership-only MVP cannot enforce (see the Decision C MVP
+    /// note settled in #17). The builder is the only way to obtain an
+    /// `Environment`, so the bring-up unit reads a validated topology.
+    #[error("invalid environment: {reason}")]
+    InvalidEnvironment {
         /// What was wrong with the topology.
         reason: String,
     },
