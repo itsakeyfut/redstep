@@ -46,6 +46,18 @@ pub enum Error {
         got: crate::intensity::Intensity,
     },
 
+    /// The boundary self-check found a declared-forbidden path reachable: the
+    /// lab's isolation is broken, so the run must not proceed (Decision N step
+    /// 4). Distinct from a test verdict and from `LabUnavailable` (which is the
+    /// self-check being unable to run at all).
+    #[error("boundary self-check failed: {from} -> {to} is reachable but declared blocked")]
+    BoundaryViolated {
+        /// The segment the forbidden path leads from.
+        from: String,
+        /// The segment the forbidden path leads to.
+        to: String,
+    },
+
     /// The lab could not be provisioned or torn down. Carries a stringified
     /// reason rather than the orchestration backend's error type, so the model
     /// error stays free of that layer (docs/rules/design.md section 2). Named for

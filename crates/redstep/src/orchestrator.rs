@@ -16,11 +16,12 @@
 //! refused upstream, so no cross-segment path is wired here; the firewall
 //! gateway for port-level boundaries is Phase 4 / M3.
 //!
-//! This unit stands the lab up and tears it down. It runs no attack and makes no
-//! verdict. That the egress-less flag is set is checked here (the integration
-//! test inspects it); that a forbidden path is actually blocked at run time is
-//! the boundary self-check (Decision N step 4), a later unit (#19) built on
-//! [`RunningLab`].
+//! This unit stands the lab up, tears it down, and verifies isolation before a
+//! run. It makes no test verdict. That the egress-less flag is set is checked
+//! structurally (the integration test inspects it); that a declared-forbidden
+//! path is actually blocked is [`boundary_self_check`] (Decision N step 4),
+//! which probes it behaviourally with a positive control and refuses a run whose
+//! forbidden path is reachable.
 
 use std::collections::HashMap;
 
@@ -287,6 +288,157 @@ async fn remove_all(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// A tiny pinned image that can `ping`, for the self-check's probe containers (a
+/// workload image like `postgres:16` may not carry `ping`).
+const PROBE_IMAGE: &str = "busybox:1.37";
+
+/// Verify every declared-forbidden path is actually blocked, before any test
+/// runs (Decision N step 4). For each boundary (an empty `allow` means the path
+/// is blocked, and a non-empty one is refused at build), a probe container in
+/// the `from` segment must fail to reach a workload in the `to` segment, while a
+/// positive-control probe in the `to` segment does reach it, so a broken probe
+/// cannot read as isolation (the gap #18's review found).
+///
+/// Returns `Ok(())` only when every forbidden path is verified blocked. A
+/// reachable forbidden path is [`Error::BoundaryViolated`]; a control that
+/// cannot reach, or any probe failure, is [`Error::LabUnavailable`], so the run
+/// fails closed rather than proceeding on a lab whose isolation is uncertain.
+/// The result is distinct from a test verdict.
+///
+/// Reachability is ICMP to the target's container name, which Docker's embedded
+/// DNS resolves only for peers on the same network, so it needs no listener and
+/// a path that opens only because the target was wrongly attached to the `from`
+/// network is detected.
+pub async fn boundary_self_check(
+    docker: &Docker,
+    env: &Environment,
+    lab: &RunningLab,
+) -> Result<()> {
+    pull_image(docker, PROBE_IMAGE).await?;
+
+    for boundary in env.boundaries() {
+        let from = boundary.from();
+        let to = boundary.to();
+
+        let Some(target) = lab.containers().iter().find(|c| c.segment() == to) else {
+            // Nothing in the `to` segment to reach; the path is vacuously blocked.
+            continue;
+        };
+        let from_net = segment_network(lab, from)?;
+        let to_net = segment_network(lab, to)?;
+
+        // Positive control: reachable from its own segment, so a later
+        // "unreachable" is a real block rather than a broken probe.
+        if !probe_reaches(docker, to_net, target.name()).await? {
+            return Err(Error::LabUnavailable {
+                reason: format!(
+                    "boundary self-check could not reach {to} workload {:?} from its own segment; \
+                     the probe is untrustworthy, so isolation cannot be certified",
+                    target.workload()
+                ),
+            });
+        }
+
+        // The forbidden path must be blocked.
+        if probe_reaches(docker, from_net, target.name()).await? {
+            return Err(Error::BoundaryViolated {
+                from: from.to_owned(),
+                to: to.to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// The Docker network name for a segment in this lab.
+fn segment_network<'a>(lab: &'a RunningLab, segment: &str) -> Result<&'a str> {
+    lab.networks()
+        .iter()
+        .find(|n| n.segment() == segment)
+        .map(LabNetwork::name)
+        .ok_or_else(|| Error::LabUnavailable {
+            reason: format!("no network for segment {segment:?} in the running lab"),
+        })
+}
+
+/// Whether a probe container on `network` can reach `target` (a container name
+/// Docker's DNS resolves on that network) by ICMP. The probe is removed before
+/// returning, even on error.
+async fn probe_reaches(docker: &Docker, network: &str, target: &str) -> Result<bool> {
+    let name = format!("{}-probe", run_id());
+    let result = run_probe(docker, &name, network, target).await;
+    let _ = docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    result
+}
+
+async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> Result<bool> {
+    let endpoints = HashMap::from([(network.to_owned(), EndpointSettings::default())]);
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: Some(name.to_owned()),
+                ..Default::default()
+            }),
+            ContainerCreateBody {
+                image: Some(PROBE_IMAGE.to_owned()),
+                cmd: Some(vec![
+                    "ping".to_owned(),
+                    "-c".to_owned(),
+                    "1".to_owned(),
+                    "-w".to_owned(),
+                    "2".to_owned(),
+                    target.to_owned(),
+                ]),
+                networking_config: Some(NetworkingConfig {
+                    endpoints_config: Some(endpoints),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(lab_unavailable)?;
+    docker
+        .start_container(
+            name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .map_err(lab_unavailable)?;
+    Ok(probe_exit(docker, name).await? == 0)
+}
+
+/// Poll until the probe container exits and return its exit code, bounded so a
+/// stuck probe fails the check rather than hanging it (`ping -w 2` exits within
+/// a few seconds).
+async fn probe_exit(docker: &Docker, name: &str) -> Result<i64> {
+    for _ in 0..40 {
+        let info = docker
+            .inspect_container(
+                name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(lab_unavailable)?;
+        let state = info.state.unwrap_or_default();
+        if state.running != Some(true) {
+            return Ok(state.exit_code.unwrap_or(-1));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(Error::LabUnavailable {
+        reason: format!("boundary self-check probe {name:?} did not exit within the timeout"),
+    })
 }
 
 impl RunningLab {

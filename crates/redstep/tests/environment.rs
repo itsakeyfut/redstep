@@ -4,17 +4,16 @@
 //! CI leg. They send traffic only inside Docker objects they create, never to a
 //! real external host (docs/rules/test.md), and clean up what they make.
 //!
-//! The egress-less flag is checked structurally here (each lab network is
+//! The egress-less flag is checked structurally (each lab network is
 //! `internal: true`), which a dropped `internal: Some(true)` in the orchestrator
-//! would fail. That a forbidden path is actually blocked at run time is the
-//! boundary self-check (Decision N step 4), a later unit (#19): a behavioural
-//! egress probe belongs there, driven against a `bring_up` lab with a positive
-//! control, not here where it would be confounded by Docker's inter-network
-//! isolation.
+//! would fail. That a declared-forbidden path is actually blocked is the
+//! boundary self-check (Decision N step 4), driven against a `bring_up` lab with
+//! a positive control.
 
 use bollard::Docker;
+use bollard::models::NetworkConnectRequest;
 use bollard::query_parameters::{InspectContainerOptions, InspectNetworkOptions};
-use redstep::{Environment, bring_up};
+use redstep::{Environment, Error, boundary_self_check, bring_up};
 
 /// A tiny pinned image for the stand-in workloads (#18 proves orchestration, not
 /// real services; the real vulnerable images are the H slice).
@@ -129,5 +128,79 @@ fn brings_up_and_tears_down_the_mvp_lab() {
                 "network {net} should be gone after teardown"
             );
         }
+    });
+}
+
+/// Guard: the boundary self-check passes over a correctly-isolated MVP lab, so a
+/// run could proceed. The happy-path companion to the refusal below.
+#[test]
+fn self_check_passes_for_an_isolated_lab() {
+    if !linux_docker_available() {
+        eprintln!("skipping self_check_passes_for_an_isolated_lab: no Linux Docker daemon");
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = mvp();
+        let lab = bring_up(&docker, &env).await.expect("bring up the MVP lab");
+        let result = boundary_self_check(&docker, &env, &lab).await;
+        let teardown = lab.teardown().await;
+        result.expect("an isolated lab passes the self-check");
+        teardown.expect("teardown removes every object");
+    });
+}
+
+/// Guard: the self-check refuses a lab whose forbidden pair has been connected
+/// (an `internal` workload attached to the `internet` network too, the realistic
+/// bring-up bug), rather than letting the run proceed. Mutation: treat a
+/// reachable forbidden probe as not-violated (drop the `probe_reaches -> Err`
+/// arm in `boundary_self_check`) -> the broken lab passes -> this fails.
+#[test]
+fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
+    if !linux_docker_available() {
+        eprintln!(
+            "skipping self_check_refuses_a_lab_whose_forbidden_pair_is_connected: no Linux Docker daemon"
+        );
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = mvp();
+        let lab = bring_up(&docker, &env).await.expect("bring up the MVP lab");
+
+        // Break isolation the realistic way: attach an internal workload onto the
+        // internet network, so internet -> internal is now reachable.
+        let internet_net = lab
+            .networks()
+            .iter()
+            .find(|n| n.segment() == "internet")
+            .expect("internet network")
+            .name()
+            .to_owned();
+        let internal_container = lab
+            .containers()
+            .iter()
+            .find(|c| c.segment() == "internal")
+            .expect("an internal workload")
+            .name()
+            .to_owned();
+        docker
+            .connect_network(
+                &internet_net,
+                NetworkConnectRequest {
+                    container: internal_container,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connect the internal workload to the internet network");
+
+        let result = boundary_self_check(&docker, &env, &lab).await;
+        let _ = lab.teardown().await;
+
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "internet" && to == "internal"),
+            "a connected forbidden pair must be refused, got {result:?}"
+        );
     });
 }
