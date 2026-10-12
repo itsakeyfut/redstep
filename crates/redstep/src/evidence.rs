@@ -12,8 +12,9 @@
 //! is the oracle's judgement over an observation, and the same observation can be
 //! a `Pass` or a `Fail` depending on the expectation, so a verdict cannot live in
 //! the fact. Decision D's planned `result: Outcome` is retired here rather than
-//! renamed; the link from a judgement back to its evidence is a later step before
-//! reporting (Decision J's forward note), not this unit.
+//! renamed; the link from a judgement back to its evidence is built on top in #14
+//! (the [`DraftRef`] a judgement carries, resolved by the runner; see the
+//! Decision J note), not by this record itself.
 //!
 //! A capability cannot know the id or the timestamp of its own record, so it
 //! produces a pure [`EvidenceDraft`] and the store stamps both on append: the id
