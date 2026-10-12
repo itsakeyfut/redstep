@@ -73,7 +73,7 @@ matcher never widens to a target outside the allowlist.
 
 ---
 
-## Discovery is flaky; a pinned replay is the regression (Decision V, O)
+## Discovery is flaky; a pinned replay is the regression (ADR-0022, ADR-0014)
 
 Two kinds of test behave differently and must not be confused.
 

@@ -5,7 +5,7 @@
 //! crate that writes tests needs only `redstep` as a dependency. The module is
 //! `#[doc(hidden)]` (see lib.rs): the macro has to reach these items, but they
 //! are not a stable surface for a downstream crate to build on, so later fields
-//! on `RegisteredTest` (Decision K tags, an intensity marker) stay an internal,
+//! on `RegisteredTest` (ADR-0016 tags, an intensity marker) stay an internal,
 //! coordinated change rather than a semver break.
 
 use crate::context::TestContext;

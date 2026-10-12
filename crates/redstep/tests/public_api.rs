@@ -258,7 +258,7 @@ fn run_passes_the_scope_to_tests() {
 
 /// Guard: a run collects every capability execution's evidence into the summary's
 /// store, in execution order, with run-scoped sequential ids and a real clock
-/// timestamp (Decision D). Two demos produce evidence: `aaa_earlier_evidence_demo`
+/// timestamp (ADR-0004). Two demos produce evidence: `aaa_earlier_evidence_demo`
 /// (sorts first) once, then `records_evidence_demo` twice, so the store holds
 /// `earlier`, `alpha`, `beta` at ids 0, 1, 2.
 /// Mutations caught: drop the collection loop in `run` -> store empty -> the

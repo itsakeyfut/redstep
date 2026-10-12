@@ -1,6 +1,6 @@
 //! The capability layer: an active action against a scope-resolved target.
 //!
-//! A capability is where force lives (See Decision B). The shipped
+//! A capability is where force lives (See ADR-0002). The shipped
 //! [`TcpConnect`] takes a [`ScopedTarget`](crate::ScopedTarget), which nothing
 //! but the scope resolver produces, so it cannot reach a target that did not
 //! pass the gate (docs/rules/security.md section 2). That is a property of that
@@ -28,7 +28,7 @@ use crate::observation::Observation;
 /// through a generic caller ([`TestContext::run`](crate::TestContext::run)), not
 /// a `dyn` object, and the runner is single-threaded, so the absent `Send`
 /// bound the lint warns about is not needed. A `dyn`-safe registry of
-/// capabilities is a later unit's concern (Decision B).
+/// capabilities is a later unit's concern (ADR-0002).
 #[allow(async_fn_in_trait)]
 pub trait Capability {
     /// What the observation carries. For a reachability capability it is `bool`.
@@ -46,6 +46,6 @@ pub trait Capability {
     /// [`ScopedTarget`](crate::ScopedTarget), so this takes no raw target. It
     /// returns an [`EvidenceDraft`], not an [`Evidence`](crate::Evidence):
     /// a capability cannot know the id or timestamp of its own record, which the
-    /// store assigns on append (Decision D).
+    /// store assigns on append (ADR-0004).
     async fn execute(&self) -> crate::Result<(Observation<Self::Value>, EvidenceDraft)>;
 }

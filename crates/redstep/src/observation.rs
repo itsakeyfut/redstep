@@ -1,8 +1,8 @@
 //! A normalized signal from a capability, and how much to trust it.
 //!
-//! Pure model type. This is the minimal shape of Decision J's observation: a
+//! Pure model type. This is the minimal shape of ADR-0010's observation: a
 //! typed value plus a confidence. Corroboration across individual signals
-//! (deferred, Decision J) will later raise or lower the confidence; for now a
+//! (deferred, ADR-0010) will later raise or lower the confidence; for now a
 //! capability sets it directly.
 
 /// How much to trust an observation. A single weak signal is `Low`, so the
@@ -12,7 +12,7 @@
 pub enum Confidence {
     /// Unambiguous for the capability that set it: a completed handshake, or a
     /// connection the target explicitly refused. Corroboration across signals
-    /// (deferred, Decision J) is not yet a source of this.
+    /// (deferred, ADR-0010) is not yet a source of this.
     High,
     /// Plausible, not certain.
     Medium,

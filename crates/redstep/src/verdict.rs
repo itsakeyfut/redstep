@@ -1,12 +1,12 @@
-//! The security verdict: whether what was observed is acceptable (Decision J).
+//! The security verdict: whether what was observed is acceptable (ADR-0010).
 //!
 //! Pure model type, and the sign-inverted counterpart of an observation. An
 //! observation says what happened (reachable, a row returned); a verdict says
 //! whether that is acceptable, and the sign flips: an attack that succeeded is
 //! a `Fail`, a boundary that held is a `Pass`. It is three-valued plus `Error`
 //! so a weak signal lands in `Inconclusive` rather than a false `Pass` or
-//! `Fail` (See Decision J). Conflict handling across several signals is
-//! deferred (that is corroboration, Decision J); here a single signal's
+//! `Fail` (See ADR-0010). Conflict handling across several signals is
+//! deferred (that is corroboration, ADR-0010); here a single signal's
 //! confidence is what distinguishes a weak one.
 
 /// Whether what a test observed is acceptable.

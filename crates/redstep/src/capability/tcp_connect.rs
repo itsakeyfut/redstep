@@ -167,8 +167,8 @@ pub(crate) fn connect_summary(outcome: ConnectOutcome) -> &'static str {
 /// Compose the evidence draft for the host-run connect. Pure, so that the draft
 /// mirroring the observation (not a hard-coded value) is testable without a
 /// socket. The observed value is erased to a JSON bool so the record stays
-/// capability-neutral (Decision D); the reproduction restates the target and the
-/// timeout, which together re-run the same connect (Decision V's witness).
+/// capability-neutral (ADR-0004); the reproduction restates the target and the
+/// timeout, which together re-run the same connect (ADR-0022's witness).
 fn build_draft(
     capability: &'static str,
     target: String,

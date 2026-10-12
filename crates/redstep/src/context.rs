@@ -7,7 +7,7 @@
 //! in two interior-mutable sinks the runner drains per test; expecting over a
 //! `Recorded` carries a reference to that execution's draft into the judgement,
 //! which the runner resolves to an evidence id (issue #14). A capability
-//! *registry* (the plugin side of Decision B) is still later.
+//! *registry* (the plugin side of ADR-0002) is still later.
 //!
 //! A test holds `&TestContext` (the `#[security_test]` signature and
 //! `registry::TestFn` both take a shared reference), so the sinks record
@@ -46,7 +46,7 @@ pub struct TestContext {
     /// (the `--allow` path): [`connect_from_vantage`](Self::connect_from_vantage) needs it, [`run`](Self::run)
     /// does not. It is what lets a capability act from inside the lab rather than
     /// from the host, which reaches every segment and so cannot observe a
-    /// boundary (#28, Decision C).
+    /// boundary (#28, ADR-0003).
     lab: Option<VantageBinding>,
     /// Each recorded judgement with the per-test reference to the evidence it
     /// judged, if any. The reference sits *beside* the `Judgement` rather than in
@@ -116,7 +116,7 @@ impl TestContext {
         } else {
             Verdict::Fail
         };
-        // The built-in check produces the FAIL diagnostic (Decision H-2); a bare
+        // The built-in check produces the FAIL diagnostic (ADR-0009); a bare
         // check knows only its own condition, so the cause restates it.
         let diagnostic = (!condition).then(|| Diagnostic {
             probable_cause: format!("the asserted condition did not hold: {message}"),
@@ -144,13 +144,13 @@ impl TestContext {
     /// Declare an expectation over an observation. The oracle judges it, records
     /// the [`Judgement`] (the runner aggregates the recorded judgements into the
     /// test's verdict), and returns the [`Verdict`]. The body continues, so
-    /// several expectations accumulate (See Decision J).
+    /// several expectations accumulate (See ADR-0010).
     ///
     /// Accepts both what [`run`](Self::run) returns ([`Recorded`], which links the
     /// judgement to its evidence) and a bare [`Observation`] (a hand-built or
     /// non-capability signal, which links to nothing), through the [`Expectable`]
     /// seam. The evidence reference rides on `Recorded`, not on the pure
-    /// `Observation` (Decision J, issue #14). A `Recorded` must be judged on the
+    /// `Observation` (ADR-0010, issue #14). A `Recorded` must be judged on the
     /// same context that produced it; see [`Recorded`].
     ///
     /// ```ignore
@@ -184,7 +184,7 @@ impl TestContext {
     /// Drain the evidence drafts recorded during one test, in execution order.
     /// The runner calls this after the test body and appends each to the run's
     /// [`EvidenceStore`](crate::EvidenceStore), which mints the
-    /// [`Evidence`](crate::Evidence) and assigns the ids (Decision D). It returns
+    /// [`Evidence`](crate::Evidence) and assigns the ids (ADR-0004). It returns
     /// drafts, not records: only the store gives a record its id and timestamp.
     pub(crate) fn take_evidence_drafts(&self) -> Vec<EvidenceDraft> {
         std::mem::take(&mut self.evidence_drafts.borrow_mut())
@@ -195,7 +195,7 @@ impl TestContext {
     ///
     /// This is the intended invocation path: it checks the intensity as a value
     /// and refuses anything but `Safe`, because the authorization and isolation
-    /// proof the higher rungs require are not built yet (See Decision F). The
+    /// proof the higher rungs require are not built yet (See ADR-0006). The
     /// check lives here rather than in the type system: `Capability::execute` is
     /// a public trait method a hand-written capability could call directly, so
     /// the gate is a runtime check this one place holds. Making the `Capability`
@@ -208,7 +208,7 @@ impl TestContext {
     /// Passing the `Recorded` to [`expect`](Self::expect) links the resulting
     /// judgement to the evidence; the runner resolves the reference to an
     /// [`EvidenceId`](crate::EvidenceId) when it drains the drafts into the store
-    /// (Decision D, issue #14). An `execute` that errors records nothing, because
+    /// (ADR-0004, issue #14). An `execute` that errors records nothing, because
     /// the draft is the product of a completed action. The shipped
     /// [`TcpConnect`](crate::TcpConnect) holds a [`ScopedTarget`] (only the
     /// resolver produces one), so for it the scope gate is type-enforced; the
@@ -245,10 +245,10 @@ impl TestContext {
     /// This is the lab-wired counterpart of `run` for the one MVP capability: it
     /// executes from a container on the vantage network (`tcp_reachable_from`),
     /// not from the host, because the host reaches every segment and so cannot
-    /// observe an inter-segment boundary (a vacuous PASS; #28, Decision C,
+    /// observe an inter-segment boundary (a vacuous PASS; #28, ADR-0003,
     /// `.claude/review/knowledge.md` RK-008). A completed connect is reachable at
     /// `High`; a failure is unreachable at `Low`, because the probe cannot prove
-    /// the port closed (See Decision J, and `TcpConnect`), so a test asserting a
+    /// the port closed (See ADR-0010, and `TcpConnect`), so a test asserting a
     /// boundary holds opts down to `min_confidence(Low)` explicitly, and the
     /// `High` certification that the boundary held is the boundary self-check, not
     /// this probe.
@@ -306,7 +306,7 @@ impl TestContext {
 /// `Observation` a `Capability` returns to all carry a link they cannot fill, and
 /// would make `execute`'s observation meaningless until `run` rewrote it. So the
 /// observation stays a plain signal and only a capability's result carries a link
-/// (Decision J, issue #14). Only `run` and `connect_from_vantage` construct one.
+/// (ADR-0010, issue #14). Only `run` and `connect_from_vantage` construct one.
 ///
 /// The reference is a per-test index (see [`DraftRef`]), so a
 /// `Recorded` is only meaningful to the context that produced it. Judging one on
@@ -600,7 +600,7 @@ mod tests {
 
     /// Guard: a failing `check` records a `Fail` judgement carrying a FAIL
     /// diagnostic whose cause names the assertion, and a passing `check` carries
-    /// none (Decision H-2; the built-in check produces it, on failure only).
+    /// none (ADR-0009; the built-in check produces it, on failure only).
     /// Mutation: leave `diagnostic` `None` on failure -> the failing assert fails;
     /// fill it unconditionally -> the passing assert fails; drop the message from
     /// the cause -> the content assert fails.

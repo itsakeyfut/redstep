@@ -1,6 +1,6 @@
-//! The canonical JSON and the terminal renderer over it (Decision E, H-2).
+//! The canonical JSON and the terminal renderer over it (ADR-0005, ADR-0009).
 //!
-//! Decision E makes one canonical JSON the single intermediate representation:
+//! ADR-0005 makes one canonical JSON the single intermediate representation:
 //! every other output is a thin renderer over it, so the formats cannot drift. A
 //! `Report` is projected once from a `RunSummary` by `build`; `to_json` and
 //! `render_terminal` are the two renderers over that one `Report`, so the file
@@ -17,7 +17,7 @@
 //! `render_terminal` is a `cargo test`-style summary: one line per test, then the
 //! non-PASS reasons indented (a FAIL also carries the H-2 diagnostic), then a
 //! count line. The evidence section reuses the `Evidence` records the store
-//! already holds (Decision D); they are canonical as they are.
+//! already holds (ADR-0004); they are canonical as they are.
 
 use std::fmt::Write;
 
@@ -30,11 +30,11 @@ use crate::runner::{RunSummary, TestRun};
 
 /// The version of the canonical JSON schema. Bumped when the contract changes in
 /// a way a consumer must branch on; present from the first release so a consumer
-/// always has a version to read (Decision E).
+/// always has a version to read (ADR-0005).
 const SCHEMA_VERSION: u32 = 1;
 
 /// The canonical JSON of a run: its per-test results, the evidence they project
-/// from, and the exit status a CI gate reads (Decision E). `#[non_exhaustive]`,
+/// from, and the exit status a CI gate reads (ADR-0005). `#[non_exhaustive]`,
 /// so a later field is not a breaking change for an external Rust consumer; the
 /// JSON itself grows compatibly because serde ignores unknown fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,16 +44,16 @@ pub struct Report {
     pub schema_version: u32,
     /// One result per security test, in run order.
     pub results: Vec<TestResult>,
-    /// Every evidence record the run produced (Decision D), reused as-is.
+    /// Every evidence record the run produced (ADR-0004), reused as-is.
     pub evidence: Vec<Evidence>,
     /// `0` only if at least one test ran and all passed; non-zero otherwise. A
-    /// field of the canonical JSON, so a gate judges from the JSON (Decision E).
+    /// field of the canonical JSON, so a gate judges from the JSON (ADR-0005).
     pub exit_code: i32,
 }
 
 /// One security test's result: its verdict, the reasons behind it, and the
 /// evidence ids they rest on. Named `TestResult`, not `Finding`: a `Finding`
-/// (Decision G) is a scanner's discovered issue, whereas this is a test outcome
+/// (ADR-0007) is a scanner's discovered issue, whereas this is a test outcome
 /// that may well be a `PASS`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -68,7 +68,7 @@ pub struct TestResult {
     pub error: Option<String>,
     /// The evidence ids the reasons rest on, aggregated. A list, so a result can
     /// rest on several records even though each reason references one (the #14
-    /// cardinality note; Decision J).
+    /// cardinality note; ADR-0010).
     pub evidence_ids: Vec<u64>,
 }
 
@@ -86,12 +86,12 @@ pub struct Reason {
     pub confidence: Confidence,
     /// The evidence record this reason rests on, if any.
     pub evidence_id: Option<u64>,
-    /// The rustc-style FAIL diagnostic (Decision H-2), present on a `FAIL`.
+    /// The rustc-style FAIL diagnostic (ADR-0009), present on a `FAIL`.
     pub diagnostic: Option<Diagnostic>,
 }
 
 /// Project a run into the canonical report. The one place the projection is
-/// built, so the renderers cannot disagree (Decision E).
+/// built, so the renderers cannot disagree (ADR-0005).
 pub fn build(summary: &RunSummary) -> Report {
     Report {
         schema_version: SCHEMA_VERSION,
@@ -301,7 +301,7 @@ mod tests {
         }
     }
 
-    /// Guard: the results are the published contract (Decision E), pinned exact so
+    /// Guard: the results are the published contract (ADR-0005), pinned exact so
     /// a renamed key, a dropped/mismapped field, a missing verdict kind, or a
     /// mis-serialized `Confidence` is caught (round-trip alone would not; RK-003).
     /// The evidence shape is pinned by #5, so only its ids are checked here.
@@ -460,7 +460,7 @@ mod tests {
     }
 
     /// Guard: every evidence id a result cites resolves to a record in the report's
-    /// evidence section, so the projection is internally consistent (Decision E).
+    /// evidence section, so the projection is internally consistent (ADR-0005).
     /// Mutation: have `build` copy only some of the store's records -> an id no
     /// longer resolves -> fails.
     #[test]

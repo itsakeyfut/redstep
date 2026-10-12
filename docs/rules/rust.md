@@ -20,7 +20,7 @@
 | Constants | SCREAMING_SNAKE_CASE | `DEFAULT_INTENSITY` |
 | Modules / files | snake_case | `scope_gate`, `scope_gate.rs` |
 
-Use the domain's own words, fixed by `docs/specs/design-decisions.md`: verdict,
+Use the domain's own words, fixed by the ADRs in `docs/adr/`: verdict,
 observation, expectation, evidence, success witness, capability, intensity,
 scope, foothold, pivot, segment, boundary. Do not invent a synonym for one of
 these; a second vocabulary is the `naming` lens's first finding.
@@ -124,7 +124,7 @@ comment.
 ## Comments
 
 - Comments explain **why**, not the obvious **what**. Where a decision settled it,
-  name the decision (`See Decision J.`) rather than restating it.
+  name the decision (`See ADR-0010.`) rather than restating it.
 - A comment is a claim (CLAUDE.md). If it says what a tool's output means, or that
   a target is unreachable, it is checkable, so check it.
 

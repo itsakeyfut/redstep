@@ -2,9 +2,9 @@
 //! summary, and optionally write the canonical JSON.
 //!
 //! The terminal summary and the JSON are two renderers over one canonical
-//! [`Report`](redstep::report::Report), so they cannot disagree (Decision E). The
+//! [`Report`](redstep::report::Report), so they cannot disagree (ADR-0005). The
 //! argument surface is deliberately minimal; it grows with the environment unit
-//! (Decision C), which later supplies scope from the lab definition rather than
+//! (ADR-0003), which later supplies scope from the lab definition rather than
 //! from `--allow`.
 
 use redstep::report;
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // The status is a field of the canonical JSON (Decision E). Map it to a
+    // The status is a field of the canonical JSON (ADR-0005). Map it to a
     // process code explicitly rather than casting: `build` only ever produces 0
     // or 1, but `report.exit_code` is a public `i32`, and `as u8` would wrap a
     // stray value (256 -> 0) into a false success (CLAUDE.md row 6).

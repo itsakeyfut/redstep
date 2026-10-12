@@ -1,11 +1,11 @@
 //! What a test expects of an observation, and the oracle that judges it
-//! (Decision J).
+//! (ADR-0010).
 //!
 //! Pure model layer. An [`Expectation`] is the declared, acceptable value plus
 //! an optional minimum confidence. [`judge`] compares an [`Observation`] against
 //! it and yields a [`Judgement`]: a [`Verdict`] and the reason (expected vs
 //! actual) the report renders. The reason is `Debug`-formatted for now; the
-//! stable machine form is the canonical JSON (Decision E).
+//! stable machine form is the canonical JSON (ADR-0005).
 
 use std::fmt::Debug;
 
@@ -20,7 +20,7 @@ use crate::verdict::Verdict;
 ///
 /// The sign is here. A test declares the *safe* value (for the boundary demo,
 /// `reachable` to be `false`), so an attack that succeeded (`reachable == true`)
-/// is a mismatch and a `Fail`. See Decision J.
+/// is a mismatch and a `Fail`. See ADR-0010.
 pub struct Expectation<T> {
     expected: T,
     min_confidence: Confidence,
@@ -47,7 +47,7 @@ impl<T> Expectation<T> {
 }
 
 /// A rustc-style FAIL diagnostic: why the test failed and how to fix it, produced
-/// by the built-in check rather than authored per test (Decision H-2). Present on
+/// by the built-in check rather than authored per test (ADR-0009). Present on
 /// a `Fail`, absent otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -72,10 +72,10 @@ pub struct Judgement {
     /// The evidence record this judgement rests on, or `None` for a bare `check`
     /// or a hand-built observation that came from no capability. `judge` leaves it
     /// `None`: it is pure and cannot know the run-scoped id, which the store does
-    /// not assign until the runner drains the test's drafts (Decision J, issue
+    /// not assign until the runner drains the test's drafts (ADR-0010, issue
     /// #14). The runner fills it from the per-test reference the test carried.
     pub evidence: Option<EvidenceId>,
-    /// The FAIL diagnostic the built-in check produced (Decision H-2), or `None`
+    /// The FAIL diagnostic the built-in check produced (ADR-0009), or `None`
     /// when the verdict is not `Fail`.
     pub diagnostic: Option<Diagnostic>,
 }
@@ -85,7 +85,7 @@ pub struct Judgement {
 /// A signal below the required confidence is `Inconclusive`, whatever its value,
 /// so a weak signal cannot read as a confident `Pass` or `Fail`. Otherwise a
 /// value that matches the expectation is a `Pass`, and a mismatch is a `Fail`. A
-/// `Fail` also carries a generic [`Diagnostic`] (Decision H-2, produced by the
+/// `Fail` also carries a generic [`Diagnostic`] (ADR-0009, produced by the
 /// check); a `Pass` or `Inconclusive` carries none.
 pub fn judge<T: PartialEq + Debug>(
     observation: &Observation<T>,
@@ -100,7 +100,7 @@ pub fn judge<T: PartialEq + Debug>(
     };
     let expected = format!("{:?}", expectation.expected);
     let actual = format!("{:?}", observation.value);
-    // The built-in check produces the FAIL diagnostic (Decision H-2). This value
+    // The built-in check produces the FAIL diagnostic (ADR-0009). This value
     // expectation knows only the mismatch, so the text is generic; a domain check
     // (segmentation, authorization) that knows the meaning sets richer text with
     // no change to the renderer.
@@ -118,7 +118,7 @@ pub fn judge<T: PartialEq + Debug>(
         actual,
         confidence: observation.confidence,
         // The link is attached at the `ExpectationBuilder` seam and resolved by
-        // the runner, not here (Decision J): `judge` is pure and id-blind.
+        // the runner, not here (ADR-0010): `judge` is pure and id-blind.
         evidence: None,
         diagnostic,
     }
@@ -224,7 +224,7 @@ mod tests {
     }
 
     /// Guard: the built-in value check produces a FAIL diagnostic and none on a
-    /// Pass or an Inconclusive (Decision H-2, produced by the check not the
+    /// Pass or an Inconclusive (ADR-0009, produced by the check not the
     /// author), and the cause names both the observed and the expected value.
     /// Mutation: leave `diagnostic` `None` on a `Fail` -> the FAIL expect fails;
     /// widen it to `!= Pass` -> the Inconclusive assert fails; set it on a Pass ->

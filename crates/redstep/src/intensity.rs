@@ -1,9 +1,9 @@
-//! How much force a capability applies (Decision B, F).
+//! How much force a capability applies (ADR-0002, ADR-0006).
 //!
 //! Pure model type. The intensity ladder is how the safety model gates force:
 //! a capability reports its intensity, and the run path refuses anything but
 //! `Safe` until the authorization and isolation proof a later unit adds unlock
-//! the higher rungs (See Decision F).
+//! the higher rungs (See ADR-0006).
 
 /// The force a capability applies. `Safe` is the only rung exercisable in the
 /// current build.

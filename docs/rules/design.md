@@ -1,14 +1,14 @@
 # Design and API Conventions
 
 redstep starts as a single crate and splits into a workspace as the milestones
-land (Decision M onward). These rules are about **boundaries and invariants**,
+land (ADR-0013 onward). These rules are about **boundaries and invariants**,
 which hold whether a boundary is a module today or a crate later. When the split
 happens, a layer below becomes a crate below, and the dependency direction here
 becomes the crate graph.
 
 ---
 
-## 1. The role tiers (Decision G)
+## 1. The role tiers (ADR-0007)
 
 Everything that touches a target is one of three roles, and the code keeps them
 distinct because they carry different safety obligations:
@@ -47,12 +47,12 @@ evidence / verdict / scope / intensity   (the model: pure, no I/O)
   be applied without a value the model produced. This is the type-level half of
   security.md sections 2 and 3.
 
-## 3. Evidence is the one source of truth (Decision D, V)
+## 3. Evidence is the one source of truth (ADR-0004, ADR-0022)
 
 - The evidence record is the single source of truth. The terminal report, the
   canonical JSON, the attack graph and the success witness are **projections** of
   it, computed from it, never a second answer that can disagree. A projection that
-  derives its own verdict is the drift Decision E exists to prevent.
+  derives its own verdict is the drift ADR-0005 exists to prevent.
 - Define the evidence type and the verdict type **once**, in the model layer, and
   re-export upward. Never define a second copy in the reporting layer.
 
@@ -85,7 +85,7 @@ evidence / verdict / scope / intensity   (the model: pure, no I/O)
   validate. For anything safety-relevant, `.build()` is also where the scope and
   intensity are resolved, so an unvalidated or unscoped object cannot exist.
 
-## 7. The plugin boundary is a contract (Decision G)
+## 7. The plugin boundary is a contract (ADR-0007)
 
 - A Capability adapter, a Scanner and an Interop importer each implement a stable
   trait, so a new tool is a new implementation rather than a change to the core.

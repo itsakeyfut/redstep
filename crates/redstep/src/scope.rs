@@ -86,7 +86,7 @@ impl Scope {
     /// stays exact. Standing up the egress-less network this membership-only gate
     /// rests on is the bring-up unit's (#18).
     ///
-    /// Membership, not reachability (Decision F, MVP note #20): a blocked
+    /// Membership, not reachability (ADR-0006, MVP note #20): a blocked
     /// boundary is observed as unreachable at run time, never denied here, or a
     /// test could never attempt the target it is meant to prove unreachable.
     pub fn from_environment(env: &Environment) -> Scope {
@@ -127,7 +127,7 @@ impl ScopeBuilder {
 
 /// Parse a `host:port` specification. The host is matched against the allowlist
 /// by the caller; a named target (`web:80`) resolves when its host is a declared
-/// workload, against a scope from [`Scope::from_environment`] (Decision C).
+/// workload, against a scope from [`Scope::from_environment`] (ADR-0003).
 ///
 /// The host is validated rather than accepted verbatim, so a malformed spec is
 /// a visible error instead of a silently unmatchable entry. In particular a
