@@ -120,12 +120,16 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
 /// (the host-in-process `--allow` path) does not.
 ///
 /// It is `async`: the caller owns the runtime (unlike `run`, which builds its
-/// own), because the lab lifecycle is already async. Teardown runs on every path,
-/// including a self-check refusal or a test panic; the `RunningLab` `Drop`
-/// backstop (#18) is the last resort. A teardown failure is warned to stderr, not
-/// returned: a leaked egress-less lab is a row-5 cleanup concern, not a wrong
-/// verdict, and returning it as `RunError` would demote a recorded `Fail` or hide
-/// a refusal.
+/// own), because the lab lifecycle is already async. Teardown runs on every path
+/// this function returns from, including a self-check refusal or a test panic
+/// (caught per test). The `RunningLab` `Drop` backstop (#18) is the last resort
+/// for the paths that never reach the `teardown` call: an unwind or cancellation
+/// before it, such as a panic in the self-check (which runs outside the per-test
+/// `catch_unwind`) or this future being dropped at an earlier `.await`. A
+/// teardown that ran to completion and failed is warned, not retried by the
+/// backstop: the failure goes to stderr, not the return, because a leaked
+/// egress-less lab is a row-5 cleanup concern, not a wrong verdict, and returning
+/// it as `RunError` would demote a recorded `Fail` or hide a refusal.
 pub async fn run_in_lab(
     docker: &Docker,
     env: &Environment,

@@ -663,6 +663,14 @@ impl RunningLab {
 
     /// Remove every container and network this lab created. The normal,
     /// error-surfacing teardown path.
+    ///
+    /// `torn_down` is set whether or not `remove_all` succeeded, but only once
+    /// this future runs to completion (the assignment is after the `.await`): a
+    /// teardown that *completed* is the caller's result to handle (the returned
+    /// `Err`, which `run_in_lab` warns), not something the `Drop` backstop
+    /// retries. The backstop fires when `teardown` did not complete: never
+    /// called, or its future dropped (cancelled) before `torn_down` was set (the
+    /// `Drop` impl).
     pub async fn teardown(mut self) -> Result<()> {
         let result = remove_all(&self.docker, &self.containers, &self.networks).await;
         self.torn_down = true;
@@ -675,11 +683,14 @@ impl Drop for RunningLab {
         if self.torn_down {
             return;
         }
-        // Backstop for a forgotten teardown or a panic. Drop cannot be async,
-        // and `block_on` panics when it runs on a thread that is already inside
-        // a runtime (the common case: a `?`/panic/cancel between `bring_up` and
-        // an explicit teardown). So run the removal on a dedicated thread, which
-        // has no ambient runtime, and join it. Best effort: warn, never panic.
+        // Backstop for a teardown that did not complete: never called, or its
+        // future dropped mid-removal (a `?`/panic/cancel between `bring_up` and a
+        // completed teardown). Not for a teardown that ran to completion and
+        // failed: that error is the caller's, surfaced by `teardown`, and is not
+        // retried here. Drop cannot be async, and `block_on` panics when it runs
+        // on a thread that is already inside a runtime (the common case fires
+        // there). So run the removal on a dedicated thread, which has no ambient
+        // runtime, and join it. Best effort: warn, never panic.
         let docker = self.docker.clone();
         let containers = std::mem::take(&mut self.containers);
         let networks = std::mem::take(&mut self.networks);
