@@ -32,10 +32,16 @@ standard. Copy [`adr-template.md`](./adr-template.md) to start one.
 | [0009](./0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md) | Emit an executable, rustc-style FAIL diagnostic from the oracle | accepted | `check_failure_carries_a_diagnostic` in `context.rs` (mutation: leave `diagnostic` None on a failing check) |
 | [0010](./0010-separate-observation-from-verdict-and-default-to-high-confidence.md) | Separate observation from verdict, and require High confidence by default | accepted | `default_requires_high_confidence` in `expectation.rs`, `aggregate_is_fail_closed` / `inconclusive_run_exits_nonzero` in `runner.rs` |
 | [0011](./0011-enforce-boundaries-by-membership-and-self-check-before-any-test.md) | Enforce boundaries by membership, add a firewall only where needed, self-check before any test | accepted | `check_refuses_when_a_non_first_workload_is_reachable` and `a_connected_lab_is_refused_before_any_test_runs` (Docker, CI leg); `check_boundaries` offline with an injected prober |
+| [0012](./0012-model-the-attacker-state-as-a-growing-asset-set.md) | Model the attacker's state as a growing asset set, identified with the attack graph | accepted | nothing yet beyond the skeleton (Phase 5) |
+| [0013](./0013-handle-only-what-can-be-both-mocked-and-run-for-real.md) | Handle only what can be both mocked and run for real, two backends per workload | accepted | nothing yet (M4); the wireless non-goal is held by its absence |
+| [0014](./0014-do-not-assume-ci-gating-report-and-evidence-are-primary.md) | Do not assume CI gating; report and evidence are primary | accepted | the deterministic runner exit (ADR-0010 guards); the discovery/replay split is Phase 5 |
+| [0015](./0015-run-ai-testing-in-two-modes-with-a-discovery-to-code-promotion.md) | Run AI testing in two modes with a discovery-to-code promotion | accepted | nothing yet (M5) |
+| [0016](./0016-tag-attacks-with-attack-and-owasp-optional-but-first-class.md) | Tag attacks with ATT&CK and OWASP, optional but first-class, unmapped allowed | accepted | nothing yet (M2) |
+| [0017](./0017-make-external-and-assume-breach-vantages-first-class.md) | Make both external and assume-breach vantages first-class | accepted | the external vantage in `tests/environment.rs` (Docker, CI leg) and `vantage_segment_must_be_set_and_declared` offline; assume-breach is Phase 5 |
 
-**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011 · proposed: none · superseded: none
+**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017 · proposed: none · superseded: none
 
-Records are numbered consecutively from `0001`. The remaining lettered decisions (L, M, O, U, K, P, Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
+Records are numbered consecutively from `0001`. The remaining lettered decisions (Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
 
 ## Where each kind of writing belongs
 
