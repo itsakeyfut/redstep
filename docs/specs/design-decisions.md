@@ -120,6 +120,13 @@ environment:
 
 **未決(今後詰める)**: 環境定義フォーマットの詳細(DSL / A の Attack Scenario DSL との統合)、compose サービスを引き取りつつ独自ネットワーク定義を無視する統合ロジック、境界(firewall / routing)を Docker ネットワーク上でどう実装するか(iptables / 独立ネットワーク + ゲートウェイ等)、VPN 境界の表現方法。
 
+**MVP implementation note (settled in #17)**: the lab definition model is a pure, validated value, built in code. The bring-up (#18), the boundary self-check (#19), and scope resolution (#20) read it.
+
+- The `environment` module holds `Segment`, `Workload { name, image, segment }`, `Boundary { from, to, allow }`, and `Lab`, built through `Lab::builder()` (valid by construction, like `Scope::builder`). `allow` is the raw `workload:port` specs (this sketch's shape); it is held opaquely, since the MVP's boundaries are empty-`allow` and parsing/enforcing a non-empty one belongs to the membership-vs-firewall decision (Decision N) in a later unit.
+- `build` validates references (every boundary and workload segment, and the attacker's segment, is declared; names are unique) and returns `Error::InvalidLab` otherwise, so an invalid topology never reaches bollard. It does not validate the `allow` specs' contents.
+- The YAML/DSL *definition format* above is deferred (M2); the MVP constructs the lab in code. `image` is a plain reference (Decision C's `compose(...)` source is deferred). Accepting a non-empty `allow` the membership-only MVP cannot yet enforce is left to the enforcement layer (#18/#19) to refuse fail-closed, not to the model.
+- The MVP topology the later units build: segments `internet`/`internal`; workloads `web`/`api`/`db` in `internal`; attacker in `internet`; boundary `internet -> internal` with an empty `allow`.
+
 ---
 
 ### Decision D — Evidence & Attack Path: Layered(確定)
