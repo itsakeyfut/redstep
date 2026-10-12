@@ -38,10 +38,15 @@ standard. Copy [`adr-template.md`](./adr-template.md) to start one.
 | [0015](./0015-run-ai-testing-in-two-modes-with-a-discovery-to-code-promotion.md) | Run AI testing in two modes with a discovery-to-code promotion | accepted | nothing yet (M5) |
 | [0016](./0016-tag-attacks-with-attack-and-owasp-optional-but-first-class.md) | Tag attacks with ATT&CK and OWASP, optional but first-class, unmapped allowed | accepted | nothing yet (M2) |
 | [0017](./0017-make-external-and-assume-breach-vantages-first-class.md) | Make both external and assume-breach vantages first-class | accepted | the external vantage in `tests/environment.rs` (Docker, CI leg) and `vantage_segment_must_be_set_and_declared` offline; assume-breach is Phase 5 |
+| [0018](./0018-manage-attack-data-as-version-pinned-packs.md) | Manage attack data as version-pinned packs, updated explicitly | accepted | nothing yet (Phase 4+) |
+| [0019](./0019-build-the-attacker-image-from-a-pinned-base-and-tool-profiles.md) | Build the attacker image from a digest-pinned base and composable tool profiles | accepted | nothing yet (Phase 4+) |
+| [0020](./0020-treat-a-c2-session-as-a-foothold.md) | Treat a C2 session as a foothold and integrate C2 via the plugin | accepted | nothing yet (Phase 9) |
+| [0021](./0021-govern-distribution-by-risk-tier.md) | Govern distribution by risk tier, connected at the scope gate | accepted | nothing enforced yet; the baseline documents are the artifact |
+| [0022](./0022-capture-a-success-witness-and-generate-a-pinned-replay.md) | Capture a success witness and generate a pinned replay from it | accepted | nothing yet (first piece is #29; Phase 5) |
 
-**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017 · proposed: none · superseded: none
+**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022 · proposed: none · superseded: none
 
-Records are numbered consecutively from `0001`. The remaining lettered decisions (Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
+Records are numbered consecutively from `0001`. The lettered decisions A to V (with H-2) are now the records above; the retired `design-decisions.md`'s "Decision MVP" was scope, not a decision, and lives in [`docs/roadmap/mvp.md`](../roadmap/mvp.md).
 
 ## Where each kind of writing belongs
 
