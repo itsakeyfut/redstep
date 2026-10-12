@@ -812,5 +812,7 @@ Brute: 探索（遅い, flaky）             → 「admin = Summer2024!」判明
 
 **実ツールの扱い(確定)**: Option (1) — **nmap + sqlmap を MVP に前倒し**。ユーザーの「実際にクラッカーが使う成熟ツールで検証する」意図に忠実。
 
+**M1 real-tool scope (clarified, #33)**: M1's nmap/sqlmap (G/B) run as single-hop attacks against a target reachable under the membership model, bespoke in the `connect_from_vantage` pattern (#27), to prove the adapter mechanism and Decision V with real tools. What M1 actually *delivers* of the attack-to-defense loop is the native boundary Security Test, "the attacker cannot reach the database" (#28). Deferred to M3 / Phase 5: the generalized in-container capability seam (#27, #28 notes), the full external -> web -> api -> db Attack Scenario, the "Internal API reachable only through the intended path" port boundary (the M3 firewall gateway, in OUT-scope above), and the multi-step pivot (Decision L, Phase 5). So "nmap/sqlmap in M1" is not a mandate to build the generalized vantage-capability seam early.
+
 ---
 

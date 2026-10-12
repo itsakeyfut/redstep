@@ -103,3 +103,5 @@
 | **横断** | **ガバナンス・資産保守(継続)** | リスク階層ガバナンスの成熟・米/日法務レビュー(T)/ データパック・イメージ保守(Q/R)/ responsible disclosure | 全世界向けに安全・合法・再現可能に配布し続けられる |
 
 **芯の流れ**: M1 で「攻撃→防御ループ」を1本通す → M2 で書きやすく見やすく → M3 で本物の多段攻撃 → M4 で全層・mock/real → M5 で AI と敵対者エミュレーション。
+
+**M1 real-tool note (#33)**: M1's nmap/sqlmap run single-hop against a reachable target (the adapter mechanism and Decision V); the multi-step external -> web -> api -> db attack scenario and "reachable only through the intended path" (a port boundary) are M3, where the firewall gateway and the pivot land. What M1 delivers of the attack-to-defense loop is the native boundary test, "the attacker cannot reach the database" (#28). See the Decision MVP note for the split.
