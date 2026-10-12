@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use crate::capability::Capability;
-use crate::evidence::Evidence;
+use crate::evidence::{EvidenceDraft, Reproduction};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::scope::ScopedTarget;
@@ -65,7 +65,7 @@ impl Capability for TcpConnect {
         Intensity::Safe
     }
 
-    async fn execute(&self) -> crate::Result<(Observation<bool>, Evidence)> {
+    async fn execute(&self) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
         let target = format!("{}:{}", self.target.host(), self.target.port());
         let dial = target.clone();
         let outcome = connect_outcome(self.timeout, async move {
@@ -74,14 +74,21 @@ impl Capability for TcpConnect {
         .await;
 
         let observation = classify_connect(outcome);
-        let evidence = build_evidence(self.name(), target, self.intensity(), &observation);
-        Ok((observation, evidence))
+        let draft = build_draft(
+            self.name(),
+            target,
+            self.intensity(),
+            self.timeout,
+            outcome,
+            &observation,
+        );
+        Ok((observation, draft))
     }
 }
 
 /// What a connection attempt established. Only a completed handshake and an
 /// explicit refusal are confident; everything else is ambiguous.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectOutcome {
     /// The handshake completed: the port accepts a connection.
     Connected,
@@ -132,21 +139,44 @@ fn classify_connect(outcome: ConnectOutcome) -> Observation<bool> {
     }
 }
 
-/// Compose the evidence record from the observation. Pure, so that the record
-/// mirroring the observation (not a hard-coded value) is testable without a
-/// socket.
-fn build_evidence(
+/// Compose the evidence draft. Pure, so that the draft mirroring the observation
+/// (not a hard-coded value) is testable without a socket. The observed value is
+/// erased to a JSON bool so the record stays capability-neutral (Decision D); the
+/// reproduction restates the target and the timeout, which together re-run the
+/// same connect (Decision V's witness).
+///
+/// The summary is derived from the three-valued `outcome`, not from the bool: a
+/// refusal (the port is closed) and an indeterminate result (a timeout or a
+/// probe-side error, which established nothing) both erase to `observed: false`,
+/// so a summary keyed off the bool would phrase both as "unreachable" and let a
+/// projection that reads the summary without the confidence read a probe-side
+/// non-result as a confident boundary hold (a false PASS, CLAUDE.md row 6). The
+/// `confidence` already distinguishes them; the summary must not contradict it.
+fn build_draft(
     capability: &'static str,
     target: String,
     intensity: Intensity,
+    timeout: Duration,
+    outcome: ConnectOutcome,
     observation: &Observation<bool>,
-) -> Evidence {
-    Evidence {
+) -> EvidenceDraft {
+    let summary = match outcome {
+        ConnectOutcome::Connected => "reachable",
+        ConnectOutcome::Refused => "connection refused",
+        ConnectOutcome::Indeterminate => "not established (timeout or probe error)",
+    };
+    EvidenceDraft {
         capability,
-        target,
+        target: target.clone(),
         intensity,
-        reachable: observation.value,
+        observed: serde_json::Value::Bool(observation.value),
         confidence: observation.confidence,
+        summary: summary.to_owned(),
+        reproduction: Reproduction {
+            capability: capability.to_owned(),
+            target,
+            params: serde_json::json!({ "timeout_ms": timeout.as_millis() as u64 }),
+        },
     }
 }
 
@@ -232,26 +262,108 @@ mod tests {
         );
     }
 
-    /// Guard: the evidence mirrors the observation, including on the decisive
-    /// Low path. Mutation: set `confidence` to a fixed `High` in `build_evidence`
-    /// -> this fails (the integration tests only reach High, so they cannot).
+    /// Guard: the draft mirrors every field it is given, including on the
+    /// decisive Indeterminate/Low path: `observed` tracks the value, `confidence`
+    /// and `intensity` are copied not hard-coded, and the reproduction restates
+    /// the target and timeout. Passing `Intensity::Controlled` (a value TcpConnect
+    /// never uses) proves the field is copied. Mutation: set `confidence` to a
+    /// fixed `High`, `intensity` to a fixed `Safe`, or hard-code `observed` ->
+    /// this fails (the integration tests only reach the reachable/High/Safe case,
+    /// so they cannot catch it).
     #[test]
-    fn build_evidence_mirrors_the_observation() {
+    fn build_draft_mirrors_the_observation() {
         let observation = Observation {
             value: false,
             confidence: Confidence::Low,
         };
-        let evidence = build_evidence(
+        let draft = build_draft(
+            "tcp_connect",
+            "web:80".to_owned(),
+            Intensity::Controlled,
+            Duration::from_millis(250),
+            ConnectOutcome::Indeterminate,
+            &observation,
+        );
+        assert_eq!(draft.capability, "tcp_connect");
+        assert_eq!(draft.target, "web:80");
+        assert_eq!(draft.intensity, Intensity::Controlled);
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.reproduction.capability, "tcp_connect");
+        assert_eq!(draft.reproduction.target, "web:80");
+        assert_eq!(draft.reproduction.params["timeout_ms"], 250);
+    }
+
+    /// Guard: a refusal and an indeterminate result (both `observed: false`) do
+    /// not share a summary, so a projection that renders the summary cannot read
+    /// a timeout or probe error as a confident "the port is closed" (CLAUDE.md
+    /// row 6). Mutation: key the summary off `observation.value` instead of the
+    /// outcome in `build_draft` -> both become "unreachable" and this fails. The
+    /// indeterminate summary must not claim the port is closed/unreachable.
+    #[test]
+    fn refused_and_indeterminate_do_not_share_a_summary() {
+        let refused = build_draft(
             "tcp_connect",
             "web:80".to_owned(),
             Intensity::Safe,
-            &observation,
+            Duration::from_secs(5),
+            ConnectOutcome::Refused,
+            &classify_connect(ConnectOutcome::Refused),
         );
-        assert_eq!(evidence.capability, "tcp_connect");
-        assert_eq!(evidence.target, "web:80");
-        assert_eq!(evidence.intensity, Intensity::Safe);
-        assert!(!evidence.reachable);
-        assert_eq!(evidence.confidence, Confidence::Low);
+        let indeterminate = build_draft(
+            "tcp_connect",
+            "web:80".to_owned(),
+            Intensity::Safe,
+            Duration::from_secs(5),
+            ConnectOutcome::Indeterminate,
+            &classify_connect(ConnectOutcome::Indeterminate),
+        );
+        // Both erase to the same observed value, so the summary is the only
+        // human-readable field that can carry the difference.
+        assert_eq!(refused.observed, indeterminate.observed);
+        assert_ne!(refused.summary, indeterminate.summary);
+        assert!(
+            !indeterminate.summary.contains("unreachable")
+                && !indeterminate.summary.contains("closed"),
+            "an indeterminate result must not claim the port is unreachable/closed, got {:?}",
+            indeterminate.summary
+        );
+    }
+
+    /// Guard: `execute` against a bound port wires the live observation into the
+    /// draft (observed/true, confidence mirrored) with a reproduction that
+    /// restates the target. Mutation: have `execute` build the draft from a
+    /// constant, or pass a different observation to `build_draft`, than the one it
+    /// returns -> the observed value, target, or confidence disagrees -> fails.
+    /// This proves the `execute` -> `build_draft` wiring end to end, which the
+    /// isolated `build_draft` test cannot.
+    #[test]
+    fn execute_emits_a_mirrored_draft_for_a_live_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener.local_addr().expect("local addr").port();
+        let spec = format!("127.0.0.1:{port}");
+
+        let scope = crate::scope::Scope::builder()
+            .allow(&spec)
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve(&spec).expect("in scope");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime with net builds");
+        let (observation, draft) = rt
+            .block_on(TcpConnect::new(target).execute())
+            .expect("the capability runs");
+
+        assert!(observation.value, "a bound port is reachable");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.summary, "reachable");
+        assert_eq!(draft.intensity, Intensity::Safe);
+        assert_eq!(draft.target, spec);
+        assert_eq!(draft.reproduction.target, spec);
+        assert_eq!(draft.confidence, observation.confidence);
     }
 
     /// Guard: `with_timeout` sets the timeout the capability will use. Mutation:

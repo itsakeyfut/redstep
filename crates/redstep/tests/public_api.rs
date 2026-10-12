@@ -7,7 +7,8 @@
 //! crate as `::redstep`.
 
 use redstep::{
-    Confidence, Observation, RunSummary, Scope, TestContext, Verdict, run, security_test,
+    Capability, Confidence, EvidenceDraft, Intensity, Observation, Reproduction, RunSummary, Scope,
+    TestContext, Verdict, run, security_test,
 };
 
 /// A tautology: should pass.
@@ -104,6 +105,68 @@ async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
+/// A Safe capability an external crate implements against the public trait,
+/// observing a reachable target with no socket. Proves the evidence shape
+/// (`EvidenceDraft`, `Reproduction`) is publicly constructible, and gives
+/// `run_collects_evidence_into_the_store` deterministic records to find. The
+/// target is a field so one test can run it twice with distinct records.
+struct StubReachable {
+    target: &'static str,
+}
+
+impl Capability for StubReachable {
+    type Value = bool;
+
+    fn name(&self) -> &'static str {
+        "stub_reachable"
+    }
+
+    fn intensity(&self) -> Intensity {
+        Intensity::Safe
+    }
+
+    async fn execute(&self) -> redstep::Result<(Observation<bool>, EvidenceDraft)> {
+        Ok((
+            Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            EvidenceDraft {
+                capability: self.name(),
+                target: self.target.to_owned(),
+                intensity: Intensity::Safe,
+                observed: serde_json::Value::Bool(true),
+                confidence: Confidence::High,
+                summary: "reachable".to_owned(),
+                reproduction: Reproduction {
+                    capability: self.name().to_owned(),
+                    target: self.target.to_owned(),
+                    params: serde_json::json!({}),
+                },
+            },
+        ))
+    }
+}
+
+/// Runs a Safe capability twice, so the run produces two evidence records the
+/// store collects in order.
+#[security_test]
+async fn records_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let first = ctx
+        .run(StubReachable {
+            target: "stub:alpha",
+        })
+        .await?;
+    let second = ctx
+        .run(StubReachable {
+            target: "stub:beta",
+        })
+        .await?;
+    ctx.expect(&first).to_be(true);
+    ctx.expect(&second).to_be(true);
+    Ok(())
+}
+
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
@@ -175,6 +238,42 @@ fn run_passes_the_scope_to_tests() {
         Verdict::Pass
     );
     assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
+}
+
+/// Guard: a run collects every capability execution's evidence into the summary's
+/// store, in execution order, with run-scoped sequential ids and a real clock
+/// timestamp (Decision D). `records_evidence_demo` runs the capability twice and
+/// is the run's only evidence producer.
+/// Mutations caught: drop the `for draft in ctx.take_evidence()` loop in `run`
+/// -> store empty -> the length assert fails; `.rev()` or `.take(1)` the drain
+/// -> the order or the count fails; `append(draft, 0)` instead of `now_ms()`, or
+/// `now_ms` returning a constant or seconds -> the timestamp assert fails.
+#[test]
+fn run_collects_evidence_into_the_store() {
+    let summary = run(Scope::default()).expect("the runtime starts");
+
+    let records: Vec<_> = summary
+        .evidence
+        .records()
+        .iter()
+        .filter(|e| e.capability == "stub_reachable")
+        .collect();
+
+    assert_eq!(records.len(), 2, "both executions were collected");
+    // Run-scoped sequential ids in execution order (this demo is the only
+    // producer, so its records are ids 0 and 1).
+    assert_eq!(records[0].id, redstep::EvidenceId(0));
+    assert_eq!(records[1].id, redstep::EvidenceId(1));
+    assert_eq!(records[0].target, "stub:alpha");
+    assert_eq!(records[1].target, "stub:beta");
+    assert_eq!(records[0].observed, serde_json::Value::Bool(true));
+    // The runner stamps a real wall clock, not a constant or seconds: this is
+    // well past 2020-09 in epoch milliseconds (and far above any seconds value).
+    assert!(
+        records[0].recorded_at_ms > 1_600_000_000_000,
+        "recorded_at_ms must be real epoch milliseconds, got {}",
+        records[0].recorded_at_ms
+    );
 }
 
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's

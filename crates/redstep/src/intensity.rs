@@ -7,7 +7,7 @@
 
 /// The force a capability applies. `Safe` is the only rung exercisable in the
 /// current build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intensity {
     /// Fast, deterministic, non-destructive: reachability, segmentation, a
     /// spec check. Runs without any opt-in.

@@ -8,7 +8,7 @@
 /// How much to trust an observation. A single weak signal is `Low`, so the
 /// oracle requires `High` by default before a conclusion rests on it, and a
 /// transient result (a timeout) cannot read as a confident answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Confidence {
     /// Unambiguous for the capability that set it: a completed handshake, or a
     /// connection the target explicitly refused. Corroboration across signals
