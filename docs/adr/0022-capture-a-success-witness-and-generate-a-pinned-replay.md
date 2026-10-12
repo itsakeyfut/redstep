@@ -27,12 +27,12 @@ Chosen: Option 2. A discovery test finds the success condition (flaky, informati
 
 ### Confirmation
 
-Nothing yet. No witness capture or replay generation is built; #29 is the first piece, and the `reproduction` field on the evidence record (ADR-0004) is the foundation it will build on. When built, the ADR names the guard (a pinned replay re-run reproduces the same observation).
+The first piece is built (#29): the vantage probe's witness is faithful (the `reproduction` records the stable vantage segment, not the run-scoped Docker network name), and `replay_vantage_probe` in `orchestrator.rs` reconstructs the probe from the witness and re-runs it. `replay_vantage_probe_reproduces_a_recorded_observation` (Docker-gated, self-skipping) shows a recorded observation reproduces; the offline guards `parse_vantage_witness_rejects_an_incomplete_witness` (a witness missing a field cannot replay) and `vantage_network_finds_the_named_segment_or_fails_closed` (replay probes from the recorded segment, not the first) carry the precise mutations. The M1 guarantee is narrower than byte-reproducibility, the same observation against the same `Environment`; image-digest and data-pack pinning (ADR-0019, ADR-0018) would make it stronger and are a later milestone. The witness minimization, the deterministic-replay classification, and the generated/codified replay form (ADR-0015) are still undesigned.
 
 ### Consequences
 
 * Good, the deterministic part of attack testing becomes a reliable regression gate, recovering the CI value ADR-0014 set aside, and discovery feeds it through ADR-0015.
-* Bad, the witness schema, its minimization, the deterministic-replay classification, and the replay's generated form are undesigned; the current evidence `reproduction` is not yet a faithful replay witness (#29).
+* Bad, the witness minimization, the deterministic-replay classification, and the replay's generated form are undesigned; the vantage witness is faithful (#29) but witnesses for the tool-adapter capabilities are not built.
 * What would reverse this: discovery proving deterministic enough to gate directly (it is not), which is why the witness/replay split exists.
 
 ## Pros and Cons of the Options

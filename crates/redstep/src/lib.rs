@@ -48,7 +48,9 @@ pub use capability::{Capability, TcpConnect};
 pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
 pub use environment::{Boundary, Environment, EnvironmentBuilder, Segment, Workload};
 pub use error::{Error, Result};
-pub use evidence::{DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore, Reproduction};
+pub use evidence::{
+    DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore, NodeRef, Reproduction,
+};
 pub use expectation::{Diagnostic, Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};

@@ -57,11 +57,31 @@ impl DraftRef {
     }
 }
 
+/// Where an action originated: the attack-graph node that was its source
+/// (ADR-0004). M1 has one node kind, the attacker's vantage segment; the full
+/// taxonomy (host, privilege, credential) is ADR-0004's deferred graph work.
+///
+/// `#[non_exhaustive]` so a later node kind is a compatible addition, and an
+/// internal exhaustive match over a `NodeRef` answers for it by `E0004` rather
+/// than silently treating a new source as the one that exists today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum NodeRef {
+    /// The attacker's vantage: the segment the action ran from (ADR-0012/ADR-0017).
+    Vantage {
+        /// The segment the attacker acted from, e.g. `"internet"`. The *segment*,
+        /// not the run-scoped Docker network name, so a witness that carries it
+        /// (via the reproduction) can replay against a fresh lab (ADR-0022, #29).
+        segment: String,
+    },
+}
+
 /// Enough to re-run the same action, which a success witness (ADR-0022) lifts
 /// out wholesale. It restates the capability and target (also on the [`Evidence`])
 /// on purpose, so the reproduction is self-contained rather than a reference into
 /// its parent record. `params` is the capability-specific input, kept neutral as
-/// a JSON value (for `TcpConnect`, `{"timeout_ms": N}`).
+/// a JSON value (for `TcpConnect`, `{"timeout_ms": N}`; for the vantage probe,
+/// also `"vantage_segment"`, the stable segment a replay probes from).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reproduction {
     /// The capability to re-run, e.g. `"tcp_connect"`.
@@ -92,6 +112,11 @@ pub struct EvidenceDraft {
     pub confidence: Confidence,
     /// A short human label for the observation, e.g. `"reachable"`.
     pub summary: String,
+    /// The attack-graph node the action originated from, if any (ADR-0004).
+    /// `None` for a host-run native record (the host is not a lab node);
+    /// `Some(NodeRef::Vantage { .. })` for a probe run from the attacker's
+    /// vantage (#27, #29).
+    pub source: Option<NodeRef>,
     /// Enough to re-run the action.
     pub reproduction: Reproduction,
 }
@@ -120,6 +145,8 @@ pub struct Evidence {
     pub confidence: Confidence,
     /// A short human label for the observation.
     pub summary: String,
+    /// The attack-graph node the action originated from, if any (ADR-0004).
+    pub source: Option<NodeRef>,
     /// Enough to re-run the action.
     pub reproduction: Reproduction,
 }
@@ -160,6 +187,7 @@ impl EvidenceStore {
             observed: draft.observed,
             confidence: draft.confidence,
             summary: draft.summary,
+            source: draft.source,
             reproduction: draft.reproduction,
         });
         id
@@ -194,6 +222,7 @@ mod tests {
             observed: serde_json::Value::Bool(value),
             confidence: Confidence::High,
             summary: if value { "reachable" } else { "unreachable" }.to_owned(),
+            source: None,
             reproduction: Reproduction {
                 capability: "tcp_connect".to_owned(),
                 target: target.to_owned(),
@@ -226,11 +255,11 @@ mod tests {
 
     /// Guard: an appended record carries *every* draft field verbatim plus the
     /// stamped id and timestamp. The draft uses non-default values (`Controlled`,
-    /// `Medium`, a reproduction whose capability differs from the record's and
-    /// distinctive params) so a hard-coded value cannot pass as a copied one.
-    /// Mutation: hard-code any field in the `Evidence` built by `append` (e.g.
-    /// `intensity: Safe`, `confidence: High`, or replace the reproduction) ->
-    /// this fails.
+    /// `Medium`, a non-`None` `source`, a reproduction whose capability differs
+    /// from the record's and distinctive params) so a hard-coded value cannot
+    /// pass as a copied one. Mutation: hard-code any field in the `Evidence`
+    /// built by `append` (e.g. `intensity: Safe`, `confidence: High`,
+    /// `source: None`, or replace the reproduction) -> this fails.
     #[test]
     fn append_stamps_identity_onto_the_draft() {
         let mut store = EvidenceStore::new();
@@ -241,6 +270,9 @@ mod tests {
             observed: serde_json::json!({ "header": "X-Frame-Options", "present": false }),
             confidence: Confidence::Medium,
             summary: "missing security header".to_owned(),
+            source: Some(NodeRef::Vantage {
+                segment: "internet".to_owned(),
+            }),
             reproduction: Reproduction {
                 capability: "http_header_probe".to_owned(),
                 target: "api:443".to_owned(),
@@ -261,6 +293,12 @@ mod tests {
         );
         assert_eq!(record.confidence, Confidence::Medium);
         assert_eq!(record.summary, "missing security header");
+        assert_eq!(
+            record.source,
+            Some(NodeRef::Vantage {
+                segment: "internet".to_owned()
+            })
+        );
         assert_eq!(record.reproduction.capability, "http_header_probe");
         assert_eq!(record.reproduction.target, "api:443");
         assert_eq!(
@@ -308,7 +346,10 @@ mod tests {
     /// `Controlled` and `Medium`, which no other test serializes. Mutation:
     /// `#[serde(rename = ...)]` on any field (e.g. `recorded_at_ms`) or on
     /// `Intensity::Controlled` / `Confidence::Medium` -> the key or spelling
-    /// changes -> fails.
+    /// changes -> fails. The first record pins `source: null` (a host-run
+    /// record); the second pins the `NodeRef::Vantage` wire shape, so a rename
+    /// of the `source` key, the `Vantage` variant, or its `segment` field is
+    /// caught (RK-003: a round-trip would not).
     #[test]
     fn evidence_serializes_to_the_expected_json_shape() {
         let mut store = EvidenceStore::new();
@@ -320,6 +361,7 @@ mod tests {
                 observed: serde_json::Value::Bool(false),
                 confidence: Confidence::Medium,
                 summary: "missing".to_owned(),
+                source: None,
                 reproduction: Reproduction {
                     capability: "probe".to_owned(),
                     target: "api:443".to_owned(),
@@ -328,10 +370,28 @@ mod tests {
             },
             1_700_000_000_000,
         );
+        store.append(
+            EvidenceDraft {
+                capability: "tcp_connect_vantage",
+                target: "db:5432".to_owned(),
+                intensity: Intensity::Safe,
+                observed: serde_json::Value::Bool(true),
+                confidence: Confidence::High,
+                summary: "reachable".to_owned(),
+                source: Some(NodeRef::Vantage {
+                    segment: "internet".to_owned(),
+                }),
+                reproduction: Reproduction {
+                    capability: "tcp_connect_vantage".to_owned(),
+                    target: "db:5432".to_owned(),
+                    params: serde_json::json!({ "timeout_ms": 2000, "vantage_segment": "internet" }),
+                },
+            },
+            1_700_000_000_001,
+        );
 
-        let value = serde_json::to_value(&store.records()[0]).expect("serialize");
         assert_eq!(
-            value,
+            serde_json::to_value(&store.records()[0]).expect("serialize"),
             serde_json::json!({
                 "id": 0,
                 "recorded_at_ms": 1_700_000_000_000u64,
@@ -341,7 +401,27 @@ mod tests {
                 "observed": false,
                 "confidence": "Medium",
                 "summary": "missing",
+                "source": null,
                 "reproduction": { "capability": "probe", "target": "api:443", "params": { "k": 1 } }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&store.records()[1]).expect("serialize"),
+            serde_json::json!({
+                "id": 1,
+                "recorded_at_ms": 1_700_000_000_001u64,
+                "capability": "tcp_connect_vantage",
+                "target": "db:5432",
+                "intensity": "Safe",
+                "observed": true,
+                "confidence": "High",
+                "summary": "reachable",
+                "source": { "Vantage": { "segment": "internet" } },
+                "reproduction": {
+                    "capability": "tcp_connect_vantage",
+                    "target": "db:5432",
+                    "params": { "timeout_ms": 2000, "vantage_segment": "internet" }
+                }
             })
         );
     }

@@ -138,6 +138,7 @@ impl Capability for StubReachable {
                 observed: serde_json::Value::Bool(true),
                 confidence: Confidence::High,
                 summary: "reachable".to_owned(),
+                source: None,
                 reproduction: Reproduction {
                     capability: self.name().to_owned(),
                     target: self.target.to_owned(),
