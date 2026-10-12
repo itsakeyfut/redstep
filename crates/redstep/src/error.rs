@@ -46,6 +46,17 @@ pub enum Error {
         got: crate::intensity::Intensity,
     },
 
+    /// The lab could not be provisioned or torn down. Carries a stringified
+    /// reason rather than the orchestration backend's error type, so the model
+    /// error stays free of that layer (docs/rules/design.md section 2). Named for
+    /// the failure, not the backend: a later provider (Decision M) may not be
+    /// Docker.
+    #[error("lab unavailable: {reason}")]
+    LabUnavailable {
+        /// What went wrong, as reported by the orchestration backend.
+        reason: String,
+    },
+
     /// An environment definition did not validate: a boundary or workload
     /// referenced an undeclared segment, the vantage segment was missing or
     /// undeclared, a name was duplicated, or a boundary carried a port-level
