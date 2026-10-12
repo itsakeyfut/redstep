@@ -1,10 +1,18 @@
 //! Discovering and executing the registered security tests.
 //!
-//! Execution is sequential, in name order, one test at a time on a single
-//! current-thread runtime: deterministic and safe against a shared lab target.
-//! Each test runs inside `catch_unwind`, so one test's panic cannot abort the
-//! run and is never read as a pass. Each test gets its own `TestContext`, so the
-//! judgements it records are its own.
+//! Two entry points run the same registered tests. [`run`] runs them
+//! host-in-process over a [`Scope`], building its own current-thread runtime.
+//! [`run_in_lab`] (with [`run_in_running_lab`], #28) stands a lab up, gates on
+//! the boundary self-check, and runs the tests from the attacker's vantage on the
+//! caller's runtime. Both go through [`finalize_test`], so the verdict and the
+//! evidence-id resolution cannot diverge between the paths.
+//!
+//! Execution is sequential, in name order, one test at a time: deterministic and
+//! safe against a shared lab target. Each test runs inside a `catch_unwind`
+//! (`std::panic::catch_unwind` around `block_on` on the host path, the async
+//! [`FutureExt::catch_unwind`](futures_util::FutureExt) on the lab path), so one
+//! test's panic cannot abort the run and is never read as a pass. Each test gets
+//! its own `TestContext`, so the judgements it records are its own.
 
 use crate::TestContext;
 use crate::environment::Environment;
@@ -73,7 +81,7 @@ pub enum RunError {
     /// actually blocked (the boundary self-check refused the run): the run never
     /// reached a verdict. A refused run returns this, never a [`RunSummary`], so a
     /// broken lab cannot report PASS (Decision N step 4).
-    #[error("the lab could not be run against: {0}")]
+    #[error("the run could not proceed against the lab: {0}")]
     Lab(#[source] crate::Error),
 }
 
@@ -114,14 +122,16 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
 /// It is `async`: the caller owns the runtime (unlike `run`, which builds its
 /// own), because the lab lifecycle is already async. Teardown runs on every path,
 /// including a self-check refusal or a test panic; the `RunningLab` `Drop`
-/// backstop (#18) is the last resort, and a teardown failure is warned rather
-/// than returned, so it never masks a verdict or a refusal.
-pub async fn run_against(
+/// backstop (#18) is the last resort. A teardown failure is warned to stderr, not
+/// returned: a leaked egress-less lab is a row-5 cleanup concern, not a wrong
+/// verdict, and returning it as `RunError` would demote a recorded `Fail` or hide
+/// a refusal.
+pub async fn run_in_lab(
     docker: &Docker,
     env: &Environment,
 ) -> std::result::Result<RunSummary, RunError> {
     let lab = bring_up(docker, env).await.map_err(RunError::Lab)?;
-    let outcome = execute_in_lab(docker, env, &lab).await;
+    let outcome = run_in_running_lab(docker, env, &lab).await;
     if let Err(e) = lab.teardown().await {
         eprintln!("redstep: lab teardown after the run failed: {e}");
     }
@@ -129,17 +139,19 @@ pub async fn run_against(
 }
 
 /// Gate on the boundary self-check, then run the registered tests against an
-/// already-stood-up `lab` from its attacker vantage. Split from [`run_against`]
-/// so the refusal path can be driven against a deliberately broken lab (one whose
-/// forbidden pair was connected after bring-up) without `run_against` tearing it
-/// down first.
+/// already-stood-up `lab` from its attacker vantage. `pub` and split from
+/// [`run_in_lab`] so the refusal path is testable: the connected-lab test breaks
+/// the lab *between* `bring_up` and the gate, which `run_in_lab` cannot express
+/// because it owns the whole lifecycle. **A direct caller owns teardown** on both
+/// the `Ok` and the `Err` return (`run_in_lab` is the caller that does it), with
+/// the `RunningLab` `Drop` backstop behind it.
 ///
 /// The self-check runs before any test and refuses the run on failure (Decision N
 /// step 4), so a lab whose declared boundary is not actually blocked never
 /// executes a test and cannot report PASS. Each test runs over a
 /// [`TestContext::new_in_lab`] bound to the vantage segment's network, so
-/// [`TestContext::reach`](crate::TestContext::reach) acts from inside the lab.
-pub async fn execute_in_lab(
+/// [`TestContext::connect_from_vantage`](crate::TestContext::connect_from_vantage) acts from inside the lab.
+pub async fn run_in_running_lab(
     docker: &Docker,
     env: &Environment,
     lab: &RunningLab,
@@ -184,7 +196,7 @@ pub async fn execute_in_lab(
 /// run-scoped [`EvidenceId`] the store just assigned (`base` is the id of this
 /// test's first draft, so `DraftRef(i)` maps to `EvidenceId(base + i)`, issue
 /// #14), and classify the caught result against the recorded judgements. Shared
-/// by [`run`] (host) and [`execute_in_lab`] (vantage), which produce the same
+/// by [`run`] (host) and [`run_in_running_lab`] (vantage), which produce the same
 /// `std::thread::Result` so the resolution cannot diverge between the paths.
 fn finalize_test(
     name: &'static str,

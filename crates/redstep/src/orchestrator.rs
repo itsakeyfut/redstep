@@ -340,9 +340,10 @@ trait Prober {
 /// a routed or port-level boundary: the firewall gateway (Decision N, Phase 4 /
 /// M3) adds those and will need a TCP-to-port probe, not name-based ICMP.
 ///
-/// The gate is not yet wired into the runner (Decision N: deferred to the M1
-/// assembly). A caller must treat both error variants as hard stops, never
-/// log-and-continue, and re-run the check after any late change to the lab.
+/// The lab-wired runner gates on this before any test ([`run_in_running_lab`](crate::run_in_running_lab),
+/// #28): a failure is returned as `RunError::Lab` and no test runs. A caller that
+/// invokes it directly must likewise treat both error variants as hard stops,
+/// never log-and-continue, and re-run the check after any late change to the lab.
 pub async fn boundary_self_check(
     docker: &Docker,
     env: &Environment,
@@ -548,9 +549,6 @@ fn classify_probe(state: &ContainerState) -> Result<bool> {
 /// rather than through `sh -c` means a crafted host or port is one argument to
 /// `nc`, not text a shell could interpret, so it cannot inject a command into the
 /// probe container. Pure, so the argv shape is unit-tested without Docker.
-// A helper of `tcp_reachable_from`, which has no non-test caller until #28; see
-// there. `allow` not `expect`, because the test build does use it.
-#[allow(dead_code)]
 fn nc_cmd(host: &str, port: u16, secs: u64) -> Vec<String> {
     vec![
         "nc".to_owned(),
@@ -569,9 +567,6 @@ fn nc_cmd(host: &str, port: u16, secs: u64) -> Vec<String> {
 /// fail closed, never be read as a clean "unreachable" (CLAUDE.md row 6). Taking
 /// the state (not a bare code) folds the exited-cleanly check in, so the whole
 /// fail-closed mapping is unit-tested without Docker.
-// A helper of `tcp_reachable_from`, which has no non-test caller until #28; see
-// there. `allow` not `expect`, because the test build does use it.
-#[allow(dead_code)]
 fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
     match finished_exit_code(state)? {
         0 => Ok(ConnectOutcome::Connected),
@@ -610,11 +605,6 @@ fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
 /// (Decision D's `source` node and Decision V's pinned replay are a follow-up):
 /// it records the applied timeout and the vantage network, not the full lab the
 /// probe ran against.
-// No non-test caller yet: the lab-wired run path (#28, the next sub-issue of this
-// parent) is the consumer, and #27 is scoped to the executor plus its own test so
-// each sub-issue leaves the tree green. `allow` not `expect`: the in-crate Docker
-// test does use it, so the expectation would be unfulfilled in the test build.
-#[allow(dead_code)]
 pub(crate) async fn tcp_reachable_from(
     docker: &Docker,
     vantage: &LabNetwork,

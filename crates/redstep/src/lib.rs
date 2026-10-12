@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! #[redstep::security_test]
-//! async fn db_is_unreachable(ctx: &redstep::TestContext) -> redstep::Result<()> {
+//! async fn attacker_cannot_connect_to_db(ctx: &redstep::TestContext) -> redstep::Result<()> {
 //!     let target = ctx.resolve("db:5432")?;
 //!     let recorded = ctx.run(redstep::TcpConnect::new(target)).await?;
 //!     ctx.expect(&recorded).to_be(false); // require High confidence by default
@@ -54,6 +54,6 @@ pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
 pub use orchestrator::{LabContainer, LabNetwork, RunningLab, boundary_self_check, bring_up};
 pub use redstep_macros::security_test;
-pub use runner::{RunError, RunSummary, TestRun, execute_in_lab, run, run_against};
+pub use runner::{RunError, RunSummary, TestRun, run, run_in_lab, run_in_running_lab};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};
 pub use verdict::Verdict;

@@ -10,7 +10,7 @@
 //! would fail. That a declared-forbidden path is actually blocked is the
 //! boundary self-check (Decision N step 4), driven against a `bring_up` lab with
 //! a positive control. The run path brings the lab up, gates on the self-check,
-//! runs the boundary demo (`db_is_unreachable`) from the attacker's vantage, and
+//! runs the boundary demo (`attacker_cannot_connect_to_db`) from the attacker's vantage, and
 //! tears the lab down (#28).
 
 use bollard::Docker;
@@ -19,8 +19,8 @@ use bollard::models::NetworkConnectRequest;
 use bollard::query_parameters::{InspectContainerOptions, InspectNetworkOptions};
 
 use redstep::{
-    Confidence, Environment, Error, RunError, TestContext, boundary_self_check, bring_up,
-    execute_in_lab, report, run_against,
+    Confidence, Environment, Error, RunError, TestContext, boundary_self_check, bring_up, report,
+    run_in_lab, run_in_running_lab,
 };
 
 /// A tiny pinned image for the stand-in workloads (#18 proves orchestration, not
@@ -225,85 +225,87 @@ fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
 /// the run runs first, not this probe (#28, Decision J/N note). Registered by the
 /// macro and run only via the lab-wired runner.
 #[redstep::security_test]
-async fn db_is_unreachable(ctx: &TestContext) -> redstep::Result<()> {
+async fn attacker_cannot_connect_to_db(ctx: &TestContext) -> redstep::Result<()> {
     let target = ctx.resolve("db:5432")?;
-    let recorded = ctx.reach(&target).await?;
+    let recorded = ctx.connect_from_vantage(&target).await?;
     ctx.expect(&recorded)
         .min_confidence(Confidence::Low)
         .to_be(false);
     Ok(())
 }
 
-/// The count of leftover lab networks (named `redstep-...`), so a test can assert
-/// a run tore its own lab down: the count returns to its pre-run value.
-async fn redstep_network_count(docker: &Docker) -> usize {
-    docker
-        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-        .await
-        .expect("list networks")
-        .into_iter()
-        .filter(|n| {
-            n.name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("redstep-"))
-        })
-        .count()
-}
-
 /// Guard: running against the isolated MVP lab brings it up, the self-check
-/// passes, `db_is_unreachable` runs from the `internet` vantage and PASSes (the
-/// DB is unreachable), the report is PASS with the evidence linked, and the lab is
-/// torn down (the `redstep-` network count returns to its pre-run value).
-/// Mutation: skip `lab.teardown()` in `run_against` -> the network count grows ->
-/// the teardown assertion fails. The `db_is_unreachable` verdict and its evidence
-/// link are the demo's reported result.
+/// passes, `attacker_cannot_connect_to_db` runs from the `internet` vantage and
+/// PASSes (the DB is unreachable), and the report is PASS with the probe's
+/// evidence linked and resolvable to a record for `db:5432`. Mutations: make
+/// `connect_from_vantage` observe `true` (probe a reachable listener) -> the demo
+/// is `Fail` -> the Pass assertion fails; drop the evidence draft in
+/// `connect_from_vantage` -> the linked id does not resolve -> the evidence
+/// assertion fails.
+///
+/// Teardown is not re-asserted here. That `teardown` removes every object is
+/// #18's guard (`brings_up_and_tears_down_the_mvp_lab`, which inspects the named
+/// networks it owns), and `run_in_lab` calls it on every path with the `Drop`
+/// backstop behind it. A global `redstep-` network count would be unsound: the
+/// binary's tests run in parallel and each creates such networks, so a before/
+/// after delta flakes on a neighbour rather than on this run's teardown.
 #[test]
-fn run_against_the_mvp_lab_passes_the_boundary_demo() {
+fn run_in_lab_passes_the_boundary_demo() {
     if !linux_docker_available() {
-        eprintln!(
-            "skipping run_against_the_mvp_lab_passes_the_boundary_demo: no Linux Docker daemon"
-        );
+        eprintln!("skipping run_in_lab_passes_the_boundary_demo: no Linux Docker daemon");
         return;
     }
     runtime().block_on(async {
         let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
-        let before = redstep_network_count(&docker).await;
 
-        let summary = run_against(&docker, &mvp())
+        let summary = run_in_lab(&docker, &mvp())
             .await
             .expect("the run against an isolated lab succeeds");
-
-        let after = redstep_network_count(&docker).await;
 
         let run = summary
             .runs
             .iter()
-            .find(|r| r.name.ends_with("db_is_unreachable"))
+            .find(|r| r.name.ends_with("attacker_cannot_connect_to_db"))
             .expect("the boundary demo ran");
         assert_eq!(
             run.verdict,
             redstep::Verdict::Pass,
             "db is unreachable from the attacker, so the demo passes: {run:?}"
         );
-        assert!(
-            run.judgements.iter().any(|j| j.evidence.is_some()),
-            "the demo's judgement is linked to the probe's evidence"
+        // The judgement links to a real evidence record for the probe it ran, not
+        // a dangling id: resolve it and check it is the vantage probe of db:5432.
+        let evidence_id = run
+            .judgements
+            .iter()
+            .find_map(|j| j.evidence)
+            .expect("the demo's judgement is linked to evidence");
+        let record = summary
+            .evidence
+            .records()
+            .iter()
+            .find(|e| e.id == evidence_id)
+            .expect("the linked evidence id resolves to a record");
+        assert_eq!(
+            record.target, "db:5432",
+            "the evidence records the probed target"
+        );
+        assert_eq!(
+            record.capability, "tcp_connect_vantage",
+            "recorded as a vantage probe, not a host-run connect"
         );
         assert_eq!(report::build(&summary).exit_code, 0, "the report is PASS");
-        assert_eq!(
-            after, before,
-            "the run tore down its lab: the redstep network count returned to {before}"
-        );
     });
 }
 
 /// Guard: a lab whose forbidden pair is connected is refused by the self-check
 /// gate before any test runs, so the run returns an error and never a PASS. The
 /// lab is stood up with `bring_up`, broken the realistic way (the `db` container
-/// attached to the `internet` network too), then handed to `execute_in_lab`.
-/// Mutation: run the tests before the self-check gate in `execute_in_lab` -> the
-/// connected lab returns `Ok` with a reported run -> the `Err(BoundaryViolated)`
-/// assertion fails.
+/// attached to the `internet` network too), then handed to `run_in_running_lab`.
+/// Mutation: remove the `boundary_self_check` gate in `run_in_running_lab` -> the
+/// connected lab runs the demo and returns `Ok` -> the `Err(BoundaryViolated)`
+/// assertion fails. (Reordering the gate after the test loop does not flip this:
+/// the gate's `?` still returns the error whatever order it runs in; only
+/// removing the gate lets the run reach `Ok`.)
 #[test]
 fn a_connected_lab_is_refused_before_any_test_runs() {
     if !linux_docker_available() {
@@ -342,7 +344,7 @@ fn a_connected_lab_is_refused_before_any_test_runs() {
             .await
             .expect("connect db to the internet network");
 
-        let result = execute_in_lab(&docker, &env, &lab).await;
+        let result = run_in_running_lab(&docker, &env, &lab).await;
         let _ = lab.teardown().await;
 
         assert!(
