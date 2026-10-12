@@ -33,6 +33,7 @@ mod evidence;
 mod expectation;
 mod intensity;
 mod observation;
+mod orchestrator;
 // `#[doc(hidden)]`: the `#[security_test]` expansion reaches these by path, but
 // they are not a surface for a downstream crate to build on. See registry.rs.
 #[doc(hidden)]
@@ -51,6 +52,7 @@ pub use evidence::{DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore,
 pub use expectation::{Diagnostic, Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
+pub use orchestrator::{RunningLab, bring_up};
 pub use redstep_macros::security_test;
 pub use runner::{RunError, RunSummary, TestRun, run};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};

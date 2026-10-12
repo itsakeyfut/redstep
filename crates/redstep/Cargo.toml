@@ -18,6 +18,12 @@ thiserror = "2.0.21"
 # native TcpConnect capability adds TCP connect (`net`) and a bounded connect
 # timeout (`time`, docs/rules/perf.md).
 tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
+# The orchestrator layer (environment/network, docs/rules/design.md section 2)
+# drives the Docker API directly to build and tear down the isolated lab:
+# per-segment networks created `internal: true` for egress-less isolation
+# (Decision C, F layer 1, N). Used only in `orchestrator`; the model stays
+# bollard-free.
+bollard = "0.21.1"
 # Evidence is the single source of truth every report and the canonical JSON
 # project from (Decision D, E), so it serializes; `serde_json::Value` is the
 # capability-neutral carrier for an observed value and the reproduction params.

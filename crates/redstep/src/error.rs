@@ -46,6 +46,15 @@ pub enum Error {
         got: crate::intensity::Intensity,
     },
 
+    /// The lab could not be brought up or torn down with Docker. Carries a
+    /// stringified reason rather than a `bollard` error, so the model error stays
+    /// free of the orchestration layer's types (docs/rules/design.md section 2).
+    #[error("orchestration failed: {reason}")]
+    Orchestration {
+        /// What went wrong, as reported by the Docker client.
+        reason: String,
+    },
+
     /// An environment definition did not validate: a boundary or workload
     /// referenced an undeclared segment, the vantage segment was missing or
     /// undeclared, a name was duplicated, or a boundary carried a port-level
