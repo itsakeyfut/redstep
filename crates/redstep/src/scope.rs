@@ -81,11 +81,10 @@ impl Scope {
     /// still inside it (and a `Workload` carries no port to match on). A target
     /// not in the lab is [`Error::OutOfScope`].
     ///
-    /// A workload name is assumed to be a valid lab-internal host; a name
-    /// `parse_host_port` would reject (a colon, slash, or whitespace) becomes an
-    /// entry no spec can match, failing closed. Constraining names, and standing
-    /// up the egress-less network this membership-only gate rests on, is the
-    /// bring-up unit's.
+    /// A declared workload name is a valid lab-internal host: `build` validates
+    /// every name (#18), so each entry here is a resolvable host and membership
+    /// stays exact. Standing up the egress-less network this membership-only gate
+    /// rests on is the bring-up unit's (#18).
     ///
     /// Membership, not reachability (Decision F, MVP note #20): a blocked
     /// boundary is observed as unreachable at run time, never denied here, or a

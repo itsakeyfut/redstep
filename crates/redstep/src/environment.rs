@@ -174,14 +174,22 @@ impl EnvironmentBuilder {
 
     /// Validate the topology and build the environment. Every reference must
     /// name a declared segment, names must be unique, the vantage segment must
-    /// be set and declared, and every boundary's `allow` must be empty (the
-    /// membership-only MVP cannot enforce a port-level allow, so the model
-    /// refuses one fail-closed); otherwise [`Error::InvalidEnvironment`].
+    /// be set and declared, every segment and workload name must be a valid lab
+    /// identifier (see `is_valid_identifier`), and every boundary's `allow`
+    /// must be empty (the membership-only MVP cannot enforce a port-level allow,
+    /// so the model refuses one fail-closed); otherwise
+    /// [`Error::InvalidEnvironment`].
     pub fn build(self) -> Result<Environment> {
         let invalid = |reason: String| Error::InvalidEnvironment { reason };
 
         let mut segments: Vec<String> = Vec::new();
         for name in self.segments {
+            if !is_valid_identifier(&name) {
+                return Err(invalid(format!(
+                    "segment name {name:?} is not a valid lab identifier \
+                     (lowercase letters, digits, interior hyphens)"
+                )));
+            }
             if segments.contains(&name) {
                 return Err(invalid(format!("duplicate segment {name:?}")));
             }
@@ -200,6 +208,12 @@ impl EnvironmentBuilder {
 
         let mut workloads: Vec<Workload> = Vec::new();
         for (name, image, segment) in self.workloads {
+            if !is_valid_identifier(&name) {
+                return Err(invalid(format!(
+                    "workload name {name:?} is not a valid lab identifier \
+                     (lowercase letters, digits, interior hyphens)"
+                )));
+            }
             if workloads.iter().any(|w| w.name == name) {
                 return Err(invalid(format!("duplicate workload {name:?}")));
             }
@@ -245,6 +259,28 @@ impl EnvironmentBuilder {
             vantage,
         })
     }
+}
+
+/// Whether `name` is usable as a lab-internal host and a Docker network or
+/// container identifier: non-empty, at most 63 bytes, lowercase ASCII letters,
+/// digits, and interior hyphens (no leading or trailing hyphen).
+///
+/// This is the subset that is both a valid `host:port` host and a valid Docker
+/// name, so a declared workload name is always resolvable by
+/// [`Scope::from_environment`](crate::Scope::from_environment) (closing the seam
+/// the #20 review found: a routable name like an IP address that the scope gate
+/// would admit on membership alone) and is usable verbatim as a container name
+/// by the bring-up unit (#18).
+fn is_valid_identifier(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    name.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
@@ -387,5 +423,32 @@ mod tests {
             matches!(&dup_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("workload") && reason.contains("db")),
             "duplicate workload: {dup_workload:?}"
         );
+    }
+
+    /// Guard: a segment or workload name that is not a valid lab identifier is
+    /// rejected, so a routable or Docker-illegal name cannot become an allowlist
+    /// host or a container identifier (the seam the #20 review found). Mutation:
+    /// drop either `is_valid_identifier` check in `build` -> the matching bad
+    /// name builds -> this fails.
+    #[test]
+    fn name_with_invalid_characters_is_rejected() {
+        // uppercase, dot, space, an IP-like name, a leading hyphen, empty.
+        for bad in ["Web", "web.evil", "my web", "169.254.169.254", "-web", ""] {
+            let as_segment = Environment::builder().segment(bad).vantage(bad).build();
+            assert!(
+                matches!(&as_segment, Err(Error::InvalidEnvironment { reason }) if reason.contains("identifier")),
+                "segment name {bad:?}: {as_segment:?}"
+            );
+
+            let as_workload = Environment::builder()
+                .segment("internet")
+                .vantage("internet")
+                .workload(bad, "busybox:1", "internet")
+                .build();
+            assert!(
+                matches!(&as_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("identifier")),
+                "workload name {bad:?}: {as_workload:?}"
+            );
+        }
     }
 }
