@@ -276,6 +276,58 @@ fn run_collects_evidence_into_the_store() {
     );
 }
 
+/// Guard: a judgement from `expect` over a capability's result resolves, through
+/// its `evidence` id, to the record that capability produced, in order; a
+/// `check` judgement carries no id (issue #14). `records_evidence_demo` runs the
+/// capability twice (targets `stub:alpha` then `stub:beta`) and expects each, so
+/// its two judgements must link to ids 0 and 1 respectively.
+/// Mutations caught: a wrong offset in the runner's `base + index` remap -> the
+/// id resolves to the wrong record (beta, or none) -> fails; make `Observed`
+/// carry no reference, or `check` carry one -> the counts or the `check` assert
+/// fail.
+#[test]
+fn run_links_judgements_to_their_evidence() {
+    let summary = run(Scope::default()).expect("the runtime starts");
+
+    let resolve = |id: redstep::EvidenceId| {
+        summary
+            .evidence
+            .records()
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap_or_else(|| panic!("evidence id {id:?} does not resolve"))
+    };
+
+    let demo = summary
+        .runs
+        .iter()
+        .find(|r| r.name.ends_with("::records_evidence_demo"))
+        .expect("the demo was discovered");
+    let linked: Vec<redstep::EvidenceId> =
+        demo.judgements.iter().filter_map(|j| j.evidence).collect();
+    assert_eq!(linked.len(), 2, "both judgements link to their evidence");
+    assert_eq!(
+        resolve(linked[0]).target,
+        "stub:alpha",
+        "the first judgement links to the first run's record"
+    );
+    assert_eq!(
+        resolve(linked[1]).target,
+        "stub:beta",
+        "the second judgement links to the second run's record"
+    );
+
+    let tautology = summary
+        .runs
+        .iter()
+        .find(|r| r.name.ends_with("::tautology_demo"))
+        .expect("the check demo was discovered");
+    assert!(
+        tautology.judgements.iter().all(|j| j.evidence.is_none()),
+        "a check judgement links to no evidence"
+    );
+}
+
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's
 /// usage-error `ExitCode::from(2)`, or drop the unknown-argument arm of
 /// `parse_scope` -> the process exits 0 -> fails.

@@ -35,6 +35,27 @@ use crate::observation::Confidence;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceId(pub u64);
 
+/// A per-test reference to a draft a capability produced, before the store mints
+/// its run-scoped [`EvidenceId`]. Opaque: only `run` creates one (the index into
+/// the test's draft sink) and only the runner resolves it, mapping it to the id
+/// the store assigned when it drained that test's drafts. It links a judgement to
+/// the evidence it rests on without the judgement having to know the run-scoped
+/// id, which is not assigned until drain time (issue #14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftRef(usize);
+
+impl DraftRef {
+    /// The index of this draft within its test, assigned by `run` as it records.
+    pub(crate) fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// The per-test index, which the runner offsets by the test's base id.
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// Enough to re-run the same action, which a success witness (Decision V) lifts
 /// out wholesale. It restates the capability and target (also on the [`Evidence`])
 /// on purpose, so the reproduction is self-contained rather than a reference into

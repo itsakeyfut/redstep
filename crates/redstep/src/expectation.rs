@@ -9,6 +9,7 @@
 
 use std::fmt::Debug;
 
+use crate::evidence::EvidenceId;
 use crate::observation::{Confidence, Observation};
 use crate::verdict::Verdict;
 
@@ -55,6 +56,12 @@ pub struct Judgement {
     pub actual: String,
     /// The confidence of the observation.
     pub confidence: Confidence,
+    /// The evidence record this judgement rests on, or `None` for a bare `check`
+    /// or a hand-built observation that came from no capability. `judge` leaves it
+    /// `None`: it is pure and cannot know the run-scoped id, which the store does
+    /// not assign until the runner drains the test's drafts (Decision J, issue
+    /// #14). The runner fills it from the per-test reference the test carried.
+    pub evidence: Option<EvidenceId>,
 }
 
 /// Compare an observation against an expectation.
@@ -78,6 +85,9 @@ pub fn judge<T: PartialEq + Debug>(
         expected: format!("{:?}", expectation.expected),
         actual: format!("{:?}", observation.value),
         confidence: observation.confidence,
+        // The link is attached at the `ExpectationBuilder` seam and resolved by
+        // the runner, not here (Decision J): `judge` is pure and id-blind.
+        evidence: None,
     }
 }
 
