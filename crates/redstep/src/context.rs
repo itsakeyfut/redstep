@@ -19,6 +19,9 @@
 
 use std::cell::RefCell;
 use std::fmt::Debug;
+use std::time::Duration;
+
+use bollard::Docker;
 
 use crate::capability::Capability;
 use crate::error::{Error, Result};
@@ -26,12 +29,25 @@ use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
+use crate::orchestrator::{LabNetwork, tcp_reachable_from};
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
+
+/// The connect timeout for a vantage reachability probe ([`TestContext::connect_from_vantage`]),
+/// matching [`TcpConnect`](crate::TcpConnect)'s host-run default. Every network
+/// action is bounded (docs/rules/perf.md).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a `#[security_test]` receives: `async fn NAME(ctx: &TestContext) -> redstep::Result<()>`.
 pub struct TestContext {
     scope: Scope,
+    /// The attacker's vantage in a running lab, when the run is lab-wired
+    /// ([`run_in_lab`](crate::run_in_lab)). `None` for a host-in-process run
+    /// (the `--allow` path): [`connect_from_vantage`](Self::connect_from_vantage) needs it, [`run`](Self::run)
+    /// does not. It is what lets a capability act from inside the lab rather than
+    /// from the host, which reaches every segment and so cannot observe a
+    /// boundary (#28, Decision C).
+    lab: Option<VantageBinding>,
     /// Each recorded judgement with the per-test reference to the evidence it
     /// judged, if any. The reference sits *beside* the `Judgement` rather than in
     /// it because `Judgement.evidence` is a run-scoped [`EvidenceId`](crate::EvidenceId)
@@ -42,12 +58,39 @@ pub struct TestContext {
     evidence_drafts: RefCell<Vec<EvidenceDraft>>,
 }
 
+/// The attacker's vantage bound to a lab-wired run: the Docker handle and the
+/// network of the vantage segment, from which [`TestContext::connect_from_vantage`] drives a
+/// probe. Both are cheap to clone (a `Docker` is an `Arc` handle), so the runner
+/// builds one per test.
+struct VantageBinding {
+    docker: Docker,
+    vantage_network: LabNetwork,
+}
+
 impl TestContext {
-    /// Build a context over a resolved scope. The runner builds one per test;
-    /// a test constructs one directly.
+    /// Build a context over a resolved scope, with no lab bound (the
+    /// host-in-process path). The runner builds one per test; a test constructs
+    /// one directly. [`connect_from_vantage`](Self::connect_from_vantage) is unavailable on such a context.
     pub fn new(scope: Scope) -> Self {
         Self {
             scope,
+            lab: None,
+            judgements: RefCell::new(Vec::new()),
+            evidence_drafts: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Build a context bound to a running lab's attacker vantage, so
+    /// [`connect_from_vantage`](Self::connect_from_vantage) can drive a probe from inside the lab. The lab-wired
+    /// runner ([`run_in_lab`](crate::run_in_lab)) builds one per test from the
+    /// vantage segment's [`LabNetwork`] (#28).
+    pub fn new_in_lab(scope: Scope, docker: Docker, vantage_network: LabNetwork) -> Self {
+        Self {
+            scope,
+            lab: Some(VantageBinding {
+                docker,
+                vantage_network,
+            }),
             judgements: RefCell::new(Vec::new()),
             evidence_drafts: RefCell::new(Vec::new()),
         }
@@ -171,6 +214,16 @@ impl TestContext {
     /// resolver produces one), so for it the scope gate is type-enforced; the
     /// trait does not require that of every capability, so that guarantee is
     /// per-capability, not trait-wide.
+    ///
+    /// This runs the capability *host-in-process*. A capability whose observation
+    /// must come from the attacker's vantage must not be run here: the host has a
+    /// route to every segment, so a host-run reachability check against a lab is a
+    /// vacuous PASS (RK-008, the confound #27/#28 exist to kill). Today the only
+    /// vantage path is [`connect_from_vantage`](Self::connect_from_vantage), a
+    /// bespoke method kept off this trait for exactly that reason. When vantage
+    /// execution is generalized (the M3 adapters), it must *require* the vantage by
+    /// type, not run a `Capability` host-side and let it stand in for a vantage
+    /// observation.
     pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
         if capability.intensity() != Intensity::Safe {
             return Err(Error::IntensityRefused {
@@ -178,33 +231,82 @@ impl TestContext {
             });
         }
         let (observation, draft) = capability.execute().await?;
-        // Borrow / push / drop, with no await across the borrow. The draft's
-        // per-test index is its position in the sink, which the runner offsets by
-        // the test's base id to resolve the run-scoped `EvidenceId`.
-        let draft_ref = {
-            let mut drafts = self.evidence_drafts.borrow_mut();
-            let index = drafts.len();
-            drafts.push(draft);
-            DraftRef::new(index)
-        };
+        let draft_ref = self.record_draft(draft);
         Ok(Recorded {
             observation,
             draft_ref,
         })
     }
+
+    /// Attempt a TCP connection to `target` from the attacker's vantage inside the
+    /// lab, and return its [`Recorded`] result (the same shape [`run`](Self::run)
+    /// returns, so [`expect`](Self::expect) links the judgement to its evidence).
+    ///
+    /// This is the lab-wired counterpart of `run` for the one MVP capability: it
+    /// executes from a container on the vantage network (`tcp_reachable_from`),
+    /// not from the host, because the host reaches every segment and so cannot
+    /// observe an inter-segment boundary (a vacuous PASS; #28, Decision C,
+    /// `.claude/review/knowledge.md` RK-008). A completed connect is reachable at
+    /// `High`; a failure is unreachable at `Low`, because the probe cannot prove
+    /// the port closed (See Decision J, and `TcpConnect`), so a test asserting a
+    /// boundary holds opts down to `min_confidence(Low)` explicitly, and the
+    /// `High` certification that the boundary held is the boundary self-check, not
+    /// this probe.
+    ///
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound (a
+    /// host run): there is no vantage to act from. Generalizing to "run any
+    /// capability from the vantage" waits on the M3 tool adapters, which shape the
+    /// in-container seam (one capability in the MVP, as in #27).
+    ///
+    /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
+    /// against this context's own `scope`: a target's scope provenance is not yet
+    /// bound per-context. Not reachable today (the only lab-bound context a test
+    /// holds is the runner's, whose scope is the full lab membership, and a
+    /// `LabNetwork` cannot be fabricated outside the crate), but it would matter
+    /// once a run's scope is deliberately narrower than what the vantage can touch.
+    pub async fn connect_from_vantage(&self, target: &ScopedTarget) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; connect_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = tcp_reachable_from(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        Ok(Recorded {
+            observation,
+            draft_ref,
+        })
+    }
+
+    /// Push one evidence draft into the sink and return its per-test reference.
+    /// Borrow / push / drop, with no await across the borrow. The draft's per-test
+    /// index is its position in the sink, which the runner offsets by the test's
+    /// base id to resolve the run-scoped `EvidenceId` (issue #14). Shared by
+    /// [`run`](Self::run) and [`connect_from_vantage`](Self::connect_from_vantage).
+    fn record_draft(&self, draft: EvidenceDraft) -> DraftRef {
+        let mut drafts = self.evidence_drafts.borrow_mut();
+        let index = drafts.len();
+        drafts.push(draft);
+        DraftRef::new(index)
+    }
 }
 
-/// What [`TestContext::run`] returns: the capability's [`Observation`] and a
-/// per-test reference to the evidence it produced. Passing it to
-/// [`expect`](TestContext::expect) links the judgement to that evidence
-/// automatically.
+/// What [`TestContext::run`] and [`TestContext::connect_from_vantage`] return:
+/// the capability's [`Observation`] and a per-test reference to the evidence it
+/// produced. Passing it to [`expect`](TestContext::expect) links the judgement to
+/// that evidence automatically.
 ///
 /// The reference is a field here rather than on [`Observation`] because putting
 /// it there would force a hand-built observation, `judge`'s input, and the
 /// `Observation` a `Capability` returns to all carry a link they cannot fill, and
 /// would make `execute`'s observation meaningless until `run` rewrote it. So the
 /// observation stays a plain signal and only a capability's result carries a link
-/// (Decision J, issue #14). Only `run` constructs one.
+/// (Decision J, issue #14). Only `run` and `connect_from_vantage` construct one.
 ///
 /// The reference is a per-test index (see [`DraftRef`]), so a
 /// `Recorded` is only meaningful to the context that produced it. Judging one on
@@ -522,6 +624,31 @@ mod tests {
         assert!(
             passed.diagnostic.is_none(),
             "a passing check carries no diagnostic"
+        );
+    }
+
+    /// Guard: `connect_from_vantage` on a context with no lab bound (the host path, built by
+    /// `new`) fails closed with `LabUnavailable` rather than panicking or acting:
+    /// a host run has no vantage to probe from, so it must error before any
+    /// Docker call (this needs no daemon). Mutation: unwrap `self.lab` instead of
+    /// the `ok_or_else` -> the `None` case panics -> this (expecting an `Err`)
+    /// fails.
+    #[test]
+    fn connect_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("db:5432")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("db:5432").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.connect_from_vantage(&target));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "connect_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
         );
     }
 }
