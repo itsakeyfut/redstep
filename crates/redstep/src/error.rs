@@ -49,7 +49,8 @@ pub enum Error {
     /// The boundary self-check found a declared-forbidden path reachable: the
     /// lab's isolation is broken, so the run must not proceed (Decision N step
     /// 4). Distinct from a test verdict and from `LabUnavailable` (which is the
-    /// self-check being unable to run at all).
+    /// self-check being unable to certify isolation: a failed positive control,
+    /// an undeterminable probe, or a backend error).
     #[error("boundary self-check failed: {from} -> {to} is reachable but declared blocked")]
     BoundaryViolated {
         /// The segment the forbidden path leads from.
@@ -58,14 +59,16 @@ pub enum Error {
         to: String,
     },
 
-    /// The lab could not be provisioned or torn down. Carries a stringified
-    /// reason rather than the orchestration backend's error type, so the model
-    /// error stays free of that layer (docs/rules/design.md section 2). Named for
-    /// the failure, not the backend: a later provider (Decision M) may not be
-    /// Docker.
+    /// The lab could not be provisioned, torn down, or certified isolated. Also
+    /// returned by the boundary self-check when it cannot trust its own probe (a
+    /// failed positive control, an undeterminable probe exit), fail-closed.
+    /// Carries a stringified reason rather than the orchestration backend's error
+    /// type, so the model error stays free of that layer (docs/rules/design.md
+    /// section 2). Named for the failure, not the backend: a later provider
+    /// (Decision M) may not be Docker.
     #[error("lab unavailable: {reason}")]
     LabUnavailable {
-        /// What went wrong, as reported by the orchestration backend.
+        /// What went wrong, as reported by the orchestrator or the backend.
         reason: String,
     },
 

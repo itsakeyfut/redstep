@@ -19,23 +19,24 @@
 //! This unit stands the lab up, tears it down, and verifies isolation before a
 //! run. It makes no test verdict. That the egress-less flag is set is checked
 //! structurally (the integration test inspects it); that a declared-forbidden
-//! path is actually blocked is [`boundary_self_check`] (Decision N step 4),
-//! which probes it behaviourally with a positive control and refuses a run whose
-//! forbidden path is reachable.
+//! path is blocked at the membership level is [`boundary_self_check`] (Decision
+//! N step 4), which probes it behaviourally with a positive control and refuses
+//! a run whose forbidden path is reachable.
 
 use std::collections::HashMap;
 
 use bollard::Docker;
 use bollard::models::{
-    ContainerCreateBody, EndpointSettings, NetworkCreateRequest, NetworkingConfig,
+    ContainerCreateBody, ContainerState, ContainerStateStatusEnum, EndpointSettings,
+    NetworkCreateRequest, NetworkingConfig,
 };
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
 use crate::environment::Environment;
 use crate::error::{Error, Result};
 
-/// A segment's Docker network, paired with the segment it was built from so a
-/// later unit (#19's boundary self-check) can map a segment to its network
+/// A segment's Docker network, paired with the segment it was built from so the
+/// boundary self-check (and later units) can map a segment to its network
 /// without reparsing the name.
 #[derive(Debug, Clone)]
 pub struct LabNetwork {
@@ -56,8 +57,8 @@ impl LabNetwork {
 }
 
 /// A workload's Docker container, paired with the workload and segment it was
-/// built from so a later unit can find a named workload's container and its
-/// segment without reparsing the name.
+/// built from so the boundary self-check (and later units) can find a named
+/// workload's container and its segment without reparsing the name.
 #[derive(Debug, Clone)]
 pub struct LabContainer {
     workload: String,
@@ -294,59 +295,81 @@ async fn remove_all(
 /// workload image like `postgres:16` may not carry `ping`).
 const PROBE_IMAGE: &str = "busybox:1.37";
 
+/// Something that tests whether a probe placed on `network` can reach `target`
+/// (a container name) by ICMP. [`DockerProber`] is the real implementation; the
+/// trait is the seam a unit test fills, so the gate's decision logic is verified
+/// without a Docker daemon (the behaviour of the probe itself is CI-verified).
+trait Prober {
+    async fn reaches(&self, network: &str, target: &str) -> Result<bool>;
+}
+
 /// Verify every declared-forbidden path is actually blocked, before any test
 /// runs (Decision N step 4). For each boundary (an empty `allow` means the path
-/// is blocked, and a non-empty one is refused at build), a probe container in
-/// the `from` segment must fail to reach a workload in the `to` segment, while a
-/// positive-control probe in the `to` segment does reach it, so a broken probe
-/// cannot read as isolation (the gap #18's review found).
+/// is blocked, and a non-empty one is refused at build) and *every* workload in
+/// the `to` segment, a probe in the `from` segment must fail to reach the
+/// workload while a positive-control probe in the `to` segment reaches it, so a
+/// broken probe cannot read as isolation.
 ///
-/// Returns `Ok(())` only when every forbidden path is verified blocked. A
-/// reachable forbidden path is [`Error::BoundaryViolated`]; a control that
-/// cannot reach, or any probe failure, is [`Error::LabUnavailable`], so the run
-/// fails closed rather than proceeding on a lab whose isolation is uncertain.
-/// The result is distinct from a test verdict.
+/// `Ok(())` only when every declared boundary that has a `to`-workload is
+/// verified blocked. A reachable forbidden path is [`Error::BoundaryViolated`];
+/// a control that cannot reach, an undeterminable probe, or any probe failure is
+/// [`Error::LabUnavailable`], so the run fails closed rather than proceeding on a
+/// lab whose isolation is uncertain. The result is distinct from a test verdict.
 ///
-/// Reachability is ICMP to the target's container name, which Docker's embedded
-/// DNS resolves only for peers on the same network, so it needs no listener and
-/// a path that opens only because the target was wrongly attached to the `from`
-/// network is detected.
+/// This verifies *membership* isolation: reachability is ICMP to the target's
+/// container name, which Docker's embedded DNS resolves only for peers on the
+/// same network, so it detects a workload wrongly attached to the `from` network
+/// (the MVP's all-or-nothing boundary) and needs no listener. It does not verify
+/// a routed or port-level boundary: the firewall gateway (Decision N, Phase 4 /
+/// M3) adds those and will need a TCP-to-port probe, not name-based ICMP.
+///
+/// The gate is not yet wired into the runner (Decision N: deferred to the M1
+/// assembly). A caller must treat both error variants as hard stops, never
+/// log-and-continue, and re-run the check after any late change to the lab.
 pub async fn boundary_self_check(
     docker: &Docker,
     env: &Environment,
     lab: &RunningLab,
 ) -> Result<()> {
     pull_image(docker, PROBE_IMAGE).await?;
+    check_boundaries(env, lab, &DockerProber { docker }).await
+}
 
+/// The gate's decision logic, over an injectable `prober` so it is unit-testable
+/// without Docker.
+async fn check_boundaries<P: Prober>(
+    env: &Environment,
+    lab: &RunningLab,
+    prober: &P,
+) -> Result<()> {
     for boundary in env.boundaries() {
         let from = boundary.from();
         let to = boundary.to();
-
-        let Some(target) = lab.containers().iter().find(|c| c.segment() == to) else {
-            // Nothing in the `to` segment to reach; the path is vacuously blocked.
-            continue;
-        };
         let from_net = segment_network(lab, from)?;
         let to_net = segment_network(lab, to)?;
 
-        // Positive control: reachable from its own segment, so a later
-        // "unreachable" is a real block rather than a broken probe.
-        if !probe_reaches(docker, to_net, target.name()).await? {
-            return Err(Error::LabUnavailable {
-                reason: format!(
-                    "boundary self-check could not reach {to} workload {:?} from its own segment; \
-                     the probe is untrustworthy, so isolation cannot be certified",
-                    target.workload()
-                ),
-            });
-        }
-
-        // The forbidden path must be blocked.
-        if probe_reaches(docker, from_net, target.name()).await? {
-            return Err(Error::BoundaryViolated {
-                from: from.to_owned(),
-                to: to.to_owned(),
-            });
+        // Probe every workload in `to`, not a representative: the break this
+        // exists to catch is a single workload wrongly attached to `from`, which
+        // the self-check must not assume bring-up never produces.
+        for target in lab.containers().iter().filter(|c| c.segment() == to) {
+            // Positive control first: the target is reachable from its own
+            // segment, so a later "unreachable" is a real block, not a broken
+            // probe.
+            if !prober.reaches(to_net, target.name()).await? {
+                return Err(Error::LabUnavailable {
+                    reason: format!(
+                        "boundary self-check could not reach {to} workload {:?} from its own segment; \
+                         the probe is untrustworthy, so isolation cannot be certified",
+                        target.workload()
+                    ),
+                });
+            }
+            if prober.reaches(from_net, target.name()).await? {
+                return Err(Error::BoundaryViolated {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                });
+            }
         }
     }
 
@@ -364,22 +387,32 @@ fn segment_network<'a>(lab: &'a RunningLab, segment: &str) -> Result<&'a str> {
         })
 }
 
-/// Whether a probe container on `network` can reach `target` (a container name
-/// Docker's DNS resolves on that network) by ICMP. The probe is removed before
-/// returning, even on error.
-async fn probe_reaches(docker: &Docker, network: &str, target: &str) -> Result<bool> {
-    let name = format!("{}-probe", run_id());
-    let result = run_probe(docker, &name, network, target).await;
-    let _ = docker
-        .remove_container(
-            &name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
-    result
+/// The real prober: a disposable `busybox` container that pings `target` from
+/// `network`.
+struct DockerProber<'a> {
+    docker: &'a Docker,
+}
+
+impl Prober for DockerProber<'_> {
+    async fn reaches(&self, network: &str, target: &str) -> Result<bool> {
+        // A fresh name per probe (run_id's counter guarantees uniqueness within
+        // the process), removed after the run even on error. A probe dropped
+        // mid-run by a cancelled future can leak an egress-less container (row 5,
+        // not a scope escape); the run path does not cancel it.
+        let name = format!("{}-probe", run_id());
+        let result = run_probe(self.docker, &name, network, target).await;
+        let _ = self
+            .docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        result
+    }
 }
 
 async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> Result<bool> {
@@ -392,10 +425,14 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
             }),
             ContainerCreateBody {
                 image: Some(PROBE_IMAGE.to_owned()),
+                // Two packets within a 2s deadline: one lost packet should not
+                // read a reachable target as blocked (the false-negative, row-6
+                // direction). The dominant correct case fails instantly on name
+                // resolution, not on this deadline.
                 cmd: Some(vec![
                     "ping".to_owned(),
                     "-c".to_owned(),
-                    "1".to_owned(),
+                    "2".to_owned(),
                     "-w".to_owned(),
                     "2".to_owned(),
                     target.to_owned(),
@@ -415,13 +452,13 @@ async fn run_probe(docker: &Docker, name: &str, network: &str, target: &str) -> 
         )
         .await
         .map_err(lab_unavailable)?;
-    Ok(probe_exit(docker, name).await? == 0)
+    probe_exit(docker, name).await
 }
 
-/// Poll until the probe container exits and return its exit code, bounded so a
-/// stuck probe fails the check rather than hanging it (`ping -w 2` exits within
-/// a few seconds).
-async fn probe_exit(docker: &Docker, name: &str) -> Result<i64> {
+/// Poll until the probe container exits, then classify it. Bounded at 40 polls x
+/// 500ms (~20s against `ping -w 2`) so a stuck probe fails closed rather than
+/// hanging the check.
+async fn probe_exit(docker: &Docker, name: &str) -> Result<bool> {
     for _ in 0..40 {
         let info = docker
             .inspect_container(
@@ -432,13 +469,33 @@ async fn probe_exit(docker: &Docker, name: &str) -> Result<i64> {
             .map_err(lab_unavailable)?;
         let state = info.state.unwrap_or_default();
         if state.running != Some(true) {
-            return Ok(state.exit_code.unwrap_or(-1));
+            return classify_probe(&state);
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Err(Error::LabUnavailable {
         reason: format!("boundary self-check probe {name:?} did not exit within the timeout"),
     })
+}
+
+/// Read a finished probe's state as reachable (ping got a reply, exit 0) or not
+/// (clean no-reply/unresolved, busybox exit 1). Anything else, a non-`exited`
+/// state or a code that is not a clean ping outcome, is `Err(LabUnavailable)`:
+/// an undeterminable probe must refuse rather than be read as "blocked" (the
+/// row-6 direction).
+fn classify_probe(state: &ContainerState) -> Result<bool> {
+    let exited = state.status == Some(ContainerStateStatusEnum::EXITED);
+    match (exited, state.exit_code) {
+        (true, Some(0)) => Ok(true),
+        (true, Some(1)) => Ok(false),
+        _ => Err(Error::LabUnavailable {
+            reason: format!(
+                "boundary self-check probe exited abnormally (status {:?}, code {:?}); \
+                 isolation cannot be certified",
+                state.status, state.exit_code
+            ),
+        }),
+    }
 }
 
 impl RunningLab {
@@ -521,5 +578,261 @@ mod tests {
             };
             drop(lab);
         });
+    }
+
+    use std::collections::HashSet;
+
+    /// A prober that answers from canned sets, so the gate's decision logic is
+    /// tested without Docker. `reach`ed `(network, target)` pairs resolve to
+    /// reachable; `fail`ed ones return `LabUnavailable`.
+    struct MockProber {
+        reachable: HashSet<(String, String)>,
+        fail: HashSet<(String, String)>,
+    }
+
+    impl MockProber {
+        fn new() -> Self {
+            Self {
+                reachable: HashSet::new(),
+                fail: HashSet::new(),
+            }
+        }
+        fn reach(mut self, network: &str, target: &str) -> Self {
+            self.reachable
+                .insert((network.to_owned(), target.to_owned()));
+            self
+        }
+        fn failing(mut self, network: &str, target: &str) -> Self {
+            self.fail.insert((network.to_owned(), target.to_owned()));
+            self
+        }
+    }
+
+    impl Prober for MockProber {
+        async fn reaches(&self, network: &str, target: &str) -> Result<bool> {
+            let key = (network.to_owned(), target.to_owned());
+            if self.fail.contains(&key) {
+                return Err(Error::LabUnavailable {
+                    reason: "mock probe failure".to_owned(),
+                });
+            }
+            Ok(self.reachable.contains(&key))
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(f)
+    }
+
+    fn net(segment: &str, name: &str) -> LabNetwork {
+        LabNetwork {
+            segment: segment.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    fn container(workload: &str, segment: &str, name: &str) -> LabContainer {
+        LabContainer {
+            workload: workload.to_owned(),
+            segment: segment.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// A lab with the given networks and containers; `torn_down` so `Drop` is a
+    /// no-op on this fabricated state. The `Docker` handle is lazy and never used
+    /// by `check_boundaries`.
+    fn lab(networks: Vec<LabNetwork>, containers: Vec<LabContainer>) -> RunningLab {
+        RunningLab {
+            docker: Docker::connect_with_local_defaults().expect("lazy connect"),
+            networks,
+            containers,
+            torn_down: true,
+        }
+    }
+
+    /// The MVP topology: internet/internal, web/api/db in internal, the
+    /// internet -> internal boundary blocked.
+    fn mvp_env() -> Environment {
+        Environment::builder()
+            .segment("internal")
+            .segment("internet")
+            .workload("web", "busybox:1", "internal")
+            .workload("api", "busybox:1", "internal")
+            .workload("db", "busybox:1", "internal")
+            .vantage("internet")
+            .boundary("internet", "internal", &[])
+            .build()
+            .expect("the MVP topology is valid")
+    }
+
+    fn mvp_lab() -> RunningLab {
+        lab(
+            vec![net("internal", "n-internal"), net("internet", "n-internet")],
+            vec![
+                container("web", "internal", "c-web"),
+                container("api", "internal", "c-api"),
+                container("db", "internal", "c-db"),
+            ],
+        )
+    }
+
+    /// A mock prober whose positive controls (from the internal network) reach
+    /// every internal workload. Forbidden reachability from the internet network
+    /// is added per test.
+    fn controls_ok() -> MockProber {
+        MockProber::new()
+            .reach("n-internal", "c-web")
+            .reach("n-internal", "c-api")
+            .reach("n-internal", "c-db")
+    }
+
+    /// Guard: with every forbidden path blocked and controls reachable, the check
+    /// passes. Mutation: negate the forbidden `reaches` test -> a blocked path
+    /// reads as reachable -> BoundaryViolated -> this fails.
+    #[test]
+    fn check_passes_when_every_forbidden_path_is_blocked() {
+        let result = block_on(check_boundaries(&mvp_env(), &mvp_lab(), &controls_ok()));
+        assert!(result.is_ok(), "an isolated lab passes: {result:?}");
+    }
+
+    /// Guard: a forbidden path reachable to the FIRST workload is refused.
+    #[test]
+    fn check_refuses_when_the_first_workload_is_reachable() {
+        let prober = controls_ok().reach("n-internet", "c-web");
+        let result = block_on(check_boundaries(&mvp_env(), &mvp_lab(), &prober));
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "internet" && to == "internal"),
+            "got {result:?}"
+        );
+    }
+
+    /// Guard: a forbidden path reachable to a NON-first workload (db) is refused.
+    /// This is the one the `.find`-first bug would miss. Mutation: probe only the
+    /// first `to` workload (`.find` instead of the `.filter` loop) -> `db` is
+    /// never probed, the check returns `Ok` -> this fails.
+    #[test]
+    fn check_refuses_when_a_non_first_workload_is_reachable() {
+        let prober = controls_ok().reach("n-internet", "c-db");
+        let result = block_on(check_boundaries(&mvp_env(), &mvp_lab(), &prober));
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "internet" && to == "internal"),
+            "got {result:?}"
+        );
+    }
+
+    /// Guard: a positive control that cannot reach its own-segment target fails
+    /// closed (the probe is untrustworthy), rather than certifying isolation.
+    /// Mutation: drop the control arm -> the forbidden probe runs and finds the
+    /// path blocked -> `Ok` -> this fails.
+    #[test]
+    fn check_fails_closed_when_the_positive_control_cannot_reach() {
+        // Controls reach api and db, but not web.
+        let prober = MockProber::new()
+            .reach("n-internal", "c-api")
+            .reach("n-internal", "c-db");
+        let result = block_on(check_boundaries(&mvp_env(), &mvp_lab(), &prober));
+        assert!(
+            matches!(&result, Err(Error::LabUnavailable { reason }) if reason.contains("untrustworthy")),
+            "got {result:?}"
+        );
+    }
+
+    /// Guard: a probe error propagates as a refusal (fail-closed), not swallowed.
+    #[test]
+    fn check_fails_closed_when_a_probe_errors() {
+        let prober = controls_ok().failing("n-internet", "c-web");
+        let result = block_on(check_boundaries(&mvp_env(), &mvp_lab(), &prober));
+        assert!(
+            matches!(&result, Err(Error::LabUnavailable { .. })),
+            "got {result:?}"
+        );
+    }
+
+    /// Guard: a boundary whose `to` segment has no workload is a vacuous block, so
+    /// a lab with no containers passes.
+    #[test]
+    fn check_skips_a_boundary_with_no_workload_to_reach() {
+        let empty = lab(
+            vec![net("internal", "n-internal"), net("internet", "n-internet")],
+            Vec::new(),
+        );
+        let result = block_on(check_boundaries(&mvp_env(), &empty, &controls_ok()));
+        assert!(
+            result.is_ok(),
+            "nothing to reach is vacuously blocked: {result:?}"
+        );
+    }
+
+    /// Guard: every declared boundary is checked, not just the first. A two-
+    /// boundary topology with the violation on the second. Mutation: `break`
+    /// after the first boundary -> the second's violation is missed -> `Ok` ->
+    /// this fails.
+    #[test]
+    fn check_covers_every_boundary_not_just_the_first() {
+        let env = Environment::builder()
+            .segment("a")
+            .segment("b")
+            .workload("wa", "busybox:1", "a")
+            .workload("wb", "busybox:1", "b")
+            .vantage("a")
+            .boundary("a", "b", &[])
+            .boundary("b", "a", &[])
+            .build()
+            .expect("valid");
+        let two = lab(
+            vec![net("a", "n-a"), net("b", "n-b")],
+            vec![container("wa", "a", "c-wa"), container("wb", "b", "c-wb")],
+        );
+        // Controls reach each workload on its own net; the b -> a forbidden path
+        // (the second boundary) is reachable, the a -> b one is not.
+        let prober = MockProber::new()
+            .reach("n-b", "c-wb")
+            .reach("n-a", "c-wa")
+            .reach("n-b", "c-wa");
+        let result = block_on(check_boundaries(&env, &two, &prober));
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "b" && to == "a"),
+            "got {result:?}"
+        );
+    }
+
+    /// Guard: `classify_probe` reads a clean ping outcome and fails closed on
+    /// anything else. Mutation: change the `_ => Err` arm to `Ok(false)` -> the
+    /// abnormal cases read as "blocked" -> the Err assertions fail; flip the
+    /// `Some(0)`/`Some(1)` arms -> the reachable/blocked assertions fail.
+    #[test]
+    fn classify_probe_reads_clean_outcomes_and_fails_closed() {
+        use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED, RUNNING};
+        let state = |status, code| ContainerState {
+            status,
+            exit_code: code,
+            ..Default::default()
+        };
+        assert!(matches!(
+            classify_probe(&state(Some(EXITED), Some(0))),
+            Ok(true)
+        ));
+        assert!(matches!(
+            classify_probe(&state(Some(EXITED), Some(1))),
+            Ok(false)
+        ));
+        for abnormal in [
+            state(Some(EXITED), Some(137)), // OOM-killed
+            state(Some(EXITED), None),      // exited without a code
+            state(Some(CREATED), Some(0)),  // never ran
+            state(Some(RUNNING), Some(0)),  // not actually exited
+            state(None, Some(0)),           // no status
+        ] {
+            assert!(
+                matches!(classify_probe(&abnormal), Err(Error::LabUnavailable { .. })),
+                "abnormal state must fail closed: {:?}",
+                abnormal.status
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Integration tests for the lab orchestrator (#18). These need a Docker daemon
+//! Integration tests for the lab orchestrator (#18, #19). These need a Docker daemon
 //! and self-skip where one is absent (docs/rules/test.md), so the gate stays
 //! green on a bare runner while the real lab is exercised on the `ubuntu-latest`
 //! CI leg. They send traffic only inside Docker objects they create, never to a
@@ -152,9 +152,11 @@ fn self_check_passes_for_an_isolated_lab() {
 
 /// Guard: the self-check refuses a lab whose forbidden pair has been connected
 /// (an `internal` workload attached to the `internet` network too, the realistic
-/// bring-up bug), rather than letting the run proceed. Mutation: treat a
-/// reachable forbidden probe as not-violated (drop the `probe_reaches -> Err`
-/// arm in `boundary_self_check`) -> the broken lab passes -> this fails.
+/// bring-up bug), rather than letting the run proceed. The broken workload is
+/// `db`, not the first-declared `internal` one, so this also guards that the
+/// check probes every `to` workload rather than a representative. Mutation:
+/// treat a reachable forbidden probe as not-violated (drop the `BoundaryViolated`
+/// arm in `check_boundaries`) -> the broken lab passes -> this fails.
 #[test]
 fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
     if !linux_docker_available() {
@@ -177,11 +179,13 @@ fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
             .expect("internet network")
             .name()
             .to_owned();
+        // Break a non-first internal workload (db), so the test fails unless the
+        // check probes every workload in the segment, not just the first.
         let internal_container = lab
             .containers()
             .iter()
-            .find(|c| c.segment() == "internal")
-            .expect("an internal workload")
+            .find(|c| c.workload() == "db")
+            .expect("the db workload")
             .name()
             .to_owned();
         docker
