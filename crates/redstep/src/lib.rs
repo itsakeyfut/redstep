@@ -54,6 +54,6 @@ pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
 pub use orchestrator::{LabContainer, LabNetwork, RunningLab, boundary_self_check, bring_up};
 pub use redstep_macros::security_test;
-pub use runner::{RunError, RunSummary, TestRun, run};
+pub use runner::{RunError, RunSummary, TestRun, execute_in_lab, run, run_against};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};
 pub use verdict::Verdict;

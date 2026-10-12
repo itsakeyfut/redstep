@@ -7,12 +7,16 @@
 //! judgements it records are its own.
 
 use crate::TestContext;
+use crate::environment::Environment;
 use crate::error::Error;
 use crate::evidence::{EvidenceId, EvidenceStore};
 use crate::expectation::Judgement;
+use crate::orchestrator::{RunningLab, boundary_self_check, bring_up};
 use crate::registry;
 use crate::scope::Scope;
 use crate::verdict::Verdict;
+use bollard::Docker;
+use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 
 /// One test's name, its verdict, and why: the judgements its expectations
@@ -65,6 +69,12 @@ pub enum RunError {
     /// The async runtime could not be started.
     #[error("failed to start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
+    /// The lab could not be stood up, or its declared boundaries were not
+    /// actually blocked (the boundary self-check refused the run): the run never
+    /// reached a verdict. A refused run returns this, never a [`RunSummary`], so a
+    /// broken lab cannot report PASS (Decision N step 4).
+    #[error("the lab could not be run against: {0}")]
+    Lab(#[source] crate::Error),
 }
 
 /// Discover every registered test and run it, each against its own context over
@@ -89,33 +99,119 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
         // half-written.
         let result =
             std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
-        let recorded = ctx.take_judgements();
-        // Append this test's drafts, then resolve each judgement's per-test
-        // reference to the run-scoped id the store just assigned. `base` is the
-        // id of this test's first draft, so a `DraftRef(i)` maps to
-        // `EvidenceId(base + i)` (issue #14).
-        let base = evidence.len();
-        for draft in ctx.take_evidence_drafts() {
-            evidence.append(draft, now_ms());
-        }
-        let judgements: Vec<Judgement> = recorded
-            .into_iter()
-            .map(|(mut judgement, draft_ref)| {
-                judgement.evidence =
-                    draft_ref.map(|reference| EvidenceId((base + reference.index()) as u64));
-                judgement
-            })
-            .collect();
-        let (verdict, error) = classify(result, &judgements);
-        runs.push(TestRun {
-            name: test.name,
-            verdict,
-            judgements,
-            error,
-        });
+        runs.push(finalize_test(test.name, result, &ctx, &mut evidence));
     }
 
     Ok(RunSummary { runs, evidence })
+}
+
+/// Stand the lab up, run the registered tests from the attacker's vantage, and
+/// tear it down, returning the run summary (#28). This is the lab-wired
+/// counterpart of [`run`]: it composes [`bring_up`], the boundary self-check
+/// gate, [`Scope::from_environment`] and the vantage execution path, which `run`
+/// (the host-in-process `--allow` path) does not.
+///
+/// It is `async`: the caller owns the runtime (unlike `run`, which builds its
+/// own), because the lab lifecycle is already async. Teardown runs on every path,
+/// including a self-check refusal or a test panic; the `RunningLab` `Drop`
+/// backstop (#18) is the last resort, and a teardown failure is warned rather
+/// than returned, so it never masks a verdict or a refusal.
+pub async fn run_against(
+    docker: &Docker,
+    env: &Environment,
+) -> std::result::Result<RunSummary, RunError> {
+    let lab = bring_up(docker, env).await.map_err(RunError::Lab)?;
+    let outcome = execute_in_lab(docker, env, &lab).await;
+    if let Err(e) = lab.teardown().await {
+        eprintln!("redstep: lab teardown after the run failed: {e}");
+    }
+    outcome
+}
+
+/// Gate on the boundary self-check, then run the registered tests against an
+/// already-stood-up `lab` from its attacker vantage. Split from [`run_against`]
+/// so the refusal path can be driven against a deliberately broken lab (one whose
+/// forbidden pair was connected after bring-up) without `run_against` tearing it
+/// down first.
+///
+/// The self-check runs before any test and refuses the run on failure (Decision N
+/// step 4), so a lab whose declared boundary is not actually blocked never
+/// executes a test and cannot report PASS. Each test runs over a
+/// [`TestContext::new_in_lab`] bound to the vantage segment's network, so
+/// [`TestContext::reach`](crate::TestContext::reach) acts from inside the lab.
+pub async fn execute_in_lab(
+    docker: &Docker,
+    env: &Environment,
+    lab: &RunningLab,
+) -> std::result::Result<RunSummary, RunError> {
+    boundary_self_check(docker, env, lab)
+        .await
+        .map_err(RunError::Lab)?;
+
+    let scope = Scope::from_environment(env);
+    let vantage = lab
+        .networks()
+        .iter()
+        .find(|n| n.segment() == env.vantage_segment())
+        .cloned()
+        .ok_or_else(|| {
+            RunError::Lab(Error::LabUnavailable {
+                reason: format!(
+                    "no network for the vantage segment {:?} in the running lab",
+                    env.vantage_segment()
+                ),
+            })
+        })?;
+
+    let tests = ordered(registry::all().collect());
+    let mut runs = Vec::with_capacity(tests.len());
+    let mut evidence = EvidenceStore::new();
+    for test in tests {
+        let ctx = TestContext::new_in_lab(scope.clone(), docker.clone(), vantage.clone());
+        // Catch a test panic on the async path too (the sync `run` uses
+        // `catch_unwind` around `block_on`), so one test's panic is never read as
+        // a pass. `AssertUnwindSafe` is sound for the same reason as in `run`: the
+        // context sinks are borrow/push/drop, never held across an `.await`.
+        let result = AssertUnwindSafe((test.run)(&ctx)).catch_unwind().await;
+        runs.push(finalize_test(test.name, result, &ctx, &mut evidence));
+    }
+
+    Ok(RunSummary { runs, evidence })
+}
+
+/// Drain one finished test's context into a [`TestRun`]: append its evidence
+/// drafts to the run store, resolve each judgement's per-test `DraftRef` to the
+/// run-scoped [`EvidenceId`] the store just assigned (`base` is the id of this
+/// test's first draft, so `DraftRef(i)` maps to `EvidenceId(base + i)`, issue
+/// #14), and classify the caught result against the recorded judgements. Shared
+/// by [`run`] (host) and [`execute_in_lab`] (vantage), which produce the same
+/// `std::thread::Result` so the resolution cannot diverge between the paths.
+fn finalize_test(
+    name: &'static str,
+    result: std::thread::Result<crate::Result<()>>,
+    ctx: &TestContext,
+    evidence: &mut EvidenceStore,
+) -> TestRun {
+    let recorded = ctx.take_judgements();
+    let base = evidence.len();
+    for draft in ctx.take_evidence_drafts() {
+        evidence.append(draft, now_ms());
+    }
+    let judgements: Vec<Judgement> = recorded
+        .into_iter()
+        .map(|(mut judgement, draft_ref)| {
+            judgement.evidence =
+                draft_ref.map(|reference| EvidenceId((base + reference.index()) as u64));
+            judgement
+        })
+        .collect();
+    let (verdict, error) = classify(result, &judgements);
+    TestRun {
+        name,
+        verdict,
+        judgements,
+        error,
+    }
 }
 
 /// The current time as epoch milliseconds, the one wall-clock read in the crate.
