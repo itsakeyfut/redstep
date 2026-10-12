@@ -8,11 +8,16 @@
 //! later renderers over the same `Report` (M2); this unit ships the terminal and
 //! the JSON only.
 //!
-//! A `Report` is a projection, not the internal model: verdicts serialize as
-//! their `Verdict::label` strings for an explicit published contract, and a
-//! finding is one security test with its reasons and the evidence ids they rest
-//! on. The evidence section reuses the `Evidence` records the store already holds
-//! (Decision D); they are canonical as they are.
+//! A `Report` is a projection, not the internal model. Verdicts serialize as
+//! their `Verdict::label` strings rather than through a derived `Serialize`,
+//! because `Verdict` is `#[non_exhaustive]` and deriving one would tie the
+//! published JSON to the internal variant names; `Confidence` is reused as-is,
+//! as it is already a stable leaf. The published types carry `schema_version`
+//! and are `#[non_exhaustive]` so the contract can grow without a break.
+//! `render_terminal` is a `cargo test`-style summary: one line per test, then the
+//! non-PASS reasons indented (a FAIL also carries the H-2 diagnostic), then a
+//! count line. The evidence section reuses the `Evidence` records the store
+//! already holds (Decision D); they are canonical as they are.
 
 use std::fmt::Write;
 
@@ -23,12 +28,22 @@ use crate::expectation::{Diagnostic, Judgement};
 use crate::observation::Confidence;
 use crate::runner::{RunSummary, TestRun};
 
-/// The canonical JSON of a run: its findings, the evidence they project from, and
-/// the exit status a CI gate reads (Decision E).
+/// The version of the canonical JSON schema. Bumped when the contract changes in
+/// a way a consumer must branch on; present from the first release so a consumer
+/// always has a version to read (Decision E).
+const SCHEMA_VERSION: u32 = 1;
+
+/// The canonical JSON of a run: its per-test results, the evidence they project
+/// from, and the exit status a CI gate reads (Decision E). `#[non_exhaustive]`,
+/// so a later field is not a breaking change for an external Rust consumer; the
+/// JSON itself grows compatibly because serde ignores unknown fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Report {
-    /// One finding per security test, in run order.
-    pub findings: Vec<Finding>,
+    /// The schema version, so a consumer can branch on the contract.
+    pub schema_version: u32,
+    /// One result per security test, in run order.
+    pub results: Vec<TestResult>,
     /// Every evidence record the run produced (Decision D), reused as-is.
     pub evidence: Vec<Evidence>,
     /// `0` only if at least one test ran and all passed; non-zero otherwise. A
@@ -37,9 +52,12 @@ pub struct Report {
 }
 
 /// One security test's result: its verdict, the reasons behind it, and the
-/// evidence ids they rest on.
+/// evidence ids they rest on. Named `TestResult`, not `Finding`: a `Finding`
+/// (Decision G) is a scanner's discovered issue, whereas this is a test outcome
+/// that may well be a `PASS`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Finding {
+#[non_exhaustive]
+pub struct TestResult {
     /// The fully-qualified test name.
     pub test: String,
     /// The test's verdict, as its label (`"PASS"` / `"FAIL"` / ...).
@@ -48,7 +66,7 @@ pub struct Finding {
     pub reasons: Vec<Reason>,
     /// A message for a bare `check` failure, an error, or a panic.
     pub error: Option<String>,
-    /// The evidence ids the reasons rest on, aggregated. A list, so a finding can
+    /// The evidence ids the reasons rest on, aggregated. A list, so a result can
     /// rest on several records even though each reason references one (the #14
     /// cardinality note; Decision J).
     pub evidence_ids: Vec<u64>,
@@ -56,6 +74,7 @@ pub struct Finding {
 
 /// One judged expectation, projected for the report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Reason {
     /// This expectation's verdict, as its label.
     pub verdict: String,
@@ -75,7 +94,8 @@ pub struct Reason {
 /// built, so the renderers cannot disagree (Decision E).
 pub fn build(summary: &RunSummary) -> Report {
     Report {
-        findings: summary.runs.iter().map(finding_of).collect(),
+        schema_version: SCHEMA_VERSION,
+        results: summary.runs.iter().map(result_of).collect(),
         evidence: summary.evidence.records().to_vec(),
         // Reuse the runner's fail-closed rule rather than re-deriving it, so the
         // empty-run-is-not-a-pass guarantee lives in one place (RunSummary).
@@ -83,22 +103,29 @@ pub fn build(summary: &RunSummary) -> Report {
     }
 }
 
-/// Serialize the report to the canonical JSON.
+/// Serialize the report to the canonical JSON, newline-terminated (so the file
+/// follows the usual text convention). The `expect` is unreachable: the report
+/// is owned plain data with no non-string map keys, which `serde_json` cannot
+/// fail to serialize.
 pub fn to_json(report: &Report) -> String {
-    serde_json::to_string_pretty(report).expect("a report of owned, plain data serializes")
+    let mut json =
+        serde_json::to_string_pretty(report).expect("a report of owned, plain data serializes");
+    json.push('\n');
+    json
 }
 
-/// Render the report as a `cargo test`-style terminal summary. A `FAIL` prints
-/// the expected / actual / probable cause / remediation diagnostic indented
-/// beneath it (Decision H-2); a `PASS` is one line.
+/// Render the report as a `cargo test`-style terminal summary. A non-PASS reason
+/// prints its expected / actual (with the evidence id) indented beneath its test,
+/// and a FAIL reason also prints the H-2 probable cause / remediation; a PASS
+/// reason is not printed. A final line counts each verdict.
 pub fn render_terminal(report: &Report) -> String {
     let mut out = String::new();
-    for finding in &report.findings {
-        let _ = writeln!(out, "{:<12} {}", finding.verdict, finding.test);
-        if let Some(error) = &finding.error {
+    for result in &report.results {
+        let _ = writeln!(out, "{:<12} {}", result.verdict, result.test);
+        if let Some(error) = &result.error {
             let _ = writeln!(out, "             {error}");
         }
-        for reason in &finding.reasons {
+        for reason in &result.reasons {
             // A passing reason is the absence of a problem, not a line to read.
             if reason.verdict == "PASS" {
                 continue;
@@ -126,11 +153,13 @@ pub fn render_terminal(report: &Report) -> String {
             }
         }
     }
+    // The labels here must match `Verdict::label`; a snapshot test pins the whole
+    // output so a drifted label or a miscounted bucket is caught.
     let count = |verdict: &str| {
         report
-            .findings
+            .results
             .iter()
-            .filter(|f| f.verdict == verdict)
+            .filter(|r| r.verdict == verdict)
             .count()
     };
     let _ = writeln!(
@@ -144,15 +173,15 @@ pub fn render_terminal(report: &Report) -> String {
     out
 }
 
-/// Project one test run into a finding, collecting the evidence ids its reasons
+/// Project one test run into a result, collecting the evidence ids its reasons
 /// rest on.
-fn finding_of(run: &TestRun) -> Finding {
+fn result_of(run: &TestRun) -> TestResult {
     let reasons: Vec<Reason> = run.judgements.iter().map(reason_of).collect();
     let evidence_ids = reasons
         .iter()
         .filter_map(|reason| reason.evidence_id)
         .collect();
-    Finding {
+    TestResult {
         test: run.name.to_owned(),
         verdict: run.verdict.label().to_owned(),
         reasons,
@@ -205,6 +234,20 @@ mod tests {
         }
     }
 
+    /// An Inconclusive reason at Low confidence that rests on no evidence: covers
+    /// the INCONCLUSIVE label, the Low confidence serialization, and a reason with
+    /// no evidence id (which must not be aggregated as id 0).
+    fn inconclusive_judgement() -> Judgement {
+        Judgement {
+            verdict: Verdict::Inconclusive,
+            expected: "false".to_owned(),
+            actual: "false".to_owned(),
+            confidence: Confidence::Low,
+            evidence: None,
+            diagnostic: None,
+        }
+    }
+
     fn run_of(name: &'static str, verdict: Verdict, judgement: Judgement) -> TestRun {
         TestRun {
             name,
@@ -214,8 +257,10 @@ mod tests {
         }
     }
 
-    /// Two tests (a PASS and a FAIL) and one evidence record at a fixed
-    /// timestamp, so the JSON is deterministic.
+    /// One run of each verdict kind, and two evidence records at a fixed
+    /// timestamp, so the JSON and the terminal are deterministic. The ERROR run
+    /// has no reasons and an `error` message; the INCONCLUSIVE run rests on no
+    /// evidence.
     fn sample_summary() -> RunSummary {
         let mut evidence = EvidenceStore::new();
         for target in ["web:80", "db:5432"] {
@@ -240,23 +285,40 @@ mod tests {
             runs: vec![
                 run_of("a::boundary_holds", Verdict::Pass, pass_judgement()),
                 run_of("b::boundary_breached", Verdict::Fail, fail_judgement()),
+                run_of(
+                    "c::signal_too_weak",
+                    Verdict::Inconclusive,
+                    inconclusive_judgement(),
+                ),
+                TestRun {
+                    name: "d::panicked",
+                    verdict: Verdict::Error,
+                    judgements: vec![],
+                    error: Some("boom".to_owned()),
+                },
             ],
             evidence,
         }
     }
 
-    /// Guard: the findings are the published contract (Decision E), pinned exact
-    /// so a renamed key or a dropped/mismapped field is caught (round-trip alone
-    /// would not; RK-003). The evidence shape is pinned by #5, so only its ids are
-    /// checked here. Mutation: map the verdict or expected/actual wrong in
-    /// `finding_of`/`reason_of` -> the literal no longer matches -> fails.
+    /// Guard: the results are the published contract (Decision E), pinned exact so
+    /// a renamed key, a dropped/mismapped field, a missing verdict kind, or a
+    /// mis-serialized `Confidence` is caught (round-trip alone would not; RK-003).
+    /// The evidence shape is pinned by #5, so only its ids are checked here.
+    /// Mutation: map the verdict or expected/actual wrong in `result_of`/`reason_of`,
+    /// or hard-code `confidence`, or drop `error`/`schema_version` -> the literal
+    /// no longer matches -> fails.
     #[test]
-    fn canonical_json_pins_the_findings() {
+    fn canonical_json_pins_the_results() {
         let report = build(&sample_summary());
         let value = serde_json::to_value(&report).expect("serialize");
 
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(value["evidence"][0]["id"], 0);
+        assert_eq!(value["evidence"][1]["id"], 1);
         assert_eq!(
-            value["findings"],
+            value["results"],
             serde_json::json!([
                 {
                     "test": "a::boundary_holds",
@@ -276,64 +338,76 @@ mod tests {
                     ],
                     "error": null,
                     "evidence_ids": [1]
+                },
+                {
+                    "test": "c::signal_too_weak",
+                    "verdict": "INCONCLUSIVE",
+                    "reasons": [
+                        { "verdict": "INCONCLUSIVE", "expected": "false", "actual": "false", "confidence": "Low", "evidence_id": null, "diagnostic": null }
+                    ],
+                    "error": null,
+                    "evidence_ids": []
+                },
+                {
+                    "test": "d::panicked",
+                    "verdict": "ERROR",
+                    "reasons": [],
+                    "error": "boom",
+                    "evidence_ids": []
                 }
             ])
         );
-        assert_eq!(value["exit_code"], 1);
-        assert_eq!(value["evidence"][0]["id"], 0);
-        assert_eq!(value["evidence"][1]["id"], 1);
     }
 
-    /// Guard: the terminal and the JSON show the same verdicts, because both come
-    /// from one `Report`. Mutation: hard-code a verdict label in `render_terminal`
-    /// (e.g. always `"PASS"`) -> the terminal line disagrees with the finding's
-    /// verdict -> fails.
+    /// Guard: the terminal output, whole, so the summary count line, the skip-PASS
+    /// rule, the evidence suffix, the expected/actual order, the error line, and
+    /// every verdict label are all pinned, not merely `contains`-checked. Mutation:
+    /// change a count slot (e.g. `count("FAIL")` -> `0`), stop skipping PASS
+    /// reasons, swap expected/actual, drop the evidence suffix, or relabel a
+    /// verdict -> the snapshot no longer matches -> fails.
     #[test]
-    fn terminal_and_json_show_the_same_verdicts() {
+    fn terminal_matches_the_snapshot() {
         let report = build(&sample_summary());
-        let terminal = render_terminal(&report);
-        for finding in &report.findings {
-            assert!(
-                terminal.contains(&format!("{:<12} {}", finding.verdict, finding.test)),
-                "terminal is missing {} {}, got:\n{terminal}",
-                finding.verdict,
-                finding.test
-            );
-        }
+        let expected = concat!(
+            "PASS         a::boundary_holds\n",
+            "FAIL         b::boundary_breached\n",
+            "             FAIL: expected false, observed true  (Evidence: ev_1)\n",
+            "               probable cause: the boundary did not hold\n",
+            "               remediation:    close the path\n",
+            "INCONCLUSIVE c::signal_too_weak\n",
+            "             INCONCLUSIVE: expected false, observed false\n",
+            "ERROR        d::panicked\n",
+            "             boom\n",
+            "1 passed, 1 failed, 1 inconclusive, 1 errored\n",
+        );
+        assert_eq!(render_terminal(&report), expected);
     }
 
-    /// Guard: a FAIL carries the H-2 diagnostic in the JSON and prints it.
-    /// Mutation: drop `diagnostic` in `reason_of`, or make `render_terminal` skip
-    /// the probable-cause/remediation lines -> fails.
+    /// Guard: `to_json` is the real serialization, pretty-printed and
+    /// newline-terminated, and it round-trips to the same value the report
+    /// serializes to. Mutation: return a constant string, drop the trailing
+    /// newline, or switch to compact `to_string` -> fails.
     #[test]
-    fn fail_finding_carries_the_h2_diagnostic() {
+    fn to_json_is_pretty_and_round_trips() {
         let report = build(&sample_summary());
-        let fail = report
-            .findings
-            .iter()
-            .find(|f| f.verdict == "FAIL")
-            .expect("a FAIL finding");
-        let diagnostic = fail.reasons[0]
-            .diagnostic
-            .as_ref()
-            .expect("the FAIL reason carries a diagnostic");
-        assert!(!diagnostic.probable_cause.is_empty());
-        assert!(!diagnostic.remediation.is_empty());
+        let json = to_json(&report);
 
-        let terminal = render_terminal(&report);
-        assert!(terminal.contains("probable cause: the boundary did not hold"));
-        assert!(terminal.contains("remediation:    close the path"));
+        assert!(json.ends_with('\n'), "the JSON file is newline-terminated");
+        assert!(json.contains("\n  "), "the JSON is pretty-printed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, serde_json::to_value(&report).expect("serialize"));
     }
 
     /// Guard: the exit status is a field of the report and reflects the verdicts,
-    /// fail-closed on an empty run. Mutation: hard-code `exit_code: 0` in `build`
-    /// -> the FAIL run and the empty run both read 0 -> fails.
+    /// fail-closed on an empty run, for every verdict kind. Mutation: hard-code
+    /// `exit_code: 0` in `build`, or special-case Error/Inconclusive to 0 -> one of
+    /// these fails.
     #[test]
     fn report_exit_code_matches_the_verdicts() {
         assert_eq!(
             build(&sample_summary()).exit_code,
             1,
-            "a FAIL run is non-zero"
+            "a mixed run is non-zero"
         );
 
         let all_pass = RunSummary {
@@ -342,6 +416,21 @@ mod tests {
         };
         assert_eq!(build(&all_pass).exit_code, 0, "an all-pass run is zero");
 
+        for (name, verdict, judgement) in [
+            ("a::weak", Verdict::Inconclusive, inconclusive_judgement()),
+            ("a::broke", Verdict::Error, inconclusive_judgement()),
+        ] {
+            let summary = RunSummary {
+                runs: vec![run_of(name, verdict, judgement)],
+                evidence: EvidenceStore::new(),
+            };
+            assert_ne!(
+                build(&summary).exit_code,
+                0,
+                "a {verdict:?} run is not a pass"
+            );
+        }
+
         let empty = RunSummary {
             runs: vec![],
             evidence: EvidenceStore::new(),
@@ -349,22 +438,43 @@ mod tests {
         assert_ne!(build(&empty).exit_code, 0, "an empty run is not a pass");
     }
 
-    /// Guard: a finding aggregates the evidence ids of its reasons, so a test with
-    /// several runs rests on several records. Mutation: drop the `evidence_ids`
-    /// aggregation in `finding_of` (leave it empty) -> fails.
+    /// Guard: a result aggregates the evidence ids of its reasons, and a reason
+    /// with no evidence contributes none (not a spurious id 0). Mutation: drop the
+    /// aggregation (empty), or replace `filter_map` with `map(unwrap_or(0))` -> the
+    /// list is wrong -> fails.
     #[test]
-    fn finding_collects_its_evidence_ids() {
-        let two_reasons = TestRun {
-            name: "a::two_runs",
+    fn result_collects_only_real_evidence_ids() {
+        let mixed = TestRun {
+            name: "a::mixed",
             verdict: Verdict::Fail,
-            judgements: vec![pass_judgement(), fail_judgement()],
+            // pass_judgement -> id 0, inconclusive -> no id, fail -> id 1.
+            judgements: vec![pass_judgement(), inconclusive_judgement(), fail_judgement()],
             error: None,
         };
         let summary = RunSummary {
-            runs: vec![two_reasons],
+            runs: vec![mixed],
             evidence: EvidenceStore::new(),
         };
         let report = build(&summary);
-        assert_eq!(report.findings[0].evidence_ids, vec![0, 1]);
+        assert_eq!(report.results[0].evidence_ids, vec![0, 1]);
+    }
+
+    /// Guard: every evidence id a result cites resolves to a record in the report's
+    /// evidence section, so the projection is internally consistent (Decision E).
+    /// Mutation: have `build` copy only some of the store's records -> an id no
+    /// longer resolves -> fails.
+    #[test]
+    fn every_cited_evidence_id_resolves() {
+        let report = build(&sample_summary());
+        let known: Vec<u64> = report.evidence.iter().map(|e| e.id.0).collect();
+        for result in &report.results {
+            for id in &result.evidence_ids {
+                assert!(
+                    known.contains(id),
+                    "evidence id {id} cited by {} is not in the evidence section",
+                    result.test
+                );
+            }
+        }
     }
 }

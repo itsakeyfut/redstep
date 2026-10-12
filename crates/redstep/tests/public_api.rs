@@ -398,7 +398,11 @@ fn cli_json_flag_writes_the_canonical_json() {
 
     let written = std::fs::read_to_string(&path).expect("the JSON was written");
     let value: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
-    assert!(value.get("findings").is_some(), "the contract has findings");
+    assert!(
+        value.get("schema_version").is_some(),
+        "the contract is versioned"
+    );
+    assert!(value.get("results").is_some(), "the contract has results");
     assert!(value.get("evidence").is_some(), "the contract has evidence");
     assert!(
         value.get("exit_code").is_some(),

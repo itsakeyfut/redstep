@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 
     let report = report::build(&summary);
 
-    if report.findings.is_empty() {
+    if report.results.is_empty() {
         // Say so rather than exit silently: an empty run is not a pass, and a
         // bare non-zero exit with no output looks like a crash (the exit code is
         // still non-zero, see Report::exit_code, CLAUDE.md row 6).
@@ -47,8 +47,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // The status is a field of the canonical JSON (Decision E). exit_code is 0 or 1.
-    ExitCode::from(report.exit_code as u8)
+    // The status is a field of the canonical JSON (Decision E). Map it to a
+    // process code explicitly rather than casting: `build` only ever produces 0
+    // or 1, but `report.exit_code` is a public `i32`, and `as u8` would wrap a
+    // stray value (256 -> 0) into a false success (CLAUDE.md row 6).
+    if report.exit_code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// Parse `--allow host:port` (repeatable) and an optional `--json path` into a
