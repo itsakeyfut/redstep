@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 redstep-macros = { path = "../redstep-macros" }
 # Test discovery: the attribute macro registers each test into a distributed
-# collection that `run` iterates. See docs/specs/design-decisions.md Decision A.
+# collection that `run` iterates. See docs/adr/ ADR-0001.
 inventory = "0.3.25"
 thiserror = "2.0.21"
 # The runner drives async tests on one current-thread runtime (`rt`); the
@@ -21,14 +21,14 @@ tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
 # The orchestrator layer (environment/network, docs/rules/design.md section 2)
 # drives the Docker API directly to build and tear down the isolated lab:
 # per-segment networks created `internal: true` for egress-less isolation
-# (Decision C, F layer 1, N). Used only in `orchestrator`; the model stays
+# (ADR-0003, ADR-0006 layer 1, ADR-0011). Used only in `orchestrator`; the model stays
 # bollard-free.
 bollard = "0.21.1"
 # The orchestrator drains bollard's image-pull stream (create_image) to
 # completion; StreamExt::next is the only use.
 futures-util = { version = "0.3.31", default-features = false }
 # Evidence is the single source of truth every report and the canonical JSON
-# project from (Decision D, E), so it serializes; `serde_json::Value` is the
+# project from (ADR-0004, ADR-0005), so it serializes; `serde_json::Value` is the
 # capability-neutral carrier for an observed value and the reproduction params.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

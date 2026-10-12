@@ -1,16 +1,16 @@
 //! The isolated lab's topology: the segments, the workloads in them, the
-//! boundaries between them, and the attacker's vantage (Decision C).
+//! boundaries between them, and the attacker's vantage (ADR-0003).
 //!
 //! Pure model layer (docs/rules/design.md section 2): an `Environment` is a
 //! validated value with no Docker and no IO. Standing it up with bollard, the
 //! boundary self-check, and resolving scope from it are later units; this is the
 //! definition they read. The network boundary is framework-owned because it is
-//! the thing under test (Decision C); the workload *content* is the user's,
+//! the thing under test (ADR-0003); the workload *content* is the user's,
 //! referenced by image.
 //!
 //! The definition is built in code through [`Environment::builder`], valid by
 //! construction like [`Scope`](crate::Scope); the YAML/DSL definition format is
-//! Decision C's open question, deferred to M2.
+//! ADR-0003's open question, deferred to M2.
 
 use crate::error::{Error, Result};
 
@@ -29,7 +29,7 @@ impl Segment {
 }
 
 /// A workload placed in a segment. The framework owns the boundary; the user
-/// supplies the content, referenced by `image` (Decision C).
+/// supplies the content, referenced by `image` (ADR-0003).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workload {
     name: String,
@@ -55,13 +55,13 @@ impl Workload {
 }
 
 /// A declared boundary from one segment to another. `allow` is the list of
-/// permitted `workload:port` specs (Decision C's shape); an empty `allow` means
+/// permitted `workload:port` specs (ADR-0003's shape); an empty `allow` means
 /// the path is blocked, which is the MVP's `internet -> internal`.
 ///
 /// Nothing enforces a port-level `allow` yet: the MVP's boundaries are
-/// membership-only (Decision N), so [`EnvironmentBuilder::build`] refuses a
+/// membership-only (ADR-0011), so [`EnvironmentBuilder::build`] refuses a
 /// non-empty one rather than hold a permission the lab cannot keep. The field
-/// stays for the firewall gateway (Decision N, M3) that will enforce it.
+/// stays for the firewall gateway (ADR-0011, M3) that will enforce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
     from: String,
@@ -87,7 +87,7 @@ impl Boundary {
 }
 
 /// The lab topology, valid by construction: its builder checked that every
-/// reference resolves (Decision C).
+/// reference resolves (ADR-0003).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Environment {
     segments: Vec<Segment>,
@@ -118,7 +118,7 @@ impl Environment {
     }
 
     /// The segment the attacker's vantage sits in. The vantage is the minimal
-    /// part of Decision L/P modelled here: a starting segment, not the
+    /// part of ADR-0012/ADR-0017 modelled here: a starting segment, not the
     /// AttackerState graph.
     pub fn vantage_segment(&self) -> &str {
         &self.vantage
@@ -245,7 +245,7 @@ impl EnvironmentBuilder {
                 return Err(invalid(format!(
                     "boundary {from:?} -> {to:?} carries a port-level allow {allow:?}, \
                      but the membership-only MVP cannot enforce one; allow must be empty \
-                     until the firewall gateway (Decision N, M3)"
+                     until the firewall gateway (ADR-0011, M3)"
                 )));
             }
             boundaries.push(Boundary { from, to, allow });

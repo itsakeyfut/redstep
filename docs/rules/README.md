@@ -15,8 +15,7 @@ the short charter, and these are the detail behind it.
 | [unsafe.md](./unsafe.md) | When `unsafe` is allowed, isolation, SAFETY comments |
 | [perf.md](./perf.md) | Where the cost actually is, bounded concurrency, streaming tool output |
 
-The settled reasoning lives in [`../specs/design-decisions.md`](../specs/design-decisions.md)
-(decisions A-V, MVP); the tooling landscape in
+The settled reasoning lives in the ADRs under [`../adr/`](../adr/README.md); the tooling landscape in
 [`../research/attack-tooling-survey.md`](../research/attack-tooling-survey.md); the
 plan in [`../roadmap/`](../roadmap/). A rule here says *how to keep the code
 aligned* with a decision; it does not restate the decision's rationale.

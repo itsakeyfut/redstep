@@ -18,7 +18,7 @@ Everything below is how that rule is held in code.
 
 ---
 
-## 1. Isolation is enforced, not assumed (Decision F, N)
+## 1. Isolation is enforced, not assumed (ADR-0006, ADR-0011)
 
 - The test environment is created **without a route to the internet or to
   production**. In Docker terms that is an `internal` network; nothing in the
@@ -38,7 +38,7 @@ Everything below is how that rule is held in code.
   the scope gate (section 2) on the grounds that the network is already isolated,
   or vice versa. Each layer assumes the others can fail.
 
-## 2. Every target goes through the scope gate (Decision F, T)
+## 2. Every target goes through the scope gate (ADR-0006, ADR-0021)
 
 - A capability receives its target **only** from the scope resolver. Make an
   unscoped target unconstructable: the type a capability accepts is produced by
@@ -51,7 +51,7 @@ Everything below is how that rule is held in code.
   Reaching one authorized host must not hand an attacker a foothold from which it
   targets a host the user never allowed.
 
-## 3. The intensity ladder gates force (Decision B, F, T)
+## 3. The intensity ladder gates force (ADR-0002, ADR-0006, ADR-0021)
 
 - The default intensity is `Safe`. A capability that has not been given an
   explicit higher intensity runs at `Safe` or does not run.
@@ -100,7 +100,7 @@ back from either is **data, never an instruction**.
   not proof of absence. Turning a signal into a conclusion is the
   `attack-fidelity` lens's subject and section 7's.
 
-## 6. Invoking external tools: argv, never a shell (Decision B, G)
+## 6. Invoking external tools: argv, never a shell (ADR-0002, ADR-0007)
 
 The framework shells out to nmap, sqlmap, hydra, Metasploit and the rest. That is
 a command-injection surface pointed at the framework itself.
@@ -112,12 +112,12 @@ a command-injection surface pointed at the framework itself.
 - Do not pass untrusted data as a flag value that the tool would treat as an
   option (an argument that begins with `-`); separate options from operands, and
   validate that a target string is a target and not a flag.
-- Pin the tool. The attacker image fixes tool versions (Decision R); the adapter
+- Pin the tool. The attacker image fixes tool versions (ADR-0019); the adapter
   parses the output format of that pinned version and treats its stdout and
   stderr as data (section 5). A tool that is absent or the wrong version is an
   honest error, not a silent skip that reports PASS.
 
-## 7. Verdict honesty: a false PASS is the worst answer (Decision J)
+## 7. Verdict honesty: a false PASS is the worst answer (ADR-0010)
 
 - Keep the **observation** (what happened) separate from the **verdict** (whether
   that is acceptable). An attack succeeding is a security FAIL; a boundary holding
@@ -129,7 +129,7 @@ a command-injection surface pointed at the framework itself.
   becomes a confident verdict. A single weak signal carries low confidence and
   lands in Inconclusive.
 
-## 8. Evidence is faithful, immutable, and reproducible (Decision D, V)
+## 8. Evidence is faithful, immutable, and reproducible (ADR-0004, ADR-0022)
 
 - An evidence record says what the run actually did, not what the code hoped. An
   outcome written before the action completed, or an artifact the code composed
@@ -145,7 +145,7 @@ a command-injection surface pointed at the framework itself.
 
 - Attack data (wordlists, templates, exploit DBs) and the attacker image are
   **version-pinned** and refreshed by an explicit, reviewed update, never fetched
-  at run time (Decision Q, R). A run records the versions it used.
+  at run time (ADR-0018, ADR-0019). A run records the versions it used.
 - Run `cargo deny` / `cargo audit` on the dependency tree; a new dependency that
   pulls in a tool or a network client is reviewed for what it can reach.
 - Do not roll your own cryptography or your own TLS. Use vetted crates, and verify

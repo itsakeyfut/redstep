@@ -1,7 +1,7 @@
 # Attack Techniques & Tooling Survey
 
 本フレームワークが「成熟していて、実際にクラッカーが使うツール」で検証を行うための調査。
-specs/design-decisions.md の Decision B(Hybrid: Rust コア + ツールアダプタ)/ Decision G(Plugin + Role 階層:
+docs/adr/ の ADR-0002(Hybrid: Rust コア + ツールアダプタ)/ ADR-0007(Plugin + Role 階層:
 Capability / Scanner / Interop)に沿って、各ツールを**役割階層・攻撃フェーズ・レイヤー**で分類する。
 
 > 調査日: 2026-10-10 / 動きの速い領域(クラウド・C2・AD)は Web 検索で現況を確認。
@@ -14,7 +14,7 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 - **攻撃フェーズ**(「Attack Simulation」 のキルチェーン): Recon → Initial Access → Exploit/Abuse →
   Privilege Escalation → Credential/Secret Discovery → Lateral Movement → Internal Access → Impact
 - **レイヤー**(「Environment Abstraction」): Application / Host / Network / Infrastructure(+ Cloud)
-- **Role 階層**(Decision G):
+- **Role 階層**(ADR-0007):
   - **Capability** = 能動実行(攻撃ステップ。Intensity × Scope Gate を通す)
   - **Scanner** = 一括発見(Finding 生成)
   - **Interop** = 独立実行型の結果取り込みのみ(framework は実行制御しない)
@@ -23,7 +23,7 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 
 ## 2. 参照すべき既存フレームワーク / 標準(タクソノミ候補)
 
-技術を「我流」で並べず、既存の標準に対応づけるかどうかは要決定(→ 後述 Decision J 候補)。
+技術を「我流」で並べず、既存の標準に対応づけるかどうかは要決定(→ 後述 ADR-0010 候補)。
 
 | 標準 | 内容 | 用途 |
 |------|------|------|
@@ -113,7 +113,7 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 
 | ツール | 役割 | 内容 | 階層 | ライセンス | 統合メモ |
 |--------|------|------|------|-----------|----------|
-| **tcpdump / tshark(Wireshark)** | パケットキャプチャ/解析 | pcap を Evidence 化 | Capability/Interop | BSD/GPL | **Evidence(pcap)取得源**として重要(Decision D) |
+| **tcpdump / tshark(Wireshark)** | パケットキャプチャ/解析 | pcap を Evidence 化 | Capability/Interop | BSD/GPL | **Evidence(pcap)取得源**として重要(ADR-0004) |
 | **Scapy** | パケット生成/操作(Python) | 任意プロトコル | Capability | GPL | 低レベル攻撃・内製代替の参考 |
 | **bettercap / ettercap** | MITM フレームワーク | ARP/DNS スプーフ等 | Capability | GPL/EUPL | 隔離 L2 内での中間者 |
 | **Responder** | LLMNR/NBT-NS/mDNS ポイズニング | 資格情報窃取 | Capability | GPL | AD 環境で定番(Phase: Windows) |
@@ -133,7 +133,7 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 
 > ⚠ **重要な制約**: 無線(aircrack)や一部物理攻撃は、コンテナ/仮想ネットワークでは再現できない
 > (無線ハードウェアが要る)。**VPN クラックは IPsec/IKE の弱 PSK・漏洩鍵・設定不備として
-> 隔離 lab で再現可能**だが、WiFi 系は MVP スコープ外に置くのが現実的(→ Decision M 候補)。
+> 隔離 lab で再現可能**だが、WiFi 系は MVP スコープ外に置くのが現実的(→ ADR-0013 候補)。
 
 ---
 
@@ -160,7 +160,7 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 | **Prowler** | クラウド構成評価(AWS/Azure/GCP、300+ チェック) | CSPM | Scanner | Apache | マルチクラウド。SARIF 可 |
 | **ScoutSuite** | マルチクラウド監査レポート | | Scanner | GPL | レポート生成が強み |
 | **Pacu**(Rhino Security) | AWS **攻撃**フレームワーク(IAM 列挙/権限昇格/永続化) | 能動 | Capability | BSD | クラウド攻撃の中核(Phase 8) |
-| **CloudFox** | AWS/Azure 攻撃経路列挙 | | Capability | Apache | Attack Path(Decision D と親和) |
+| **CloudFox** | AWS/Azure 攻撃経路列挙 | | Capability | Apache | Attack Path(ADR-0004 と親和) |
 | **Cartography** | クラウド資産の関係グラフ化 | | Scanner/graph | Apache | Attack Graph 補強 |
 | **enumerate-iam** | AWS IAM 権限列挙 | | Capability | — | |
 
@@ -191,12 +191,12 @@ Capability / Scanner / Interop)に沿って、各ツールを**役割階層・�
 ## 14. Windows / Active Directory ツール群(プラットフォーム判断が必要)
 
 AD 系は現実の企業ネットワーク攻撃の中核だが、**Windows ターゲットが必要で Docker-Linux だけでは完結しない**
-(→ Decision M「プラットフォームスコープ」で扱う)。
+(→ ADR-0013「プラットフォームスコープ」で扱う)。
 
 | ツール | 役割 | 内容 |
 |--------|------|------|
 | **Impacket** | Windows プロトコル操作の Python 群 | secretsdump, ntlmrelayx, wmiexec, psexec, GetUserSPNs |
-| **BloodHound + SharpHound** | AD 権限昇格経路の可視化 | 攻撃グラフ(Decision D と親和) |
+| **BloodHound + SharpHound** | AD 権限昇格経路の可視化 | 攻撃グラフ(ADR-0004 と親和) |
 | **Mimikatz** | LSASS からの資格情報窃取 | PtH, Golden/Silver Ticket |
 | **Rubeus** | Kerberos 攻撃 | Kerberoasting, AS-REP roasting |
 | **NetExec(旧 CrackMapExec)** | AD/SMB 横断操作 | スプレー&チェックの標準(2024 以降 NetExec) |

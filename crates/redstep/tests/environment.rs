@@ -8,7 +8,7 @@
 //! The egress-less flag is checked structurally (each lab network is
 //! `internal: true`), which a dropped `internal: Some(true)` in the orchestrator
 //! would fail. That a declared-forbidden path is actually blocked is the
-//! boundary self-check (Decision N step 4), driven against a `bring_up` lab with
+//! boundary self-check (ADR-0011 step 4), driven against a `bring_up` lab with
 //! a positive control. The run path brings the lab up, gates on the self-check,
 //! runs the boundary demo (`attacker_cannot_connect_to_db`) from the attacker's vantage, and
 //! tears the lab down (#28).
@@ -222,7 +222,7 @@ fn self_check_refuses_a_lab_whose_forbidden_pair_is_connected() {
 /// it from the vantage; the observation is `false` at `Low` (busybox `nc` cannot
 /// prove a port closed), so it opts down to `min_confidence(Low)` explicitly. The
 /// `High` certification that the boundary actually holds is the self-check gate
-/// the run runs first, not this probe (#28, Decision J/N note). Registered by the
+/// the run runs first, not this probe (#28, ADR-0010/ADR-0011 note). Registered by the
 /// macro and run only via the lab-wired runner.
 #[redstep::security_test]
 async fn attacker_cannot_connect_to_db(ctx: &TestContext) -> redstep::Result<()> {

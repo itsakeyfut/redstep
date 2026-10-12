@@ -48,7 +48,7 @@ pub struct RunSummary {
     pub runs: Vec<TestRun>,
     /// Every evidence record produced during the run, in execution order: the
     /// single source of truth the reports and the canonical JSON project from
-    /// (Decision D, E).
+    /// (ADR-0004, ADR-0005).
     pub evidence: EvidenceStore,
 }
 
@@ -80,7 +80,7 @@ pub enum RunError {
     /// The lab could not be stood up, or its declared boundaries were not
     /// actually blocked (the boundary self-check refused the run): the run never
     /// reached a verdict. A refused run returns this, never a [`RunSummary`], so a
-    /// broken lab cannot report PASS (Decision N step 4).
+    /// broken lab cannot report PASS (ADR-0011 step 4).
     #[error("the run could not proceed against the lab: {0}")]
     Lab(#[source] crate::Error),
 }
@@ -88,7 +88,7 @@ pub enum RunError {
 /// Discover every registered test and run it, each against its own context over
 /// a clone of `scope`. The evidence each test produced is collected into one
 /// run-level [`EvidenceStore`], in test-then-execution order; the store assigns
-/// the ids and stamps the timestamps from this runner's clock (Decision D).
+/// the ids and stamps the timestamps from this runner's clock (ADR-0004).
 pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -150,7 +150,7 @@ pub async fn run_in_lab(
 /// the `Ok` and the `Err` return (`run_in_lab` is the caller that does it), with
 /// the `RunningLab` `Drop` backstop behind it.
 ///
-/// The self-check runs before any test and refuses the run on failure (Decision N
+/// The self-check runs before any test and refuses the run on failure (ADR-0011
 /// step 4), so a lab whose declared boundary is not actually blocked never
 /// executes a test and cannot report PASS. Each test runs over a
 /// [`TestContext::new_in_lab`] bound to the vantage segment's network, so

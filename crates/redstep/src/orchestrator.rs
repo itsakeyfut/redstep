@@ -1,5 +1,5 @@
 //! Bring an [`Environment`] up as Docker networks and containers, and tear it
-//! down (Decision C: bollard; Decision F layer 1 and Decision N: egress-less
+//! down (ADR-0003: bollard; ADR-0006 layer 1 and ADR-0011: egress-less
 //! isolation).
 //!
 //! The environment/network layer (docs/rules/design.md section 2): this is the
@@ -11,7 +11,7 @@
 //! the default bridge, which would re-add egress), aliased by its workload name
 //! so a scope-resolved host like `db` is reachable in the lab by that name.
 //!
-//! The MVP realises the membership-only model (Decision N): a boundary is
+//! The MVP realises the membership-only model (ADR-0011): a boundary is
 //! separate networks with no connection between them, and a non-empty `allow` is
 //! refused upstream, so no cross-segment path is wired here; the firewall
 //! gateway for port-level boundaries is Phase 4 / M3.
@@ -25,7 +25,7 @@
 //!
 //! It also *executes* a capability from the attacker's vantage:
 //! [`tcp_reachable_from`] runs a TCP-connect probe from a container on a lab
-//! network and reuses `tcp_connect`'s classification (#27, a Decision B
+//! network and reuses `tcp_connect`'s classification (#27, a ADR-0002
 //! refinement). That is a downward dependency on the capability layer, which the
 //! design permits: capability sits below environment, so the orchestrator may
 //! call its classification down. A host-run native connect is not usable here,
@@ -321,7 +321,7 @@ trait Prober {
 }
 
 /// Verify every declared-forbidden path is actually blocked, before any test
-/// runs (Decision N step 4). For each boundary (an empty `allow` means the path
+/// runs (ADR-0011 step 4). For each boundary (an empty `allow` means the path
 /// is blocked, and a non-empty one is refused at build) and *every* workload in
 /// the `to` segment, a probe in the `from` segment must fail to reach the
 /// workload while a positive-control probe in the `to` segment reaches it, so a
@@ -337,7 +337,7 @@ trait Prober {
 /// container name, which Docker's embedded DNS resolves only for peers on the
 /// same network, so it detects a workload wrongly attached to the `from` network
 /// (the MVP's all-or-nothing boundary) and needs no listener. It does not verify
-/// a routed or port-level boundary: the firewall gateway (Decision N, Phase 4 /
+/// a routed or port-level boundary: the firewall gateway (ADR-0011, Phase 4 /
 /// M3) adds those and will need a TCP-to-port probe, not name-based ICMP.
 ///
 /// The lab-wired runner gates on this before any test ([`run_in_running_lab`](crate::run_in_running_lab),
@@ -602,7 +602,7 @@ fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
 /// `Error::LabUnavailable`, fail-closed.
 ///
 /// The recorded reproduction is minimal and not yet a faithful replay witness
-/// (Decision D's `source` node and Decision V's pinned replay are a follow-up):
+/// (ADR-0004's `source` node and ADR-0022's pinned replay are a follow-up):
 /// it records the applied timeout and the vantage network, not the full lab the
 /// probe ran against.
 pub(crate) async fn tcp_reachable_from(

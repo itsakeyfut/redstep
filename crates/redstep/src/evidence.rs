@@ -1,20 +1,20 @@
 //! The immutable, capability-neutral record one capability execution emits, and
-//! the append-only store a run collects them into (Decision D).
+//! the append-only store a run collects them into (ADR-0004).
 //!
-//! Decision D makes the evidence record the single source of truth: every report
+//! ADR-0004 makes the evidence record the single source of truth: every report
 //! and the later attack graph are projections of it, so it serializes (Decision
 //! E's canonical JSON is its export form). The record is capability-neutral: the
 //! observed value is erased to a `serde_json::Value`, so a capability whose
 //! observation is not a bool stores it without a lossy coercion (this is the
 //! reshape #10 asked for, away from the #3 placeholder's `reachable: bool`).
 //!
-//! The record holds the observed *fact*, not a verdict: per Decision J a `Verdict`
+//! The record holds the observed *fact*, not a verdict: per ADR-0010 a `Verdict`
 //! is the oracle's judgement over an observation, and the same observation can be
 //! a `Pass` or a `Fail` depending on the expectation, so a verdict cannot live in
-//! the fact. Decision D's planned `result: Outcome` is retired here rather than
+//! the fact. ADR-0004's planned `result: Outcome` is retired here rather than
 //! renamed; the link from a judgement back to its evidence is built on top in #14
 //! (the [`DraftRef`] a judgement carries, resolved by the runner; see the
-//! Decision J note), not by this record itself.
+//! ADR-0010 note), not by this record itself.
 //!
 //! A capability cannot know the id or the timestamp of its own record, so it
 //! produces a pure [`EvidenceDraft`] and the store stamps both on append: the id
@@ -32,7 +32,7 @@ use crate::observation::Confidence;
 
 /// A record's identity within one run: a sequential index the store assigns on
 /// append. Run-scoped and deterministic (not a UUID), so a success witness
-/// (Decision V) can pin a stable reference and tests can assert it.
+/// (ADR-0022) can pin a stable reference and tests can assert it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceId(pub u64);
 
@@ -57,7 +57,7 @@ impl DraftRef {
     }
 }
 
-/// Enough to re-run the same action, which a success witness (Decision V) lifts
+/// Enough to re-run the same action, which a success witness (ADR-0022) lifts
 /// out wholesale. It restates the capability and target (also on the [`Evidence`])
 /// on purpose, so the reproduction is self-contained rather than a reference into
 /// its parent record. `params` is the capability-specific input, kept neutral as
@@ -85,7 +85,7 @@ pub struct EvidenceDraft {
     /// The force it applied.
     pub intensity: Intensity,
     /// The observed value, erased to a JSON value so any capability's observation
-    /// fits the one record (Decision D). For a reachability capability this is a
+    /// fits the one record (ADR-0004). For a reachability capability this is a
     /// bool; for a credential find it is the found value.
     pub observed: serde_json::Value,
     /// How much to trust the observation (mirrors the [`Observation`](crate::Observation)).
@@ -98,7 +98,7 @@ pub struct EvidenceDraft {
 
 /// The immutable record the store holds: an [`EvidenceDraft`] the store has given
 /// an [`EvidenceId`] and a timestamp. The single source of truth every report and
-/// the canonical JSON project from (Decision D, E), so it serializes.
+/// the canonical JSON project from (ADR-0004, ADR-0005), so it serializes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
     /// Its identity within the run.
@@ -114,7 +114,7 @@ pub struct Evidence {
     pub target: String,
     /// The force it applied.
     pub intensity: Intensity,
-    /// The observed value, neutral as a JSON value (Decision D).
+    /// The observed value, neutral as a JSON value (ADR-0004).
     pub observed: serde_json::Value,
     /// How much to trust the observation.
     pub confidence: Confidence,
@@ -124,7 +124,7 @@ pub struct Evidence {
     pub reproduction: Reproduction,
 }
 
-/// A run's evidence: append-only, the single source of truth (Decision D).
+/// A run's evidence: append-only, the single source of truth (ADR-0004).
 ///
 /// Append-only by construction. The only way to add a record is the
 /// crate-internal `append` (the runner's collection path), and there is no API to
@@ -132,7 +132,7 @@ pub struct Evidence {
 /// store built in process. This holds for a live store; it is not a claim about a
 /// store read back from JSON, whose ids are trusted as produced and not
 /// re-validated against their positions. It serializes so a run's evidence
-/// round-trips (Decision E).
+/// round-trips (ADR-0005).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceStore {
     records: Vec<Evidence>,
@@ -270,7 +270,7 @@ mod tests {
     }
 
     /// Guard: a record round-trips through JSON unchanged, so no field is dropped
-    /// from the canonical JSON Decision E treats as a published contract.
+    /// from the canonical JSON ADR-0005 treats as a published contract.
     /// Mutation: add `#[serde(skip)]` to any `Evidence` field -> the field is
     /// dropped on the way out, and on the way in the deserialize either fails (a
     /// field whose type has no `Default`, like `Intensity`) or round-trips to a
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(record, back);
     }
 
-    /// Guard: the whole store round-trips (Decision E projects it), so a run's
+    /// Guard: the whole store round-trips (ADR-0005 projects it), so a run's
     /// evidence survives serialization. Mutation: `#[serde(skip)]` on
     /// `EvidenceStore::records` -> the records are lost and the deserialize either
     /// fails or produces an empty store -> fails.
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(store, back);
     }
 
-    /// Guard: the record's exact JSON shape, the contract Decision E treats as
+    /// Guard: the record's exact JSON shape, the contract ADR-0005 treats as
     /// published. Round-trip alone cannot catch a renamed key or enum variant
     /// (the rename is symmetric), so this pins every key and the `Intensity` /
     /// `Confidence` variant spellings against a literal. It also exercises

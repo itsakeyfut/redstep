@@ -28,14 +28,14 @@ pub enum Error {
     },
 
     /// A `TestContext::check` assertion did not hold, stopping the test. `check`
-    /// is the bare-boolean channel; the oracle's `expect` (Decision J) is the
+    /// is the bare-boolean channel; the oracle's `expect` (ADR-0010) is the
     /// path for an assertion over an observation, with the confidence gate.
     #[error("check failed: {0}")]
     Check(String),
 
     /// A capability was run at an intensity that is not permitted. Only `Safe`
     /// is allowed yet; `Controlled` and `Aggressive` require the authorization
-    /// and isolation proof a later unit adds (See Decision F), not a different
+    /// and isolation proof a later unit adds (See ADR-0006), not a different
     /// build. Carried here, in the model error, because it names only
     /// `Intensity` (a model type), so the dependency still points downward.
     #[error(
@@ -47,7 +47,7 @@ pub enum Error {
     },
 
     /// The boundary self-check found a declared-forbidden path reachable: the
-    /// lab's isolation is broken, so the run must not proceed (Decision N step
+    /// lab's isolation is broken, so the run must not proceed (ADR-0011 step
     /// 4). Distinct from a test verdict and from `LabUnavailable` (which is the
     /// self-check being unable to certify isolation: a failed positive control,
     /// an undeterminable probe, or a backend error).
@@ -65,7 +65,7 @@ pub enum Error {
     /// Carries a stringified reason rather than the orchestration backend's error
     /// type, so the model error stays free of that layer (docs/rules/design.md
     /// section 2). Named for the failure, not the backend: a later provider
-    /// (Decision M) may not be Docker.
+    /// (ADR-0013) may not be Docker.
     #[error("lab unavailable: {reason}")]
     LabUnavailable {
         /// What went wrong, as reported by the orchestrator or the backend.
@@ -75,7 +75,7 @@ pub enum Error {
     /// An environment definition did not validate: a boundary or workload
     /// referenced an undeclared segment, the vantage segment was missing or
     /// undeclared, a name was duplicated, or a boundary carried a port-level
-    /// `allow` the membership-only MVP cannot enforce (see the Decision C MVP
+    /// `allow` the membership-only MVP cannot enforce (see the ADR-0003 MVP
     /// note settled in #17). The builder is the only way to obtain an
     /// `Environment`, so the bring-up unit reads a validated topology.
     #[error("invalid environment: {reason}")]

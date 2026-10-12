@@ -1,8 +1,8 @@
 //! The `#[security_test]` attribute macro.
 //!
 //! It keeps the annotated async function as written and registers it with the
-//! runner, so `redstep`'s runner can discover and execute it. See
-//! `docs/specs/design-decisions.md` Decision A.
+//! runner, so `redstep`'s runner can discover and execute it. See ADR-0001 in
+//! `docs/adr/`.
 
 use proc_macro::TokenStream;
 use quote::quote;

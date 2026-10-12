@@ -1,7 +1,7 @@
 //! redstep: author a security test as an async function, have it discovered and
 //! executed, and get a per-test result.
 //!
-//! This crate is the runner MVP (Decision A). A test is written as:
+//! This crate is the runner MVP (ADR-0001). A test is written as:
 //!
 //! ```ignore
 //! #[redstep::security_test]
@@ -13,9 +13,9 @@
 //! }
 //! ```
 //!
-//! The `Capability` trait (Decision B), the verdict oracle (Decision J) and the
-//! append-only evidence store (Decision D) exist here; the oracle's corroboration
-//! (Decision J) and the environment (Decision C) are later units, and this crate
+//! The `Capability` trait (ADR-0002), the verdict oracle (ADR-0010) and the
+//! append-only evidence store (ADR-0004) exist here; the oracle's corroboration
+//! (ADR-0010) and the environment (ADR-0003) are later units, and this crate
 //! leaves a named seam for each.
 
 // Lets the `#[security_test]` expansion, which refers to this crate as
@@ -38,7 +38,7 @@ mod orchestrator;
 // they are not a surface for a downstream crate to build on. See registry.rs.
 #[doc(hidden)]
 pub mod registry;
-/// The canonical JSON and its terminal renderer (Decision E, H-2).
+/// The canonical JSON and its terminal renderer (ADR-0005, ADR-0009).
 pub mod report;
 mod runner;
 mod scope;
