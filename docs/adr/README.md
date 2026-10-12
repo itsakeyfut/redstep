@@ -1,19 +1,15 @@
 # Architecture Decision Records
 
-redstep keeps its design rationale in two tiers. The high-level architecture
-decisions, the ones lettered A to V with their MVP notes, live in
-[`docs/specs/design-decisions.md`](../specs/design-decisions.md): what shape the
-system takes and why. The finer cross-cutting decisions, the ones an
-implementation makes that a later milestone is then written against, live here,
-one record each. The other documents in [`docs/`](../roadmap/roadmap.md) say what
-the project wants to build, and the doc comments in the code say what each type
-is and the local reason it is shaped that way. None of these repeats another's
-reasoning: they link.
+A cross-cutting design decision's rationale lives here, in one record each, and
+nowhere else. The documents in [`docs/`](../roadmap/roadmap.md) say what the
+project wants to build, and the doc comments in the code say what each type is
+and the local reason it is shaped that way. Neither repeats the reasoning: they
+link here.
 
-So a record here answers "why was this chosen, when, and what would reverse it"
-for a decision too fine-grained to be one of the lettered architecture decisions
-but too cross-cutting to live in a single doc comment. When a record refines one
-of the A to V decisions, it says which and links to it.
+These records began as the lettered decisions A to V (plus H-2 and the MVP scope)
+gathered in a single `docs/specs/design-decisions.md`. That file was retired and
+each decision became an ADR; the lettered references in the code and the docs now
+point at the record the decision became.
 
 These records are written in **English**, like the code they constrain, because
 they are read by contributors and tooling alike.
@@ -25,23 +21,24 @@ standard. Copy [`adr-template.md`](./adr-template.md) to start one.
 
 | # | Decision | Status | Confirmed by |
 |---|---|---|---|
+| [0001](./0001-write-security-tests-in-rust-and-attack-scenarios-in-a-dsl.md) | Write security tests in Rust and attack scenarios in a declarative DSL | accepted | the runner tests (exit code, classify) in `crates/redstep/src/runner.rs` and discovery in `tests/public_api.rs`; the DSL is Phase 3, confirmed by nothing yet |
+| [0002](./0002-unify-capabilities-behind-one-trait-gated-by-intensity.md) | Unify native primitives and tool adapters behind one Capability trait, gated by Intensity | accepted | the intensity-gate and classification tests in `context.rs` and `capability/tcp_connect.rs`, and the vantage probe in `orchestrator.rs` (Docker, CI leg); tool adapters are Phase 4 |
+| [0003](./0003-own-the-network-boundary-and-drive-docker-with-bollard.md) | Own the network boundary in the framework and drive Docker with bollard | accepted | environment validation in `environment.rs` and bring-up/teardown in `tests/environment.rs` (Docker, CI leg) |
+| [0004](./0004-record-evidence-as-an-append-only-fact-project-the-graph-from-it.md) | Record evidence as an append-only atomic fact, and project the attack graph from it | accepted | the JSON-shape, append-only, and id-resolution guards in `evidence.rs`, `context.rs`, and `tests/public_api.rs` |
+| [0005](./0005-render-every-report-from-one-canonical-json.md) | Render every report from one canonical JSON | accepted | the canonical-JSON, exit-code, and two-renderer guards in `report.rs` and `tests/public_api.rs` |
+| [0006](./0006-guarantee-safety-in-independent-layers.md) | Guarantee safety in independent layers, not one check | accepted | the scope near-miss and intensity-gate guards in `scope.rs`/`context.rs`, and the egress-less structural guard in `tests/environment.rs` (Docker, CI leg) |
 
-No records yet. redstep's cross-cutting decisions so far are the lettered ones in
-[`design-decisions.md`](../specs/design-decisions.md); the first finer decision
-that earns a record starts this log at `0001`.
+**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006 · proposed: none · superseded: none
 
-**By status**: accepted: none · proposed: none · superseded: none
-
-Records are numbered consecutively from `0001`.
+Records are numbered consecutively from `0001`. The remaining lettered decisions (G, H, L, M, O, U, K, P, Q, R, S, T, V) are being migrated under the parent tracking issue; until a record exists for each, the cutover that deletes `design-decisions.md` holds.
 
 ## Where each kind of writing belongs
 
 | Location | Holds | Does not hold |
 |---|---|---|
 | [`docs/*.md`](../roadmap/roadmap.md) (`specs/`, `roadmap/`, `research/`) | what the project wants to build: the concept, the safety and scope model, the architecture, the milestones | how a decision was reached. These are intent documents, not specifications, and a design may knowingly diverge from one. Say so in the record and update the document in the same change |
-| [`docs/specs/design-decisions.md`](../specs/design-decisions.md) | the high-level architecture decisions (A to V) and their MVP notes: the big cross-cutting choices the whole system rests on | a decision fine enough that it reads as one implementation's call rather than the system's shape; that is an ADR, which may link back to the letter it refines |
-| doc comments in the code | what a type is, how to use it, and the local reason it is shaped that way | cross-cutting rationale; link to the ADR or the lettered decision instead |
-| `docs/adr/**` | why a cross-cutting implementation decision was chosen, when, and what would reverse it | type or signature detail; link to the code |
+| doc comments in the code | what a type is, how to use it, and the local reason it is shaped that way | cross-cutting rationale; link to the ADR instead |
+| `docs/adr/**` | why a cross-cutting decision was chosen, when, and what would reverse it | type or signature detail; link to the code |
 
 ## When to write one
 
@@ -62,10 +59,8 @@ find out what it costs.
 * The code was knowingly left in a shape that looks wrong: a duplication kept on
   purpose, a slower path chosen for a reason, a guard that appears redundant.
   Without a record these are cleaned up by the next person to read them.
-* An existing decision is reversed. For a lettered architecture decision, that
-  supersession happens in place in `design-decisions.md`, with the reason; for an
-  ADR, write a new record, mark the old one `superseded by ADR-NNNN`, and note
-  what changed.
+* An existing decision is reversed: write a new record, mark the old one
+  `superseded by ADR-NNNN`, and note what changed.
 * A design knowingly diverges from a document in `docs/`: record why, and update
   that document in the same change.
 * You are about to write "undecided" into a doc comment: open one as `proposed`.
@@ -152,7 +147,5 @@ bar has slipped rather than a sign of progress.
 
 * [MADR 4.0](https://adr.github.io/madr/): the template this follows.
 * [`adr-template.md`](./adr-template.md): copy this to start a new record.
-* [`docs/specs/design-decisions.md`](../specs/design-decisions.md): the lettered
-  architecture decisions (A to V) an ADR refines or sits beneath.
 * [`CLAUDE.md`](../../CLAUDE.md): the failure-row model the trust trigger above
   refers to, and the house style these records follow.
