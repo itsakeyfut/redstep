@@ -8,7 +8,7 @@
 
 use crate::TestContext;
 use crate::error::Error;
-use crate::evidence::EvidenceStore;
+use crate::evidence::{EvidenceId, EvidenceStore};
 use crate::expectation::Judgement;
 use crate::registry;
 use crate::scope::Scope;
@@ -89,10 +89,23 @@ pub fn run(scope: Scope) -> std::result::Result<RunSummary, RunError> {
         // half-written.
         let result =
             std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on((test.run)(&ctx))));
-        let judgements = ctx.take_judgements();
+        let recorded = ctx.take_judgements();
+        // Append this test's drafts, then resolve each judgement's per-test
+        // reference to the run-scoped id the store just assigned. `base` is the
+        // id of this test's first draft, so a `DraftRef(i)` maps to
+        // `EvidenceId(base + i)` (issue #14).
+        let base = evidence.len();
         for draft in ctx.take_evidence_drafts() {
             evidence.append(draft, now_ms());
         }
+        let judgements: Vec<Judgement> = recorded
+            .into_iter()
+            .map(|(mut judgement, draft_ref)| {
+                judgement.evidence =
+                    draft_ref.map(|reference| EvidenceId((base + reference.index()) as u64));
+                judgement
+            })
+            .collect();
         let (verdict, error) = classify(result, &judgements);
         runs.push(TestRun {
             name: test.name,
@@ -196,6 +209,7 @@ mod tests {
             expected: "x".to_owned(),
             actual: "y".to_owned(),
             confidence: Confidence::High,
+            evidence: None,
         }
     }
 

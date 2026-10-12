@@ -12,8 +12,9 @@
 //! is the oracle's judgement over an observation, and the same observation can be
 //! a `Pass` or a `Fail` depending on the expectation, so a verdict cannot live in
 //! the fact. Decision D's planned `result: Outcome` is retired here rather than
-//! renamed; the link from a judgement back to its evidence is a later step before
-//! reporting (Decision J's forward note), not this unit.
+//! renamed; the link from a judgement back to its evidence is built on top in #14
+//! (the [`DraftRef`] a judgement carries, resolved by the runner; see the
+//! Decision J note), not by this record itself.
 //!
 //! A capability cannot know the id or the timestamp of its own record, so it
 //! produces a pure [`EvidenceDraft`] and the store stamps both on append: the id
@@ -34,6 +35,27 @@ use crate::observation::Confidence;
 /// (Decision V) can pin a stable reference and tests can assert it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceId(pub u64);
+
+/// A per-test reference to a draft a capability produced, before the store mints
+/// its run-scoped [`EvidenceId`]. Opaque: only `run` creates one (the index into
+/// the test's draft sink) and only the runner resolves it, mapping it to the id
+/// the store assigned when it drained that test's drafts. It links a judgement to
+/// the evidence it rests on without the judgement having to know the run-scoped
+/// id, which is not assigned until drain time (issue #14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftRef(usize);
+
+impl DraftRef {
+    /// The index of this draft within its test, assigned by `run` as it records.
+    pub(crate) fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// The per-test index, which the runner offsets by the test's base id.
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// Enough to re-run the same action, which a success witness (Decision V) lifts
 /// out wholesale. It restates the capability and target (also on the [`Evidence`])

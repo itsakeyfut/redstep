@@ -167,6 +167,22 @@ async fn records_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
+/// A second evidence producer whose name sorts before `records_evidence_demo`,
+/// so it runs first and takes evidence id 0. That makes `records_evidence_demo`'s
+/// records start at a non-zero id, which is what lets a test tell the runner's
+/// per-test `base` offset from a bare index (issue #14): with no prior producer
+/// `base` is always 0 and dropping it changes nothing.
+#[security_test]
+async fn aaa_earlier_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
+    let recorded = ctx
+        .run(StubReachable {
+            target: "stub:earlier",
+        })
+        .await?;
+    ctx.expect(&recorded).to_be(true);
+    Ok(())
+}
+
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
@@ -242,12 +258,13 @@ fn run_passes_the_scope_to_tests() {
 
 /// Guard: a run collects every capability execution's evidence into the summary's
 /// store, in execution order, with run-scoped sequential ids and a real clock
-/// timestamp (Decision D). `records_evidence_demo` runs the capability twice and
-/// is the run's only evidence producer.
-/// Mutations caught: drop the `for draft in ctx.take_evidence()` loop in `run`
-/// -> store empty -> the length assert fails; `.rev()` or `.take(1)` the drain
-/// -> the order or the count fails; `append(draft, 0)` instead of `now_ms()`, or
-/// `now_ms` returning a constant or seconds -> the timestamp assert fails.
+/// timestamp (Decision D). Two demos produce evidence: `aaa_earlier_evidence_demo`
+/// (sorts first) once, then `records_evidence_demo` twice, so the store holds
+/// `earlier`, `alpha`, `beta` at ids 0, 1, 2.
+/// Mutations caught: drop the collection loop in `run` -> store empty -> the
+/// length assert fails; `.rev()` or `.take(1)` the drain -> the order or the
+/// count fails; `append(draft, 0)` instead of `now_ms()`, or `now_ms` returning a
+/// constant or seconds -> the timestamp assert fails.
 #[test]
 fn run_collects_evidence_into_the_store() {
     let summary = run(Scope::default()).expect("the runtime starts");
@@ -259,13 +276,15 @@ fn run_collects_evidence_into_the_store() {
         .filter(|e| e.capability == "stub_reachable")
         .collect();
 
-    assert_eq!(records.len(), 2, "both executions were collected");
-    // Run-scoped sequential ids in execution order (this demo is the only
-    // producer, so its records are ids 0 and 1).
-    assert_eq!(records[0].id, redstep::EvidenceId(0));
-    assert_eq!(records[1].id, redstep::EvidenceId(1));
-    assert_eq!(records[0].target, "stub:alpha");
-    assert_eq!(records[1].target, "stub:beta");
+    let targets: Vec<&str> = records.iter().map(|e| e.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        ["stub:earlier", "stub:alpha", "stub:beta"],
+        "all three executions collected in execution order"
+    );
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record.id, redstep::EvidenceId(index as u64));
+    }
     assert_eq!(records[0].observed, serde_json::Value::Bool(true));
     // The runner stamps a real wall clock, not a constant or seconds: this is
     // well past 2020-09 in epoch milliseconds (and far above any seconds value).
@@ -273,6 +292,65 @@ fn run_collects_evidence_into_the_store() {
         records[0].recorded_at_ms > 1_600_000_000_000,
         "recorded_at_ms must be real epoch milliseconds, got {}",
         records[0].recorded_at_ms
+    );
+}
+
+/// Guard: a judgement from `expect` over a capability's result resolves, through
+/// its `evidence` id, to the record that capability produced, in order and in the
+/// right test; a `check` judgement carries no id (issue #14).
+/// `aaa_earlier_evidence_demo` runs first and takes id 0, so `records_evidence_demo`'s
+/// records start at id 1: its judgements must resolve to ids 1 and 2
+/// (`stub:alpha`, `stub:beta`), not 0 and 1. That makes the runner's per-test
+/// `base` offset load-bearing.
+/// Mutations caught: drop `base` in the remap (`EvidenceId(index)`) -> the second
+/// demo's first judgement resolves to id 0 (`stub:earlier`, another test's
+/// record) -> the `stub:alpha` assert fails; an index off-by-one or reversal ->
+/// the wrong target -> fails; make `Recorded` carry no reference, or `check` carry
+/// one -> the counts or the `check` assert fail.
+#[test]
+fn run_links_judgements_to_their_evidence() {
+    let summary = run(Scope::default()).expect("the runtime starts");
+
+    let resolve = |id: redstep::EvidenceId| {
+        summary
+            .evidence
+            .records()
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap_or_else(|| panic!("evidence id {id:?} does not resolve"))
+    };
+    let links = |suffix: &str| -> Vec<redstep::EvidenceId> {
+        summary
+            .runs
+            .iter()
+            .find(|r| r.name.ends_with(suffix))
+            .unwrap_or_else(|| panic!("test {suffix} was not discovered"))
+            .judgements
+            .iter()
+            .filter_map(|j| j.evidence)
+            .collect()
+    };
+
+    // The earlier producer's judgement links to its own record (id 0).
+    let earlier = links("::aaa_earlier_evidence_demo");
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(resolve(earlier[0]).target, "stub:earlier");
+
+    // The later producer's two judgements link to its own records, at a non-zero
+    // base (ids 1 and 2), not to the earlier test's record.
+    let later = links("::records_evidence_demo");
+    assert_eq!(later.len(), 2, "both judgements link to their evidence");
+    assert!(
+        later[0] != redstep::EvidenceId(0),
+        "the later test's link must carry the per-test base, not start at 0"
+    );
+    assert_eq!(resolve(later[0]).target, "stub:alpha");
+    assert_eq!(resolve(later[1]).target, "stub:beta");
+
+    // A check links to nothing.
+    assert!(
+        links("::tautology_demo").is_empty(),
+        "a check judgement links to no evidence"
     );
 }
 

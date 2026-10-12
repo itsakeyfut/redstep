@@ -9,6 +9,7 @@
 
 use std::fmt::Debug;
 
+use crate::evidence::EvidenceId;
 use crate::observation::{Confidence, Observation};
 use crate::verdict::Verdict;
 
@@ -55,6 +56,12 @@ pub struct Judgement {
     pub actual: String,
     /// The confidence of the observation.
     pub confidence: Confidence,
+    /// The evidence record this judgement rests on, or `None` for a bare `check`
+    /// or a hand-built observation that came from no capability. `judge` leaves it
+    /// `None`: it is pure and cannot know the run-scoped id, which the store does
+    /// not assign until the runner drains the test's drafts (Decision J, issue
+    /// #14). The runner fills it from the per-test reference the test carried.
+    pub evidence: Option<EvidenceId>,
 }
 
 /// Compare an observation against an expectation.
@@ -78,6 +85,9 @@ pub fn judge<T: PartialEq + Debug>(
         expected: format!("{:?}", expectation.expected),
         actual: format!("{:?}", observation.value),
         confidence: observation.confidence,
+        // The link is attached at the `ExpectationBuilder` seam and resolved by
+        // the runner, not here (Decision J): `judge` is pure and id-blind.
+        evidence: None,
     }
 }
 
@@ -164,7 +174,10 @@ mod tests {
     }
 
     /// Guard: the judgement records the expected and actual values for the
-    /// report. Mutation: swap `expected` and `actual` in `judge` -> fails.
+    /// report, and `judge` leaves `evidence` unresolved (`None`): it is pure and
+    /// cannot know the run-scoped id, which the runner fills (issue #14).
+    /// Mutation: swap `expected` and `actual` in `judge` -> fails; set
+    /// `evidence: Some(..)` in `judge` -> the `evidence` assert fails.
     #[test]
     fn judgement_carries_expected_and_actual() {
         let judgement = judge(
@@ -174,5 +187,6 @@ mod tests {
         assert_eq!(judgement.expected, "false");
         assert_eq!(judgement.actual, "true");
         assert_eq!(judgement.confidence, Confidence::High);
+        assert_eq!(judgement.evidence, None);
     }
 }

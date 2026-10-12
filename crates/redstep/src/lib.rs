@@ -7,8 +7,8 @@
 //! #[redstep::security_test]
 //! async fn db_is_unreachable(ctx: &redstep::TestContext) -> redstep::Result<()> {
 //!     let target = ctx.resolve("db:5432")?;
-//!     let observation = ctx.run(redstep::TcpConnect::new(target)).await?;
-//!     ctx.expect(&observation).to_be(false); // require High confidence by default
+//!     let recorded = ctx.run(redstep::TcpConnect::new(target)).await?;
+//!     ctx.expect(&recorded).to_be(false); // require High confidence by default
 //!     Ok(())
 //! }
 //! ```
@@ -41,9 +41,9 @@ mod scope;
 mod verdict;
 
 pub use capability::{Capability, TcpConnect};
-pub use context::{ExpectationBuilder, TestContext};
+pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
 pub use error::{Error, Result};
-pub use evidence::{Evidence, EvidenceDraft, EvidenceId, EvidenceStore, Reproduction};
+pub use evidence::{DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore, Reproduction};
 pub use expectation::{Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};

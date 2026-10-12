@@ -1,11 +1,13 @@
 //! The entry point a security test is handed.
 //!
 //! It holds the scope and offers resolution, a bare assertion (`check`),
-//! running a capability (`run`), and declaring an expectation over an
-//! observation (`expect`, the oracle entry). It records each expectation's
-//! [`Judgement`] and each capability execution's [`EvidenceDraft`] in two
-//! interior-mutable sinks the runner drains per test; a capability *registry*
-//! (the plugin side of Decision B) is still later.
+//! running a capability (`run`, which returns a [`Recorded`]), and declaring an
+//! expectation over an observation (`expect`, the oracle entry). It records each
+//! expectation's [`Judgement`] and each capability execution's [`EvidenceDraft`]
+//! in two interior-mutable sinks the runner drains per test; expecting over a
+//! `Recorded` carries a reference to that execution's draft into the judgement,
+//! which the runner resolves to an evidence id (issue #14). A capability
+//! *registry* (the plugin side of Decision B) is still later.
 //!
 //! A test holds `&TestContext` (the `#[security_test]` signature and
 //! `registry::TestFn` both take a shared reference), so the sinks record
@@ -20,7 +22,7 @@ use std::fmt::Debug;
 
 use crate::capability::Capability;
 use crate::error::{Error, Result};
-use crate::evidence::EvidenceDraft;
+use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
@@ -30,7 +32,13 @@ use crate::verdict::Verdict;
 /// What a `#[security_test]` receives: `async fn NAME(ctx: &TestContext) -> redstep::Result<()>`.
 pub struct TestContext {
     scope: Scope,
-    judgements: RefCell<Vec<Judgement>>,
+    /// Each recorded judgement with the per-test reference to the evidence it
+    /// judged, if any. The reference sits *beside* the `Judgement` rather than in
+    /// it because `Judgement.evidence` is a run-scoped [`EvidenceId`](crate::EvidenceId)
+    /// the store does not assign until the runner drains the drafts; the runner
+    /// resolves this per-test reference to that id then (issue #14). A bare
+    /// `check` carries `None`.
+    judgements: RefCell<Vec<(Judgement, Option<DraftRef>)>>,
     evidence_drafts: RefCell<Vec<EvidenceDraft>>,
 }
 
@@ -65,12 +73,17 @@ impl TestContext {
         } else {
             Verdict::Fail
         };
-        self.record(Judgement {
-            verdict,
-            expected: "condition holds".to_owned(),
-            actual: message.to_owned(),
-            confidence: Confidence::High,
-        });
+        self.record(
+            Judgement {
+                verdict,
+                expected: "condition holds".to_owned(),
+                actual: message.to_owned(),
+                confidence: Confidence::High,
+                evidence: None,
+            },
+            // A bare check came from no capability, so it rests on no evidence.
+            None,
+        );
         if condition {
             Ok(())
         } else {
@@ -83,27 +96,38 @@ impl TestContext {
     /// test's verdict), and returns the [`Verdict`]. The body continues, so
     /// several expectations accumulate (See Decision J).
     ///
+    /// Accepts both what [`run`](Self::run) returns ([`Recorded`], which links the
+    /// judgement to its evidence) and a bare [`Observation`] (a hand-built or
+    /// non-capability signal, which links to nothing), through the [`Expectable`]
+    /// seam. The evidence reference rides on `Recorded`, not on the pure
+    /// `Observation` (Decision J, issue #14). A `Recorded` must be judged on the
+    /// same context that produced it; see [`Recorded`].
+    ///
     /// ```ignore
-    /// let verdict = ctx.expect(&observation).to_be(false);                      // requires High by default
-    /// let verdict = ctx.expect(&observation).min_confidence(Confidence::Low).to_be(false);  // opt down
+    /// let recorded = ctx.run(capability).await?;
+    /// let verdict = ctx.expect(&recorded).to_be(false);                      // requires High by default
+    /// let verdict = ctx.expect(&recorded).min_confidence(Confidence::Low).to_be(false);  // opt down
     /// ```
-    pub fn expect<'a, T>(&'a self, observation: &'a Observation<T>) -> ExpectationBuilder<'a, T> {
+    pub fn expect<'a, T, S: Expectable<T>>(&'a self, subject: &'a S) -> ExpectationBuilder<'a, T> {
         ExpectationBuilder {
             ctx: self,
-            observation,
+            observation: subject.observation(),
+            draft_ref: subject.draft_ref(),
             min_confidence: Confidence::High,
         }
     }
 
-    /// Record a judgement in the sink. Borrow, push, drop: no await is held
-    /// across the borrow.
-    fn record(&self, judgement: Judgement) {
-        self.judgements.borrow_mut().push(judgement);
+    /// Record a judgement, with the per-test reference to the evidence it judged
+    /// (if any), in the sink. Borrow, push, drop: no await is held across the
+    /// borrow.
+    fn record(&self, judgement: Judgement, draft_ref: Option<DraftRef>) {
+        self.judgements.borrow_mut().push((judgement, draft_ref));
     }
 
-    /// Drain the judgements recorded during one test. The runner calls this
-    /// after the test body to aggregate them into the verdict.
-    pub(crate) fn take_judgements(&self) -> Vec<Judgement> {
+    /// Drain the judgements recorded during one test, each with its per-test
+    /// evidence reference. The runner calls this after the test body to aggregate
+    /// them into the verdict and resolve the reference to an `EvidenceId`.
+    pub(crate) fn take_judgements(&self) -> Vec<(Judgement, Option<DraftRef>)> {
         std::mem::take(&mut self.judgements.borrow_mut())
     }
 
@@ -116,37 +140,120 @@ impl TestContext {
         std::mem::take(&mut self.evidence_drafts.borrow_mut())
     }
 
-    /// Run a capability and return its observation, recording one evidence draft.
+    /// Run a capability and return its [`Recorded`] result, recording one
+    /// evidence draft.
     ///
     /// This is the intended invocation path: it checks the intensity as a value
     /// and refuses anything but `Safe`, because the authorization and isolation
     /// proof the higher rungs require are not built yet (See Decision F). The
     /// check lives here rather than in the type system: `Capability::execute` is
     /// a public trait method a hand-written capability could call directly, so
-    /// the gate is a runtime check this one place holds. Making it unbypassable
-    /// (sealing the trait, a crate-private `execute`) is scheduled before the
-    /// first non-Safe capability lands.
+    /// the gate is a runtime check this one place holds. Making the `Capability`
+    /// trait unbypassable (sealing it, a crate-private `execute`) is scheduled
+    /// before the first non-Safe capability lands.
     ///
-    /// On a successful execution the capability's [`EvidenceDraft`] is recorded
-    /// in the evidence sink; the runner drains it and the store assigns the id
-    /// (Decision D), so `run` returns the observation the test asserts on, not the
-    /// draft. An `execute` that errors records nothing, because the draft is the
-    /// product of a completed action. The shipped
+    /// On a successful execution the capability's [`EvidenceDraft`] is recorded in
+    /// the evidence sink and `run` returns a [`Recorded`] that carries the
+    /// observation the test asserts on and a per-test reference to that draft.
+    /// Passing the `Recorded` to [`expect`](Self::expect) links the resulting
+    /// judgement to the evidence; the runner resolves the reference to an
+    /// [`EvidenceId`](crate::EvidenceId) when it drains the drafts into the store
+    /// (Decision D, issue #14). An `execute` that errors records nothing, because
+    /// the draft is the product of a completed action. The shipped
     /// [`TcpConnect`](crate::TcpConnect) holds a [`ScopedTarget`] (only the
     /// resolver produces one), so for it the scope gate is type-enforced; the
     /// trait does not require that of every capability, so that guarantee is
     /// per-capability, not trait-wide.
-    pub async fn run<C: Capability>(&self, capability: C) -> Result<Observation<C::Value>> {
+    pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
         if capability.intensity() != Intensity::Safe {
             return Err(Error::IntensityRefused {
                 got: capability.intensity(),
             });
         }
         let (observation, draft) = capability.execute().await?;
-        // Borrow / push / drop, with no await across the borrow.
-        self.evidence_drafts.borrow_mut().push(draft);
-        Ok(observation)
+        // Borrow / push / drop, with no await across the borrow. The draft's
+        // per-test index is its position in the sink, which the runner offsets by
+        // the test's base id to resolve the run-scoped `EvidenceId`.
+        let draft_ref = {
+            let mut drafts = self.evidence_drafts.borrow_mut();
+            let index = drafts.len();
+            drafts.push(draft);
+            DraftRef::new(index)
+        };
+        Ok(Recorded {
+            observation,
+            draft_ref,
+        })
     }
+}
+
+/// What [`TestContext::run`] returns: the capability's [`Observation`] and a
+/// per-test reference to the evidence it produced. Passing it to
+/// [`expect`](TestContext::expect) links the judgement to that evidence
+/// automatically.
+///
+/// The reference is a field here rather than on [`Observation`] because putting
+/// it there would force a hand-built observation, `judge`'s input, and the
+/// `Observation` a `Capability` returns to all carry a link they cannot fill, and
+/// would make `execute`'s observation meaningless until `run` rewrote it. So the
+/// observation stays a plain signal and only a capability's result carries a link
+/// (Decision J, issue #14). Only `run` constructs one.
+///
+/// The reference is a per-test index (see [`DraftRef`]), so a
+/// `Recorded` is only meaningful to the context that produced it. Judging one on
+/// a different `TestContext` would resolve the index against the wrong test's
+/// drafts; the runner hands each test exactly one context, so the honest path
+/// cannot hit this, and hardening it against deliberate misuse is left for when a
+/// second context per test is a real pattern.
+pub struct Recorded<T> {
+    /// The signal the capability observed.
+    pub observation: Observation<T>,
+    draft_ref: DraftRef,
+}
+
+/// The input [`expect`](TestContext::expect) accepts: a [`Recorded`] result,
+/// which links its judgement to evidence, or a bare [`Observation`], which does
+/// not. It is the pre-judgement input, not a judged result (that is
+/// [`Judgement`]).
+///
+/// Sealed: the only implementors are these two. A foreign implementor could
+/// return an arbitrary [`DraftRef`] from `draft_ref`, which the runner would
+/// resolve to some unrelated record, so the seam is closed rather than offered as
+/// an extension point. Callers pass `&Recorded` or `&Observation` and never name
+/// this trait.
+pub trait Expectable<T>: sealed::Sealed {
+    /// The observation to judge.
+    fn observation(&self) -> &Observation<T>;
+    /// The per-test reference to the evidence the observation came from, if any.
+    fn draft_ref(&self) -> Option<DraftRef>;
+}
+
+impl<T> Expectable<T> for Observation<T> {
+    fn observation(&self) -> &Observation<T> {
+        self
+    }
+    fn draft_ref(&self) -> Option<DraftRef> {
+        None
+    }
+}
+
+impl<T> Expectable<T> for Recorded<T> {
+    fn observation(&self) -> &Observation<T> {
+        &self.observation
+    }
+    fn draft_ref(&self) -> Option<DraftRef> {
+        Some(self.draft_ref)
+    }
+}
+
+// A private module, so the `Sealed` supertrait cannot be named or implemented
+// outside this crate: that is what seals `Expectable`.
+mod sealed {
+    use crate::observation::Observation;
+
+    pub trait Sealed {}
+    impl<T> Sealed for Observation<T> {}
+    impl<T> Sealed for super::Recorded<T> {}
 }
 
 /// Builds an expectation over an observation and judges it. Returned by
@@ -161,6 +268,7 @@ impl TestContext {
 pub struct ExpectationBuilder<'a, T> {
     ctx: &'a TestContext,
     observation: &'a Observation<T>,
+    draft_ref: Option<DraftRef>,
     min_confidence: Confidence,
 }
 
@@ -171,13 +279,14 @@ impl<'a, T: PartialEq + Debug> ExpectationBuilder<'a, T> {
         self
     }
 
-    /// Expect the observed value to be `expected`. Judges, records the
-    /// judgement, and returns the verdict.
+    /// Expect the observed value to be `expected`. Judges, records the judgement
+    /// with the reference to the evidence it judged (if the observation came from
+    /// a capability), and returns the verdict.
     pub fn to_be(self, expected: T) -> Verdict {
         let expectation = Expectation::to_be(expected).min_confidence(self.min_confidence);
         let judgement = judge(self.observation, &expectation);
         let verdict = judgement.verdict;
-        self.ctx.record(judgement);
+        self.ctx.record(judgement, self.draft_ref);
         verdict
     }
 }
@@ -297,18 +406,18 @@ mod tests {
         }
     }
 
-    /// Guard: a Safe capability is run and its observation is returned. Mutation:
-    /// make `run` refuse Safe too -> this fails.
+    /// Guard: a Safe capability is run and its observation is returned in the
+    /// `Observed` result. Mutation: make `run` refuse Safe too -> this fails.
     #[test]
     fn safe_capability_runs() {
         let ctx = TestContext::new(Scope::default());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime builds");
-        let observation = runtime
+        let recorded = runtime
             .block_on(ctx.run(AlwaysReachable))
             .expect("a Safe capability runs");
-        assert!(observation.value);
+        assert!(recorded.observation.value);
     }
 
     /// Guard: `run` records exactly one evidence draft per execution, mirroring
@@ -332,5 +441,51 @@ mod tests {
         assert_eq!(drafts[0].observed, serde_json::Value::Bool(true));
         // Drained, not left behind: a second drain is empty.
         assert!(ctx.take_evidence_drafts().is_empty());
+    }
+
+    /// Guard: expecting over a capability's `Observed` result carries the per-test
+    /// reference to its draft into the recorded judgement, while a bare
+    /// `Observation` and a `check` carry none. Mutation: make `Observed`'s
+    /// `Judged::evidence` return `None` -> the run's judgement loses its reference
+    /// -> fails; make `Observation`'s return `Some(..)`, or make `check` record a
+    /// reference -> a link appears where there is no evidence -> fails. This is
+    /// the link at the `ExpectationBuilder` seam, before the runner resolves it.
+    #[test]
+    fn expect_over_a_run_links_the_judgement_to_its_draft() {
+        let ctx = TestContext::new(Scope::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+
+        let recorded = runtime
+            .block_on(ctx.run(AlwaysReachable))
+            .expect("a Safe capability runs");
+        ctx.expect(&recorded).to_be(true);
+        // A hand-built observation came from no capability.
+        let raw = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        ctx.expect(&raw).to_be(true);
+        ctx.check(true, "holds").expect("the check passes");
+
+        let pairs = ctx.take_judgements();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(
+            pairs[0].1.map(|r| r.index()),
+            Some(0),
+            "the run's judgement references its draft"
+        );
+        assert_eq!(pairs[1].1, None, "a raw observation references no evidence");
+        assert_eq!(pairs[2].1, None, "a check references no evidence");
+        // The `Judgement.evidence` field itself is None until the runner resolves
+        // it: judge and check both leave it None, and only the runner fills it.
+        // Mutation: set `evidence: Some(..)` in judge or check -> fails here.
+        assert!(
+            pairs
+                .iter()
+                .all(|(judgement, _)| judgement.evidence.is_none()),
+            "the recorded Judgement.evidence is unresolved until the runner fills it"
+        );
     }
 }

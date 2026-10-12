@@ -35,12 +35,12 @@ fn tcp_connect_open_port_observes_reachable() {
     let ctx = TestContext::new(scope);
     let target = ctx.resolve(&spec).expect("in scope");
 
-    let observation = runtime()
+    let recorded = runtime()
         .block_on(ctx.run(TcpConnect::new(target)))
         .expect("the capability runs");
 
-    assert!(observation.value, "a bound port is reachable");
-    assert_eq!(observation.confidence, Confidence::High);
+    assert!(recorded.observation.value, "a bound port is reachable");
+    assert_eq!(recorded.observation.confidence, Confidence::High);
 }
 
 /// Guard: a port with no listener observes unreachable (High, a refusal).
@@ -57,10 +57,10 @@ fn tcp_connect_closed_port_observes_unreachable() {
     let ctx = TestContext::new(scope);
     let target = ctx.resolve(&spec).expect("in scope");
 
-    let observation = runtime()
+    let recorded = runtime()
         .block_on(ctx.run(TcpConnect::new(target)))
         .expect("the capability runs");
 
-    assert!(!observation.value, "a closed port is unreachable");
-    assert_eq!(observation.confidence, Confidence::High);
+    assert!(!recorded.observation.value, "a closed port is unreachable");
+    assert_eq!(recorded.observation.confidence, Confidence::High);
 }
