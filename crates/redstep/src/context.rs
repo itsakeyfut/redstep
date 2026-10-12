@@ -497,20 +497,31 @@ mod tests {
     }
 
     /// Guard: a failing `check` records a `Fail` judgement carrying a FAIL
-    /// diagnostic (Decision H-2); the built-in check produces it. Mutation: make
-    /// `check` leave `diagnostic` `None` on failure -> this fails.
+    /// diagnostic whose cause names the assertion, and a passing `check` carries
+    /// none (Decision H-2; the built-in check produces it, on failure only).
+    /// Mutation: leave `diagnostic` `None` on failure -> the failing assert fails;
+    /// fill it unconditionally -> the passing assert fails; drop the message from
+    /// the cause -> the content assert fails.
     #[test]
     fn check_failure_carries_a_diagnostic() {
         let ctx = TestContext::new(Scope::default());
         let _ = ctx.check(false, "the boundary must hold");
+        ctx.check(true, "a tautology").expect("the check passes");
 
         let pairs = ctx.take_judgements();
-        let (judgement, _) = &pairs[0];
-        assert_eq!(judgement.verdict, Verdict::Fail);
-        let diagnostic = judgement
+        let (failed, _) = &pairs[0];
+        assert_eq!(failed.verdict, Verdict::Fail);
+        let diagnostic = failed
             .diagnostic
             .as_ref()
             .expect("a failing check carries a diagnostic");
         assert!(diagnostic.probable_cause.contains("the boundary must hold"));
+
+        let (passed, _) = &pairs[1];
+        assert_eq!(passed.verdict, Verdict::Pass);
+        assert!(
+            passed.diagnostic.is_none(),
+            "a passing check carries no diagnostic"
+        );
     }
 }

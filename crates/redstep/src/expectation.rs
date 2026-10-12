@@ -84,7 +84,9 @@ pub struct Judgement {
 ///
 /// A signal below the required confidence is `Inconclusive`, whatever its value,
 /// so a weak signal cannot read as a confident `Pass` or `Fail`. Otherwise a
-/// value that matches the expectation is a `Pass`, and a mismatch is a `Fail`.
+/// value that matches the expectation is a `Pass`, and a mismatch is a `Fail`. A
+/// `Fail` also carries a generic [`Diagnostic`] (Decision H-2, produced by the
+/// check); a `Pass` or `Inconclusive` carries none.
 pub fn judge<T: PartialEq + Debug>(
     observation: &Observation<T>,
     expectation: &Expectation<T>,
@@ -221,10 +223,13 @@ mod tests {
         assert_eq!(judgement.evidence, None);
     }
 
-    /// Guard: the built-in value check produces a FAIL diagnostic and none
-    /// otherwise (Decision H-2, produced by the check not the author). Mutation:
-    /// make `judge` leave `diagnostic` `None` on a `Fail` -> the FAIL expect
-    /// fails; set it on a Pass -> the Pass assert fails.
+    /// Guard: the built-in value check produces a FAIL diagnostic and none on a
+    /// Pass or an Inconclusive (Decision H-2, produced by the check not the
+    /// author), and the cause names both the observed and the expected value.
+    /// Mutation: leave `diagnostic` `None` on a `Fail` -> the FAIL expect fails;
+    /// widen it to `!= Pass` -> the Inconclusive assert fails; set it on a Pass ->
+    /// the Pass assert fails; swap the `{actual}`/`{expected}` placeholders -> the
+    /// cause-content assert fails.
     #[test]
     fn fail_judge_produces_a_diagnostic() {
         let fail = judge(
@@ -232,7 +237,12 @@ mod tests {
             &Expectation::to_be(false),
         );
         let diagnostic = fail.diagnostic.expect("a FAIL carries a diagnostic");
-        assert!(!diagnostic.probable_cause.is_empty());
+        assert!(
+            diagnostic.probable_cause.contains("true")
+                && diagnostic.probable_cause.contains("false"),
+            "the cause names the observed and the expected value, got {:?}",
+            diagnostic.probable_cause
+        );
         assert!(!diagnostic.remediation.is_empty());
 
         let pass = judge(
@@ -240,5 +250,13 @@ mod tests {
             &Expectation::to_be(false),
         );
         assert!(pass.diagnostic.is_none(), "a PASS carries no diagnostic");
+
+        // Low confidence under the default High gate is Inconclusive, not Fail.
+        let inconclusive = judge(&observed(true, Confidence::Low), &Expectation::to_be(false));
+        assert_eq!(inconclusive.verdict, Verdict::Inconclusive);
+        assert!(
+            inconclusive.diagnostic.is_none(),
+            "an Inconclusive carries no diagnostic"
+        );
     }
 }
