@@ -4,47 +4,101 @@
 //!
 //! The environment/network layer (docs/rules/design.md section 2): this is the
 //! only module that uses bollard, and it depends on the pure [`Environment`]
-//! model. Each segment becomes one Docker network created `internal: true`, so
-//! nothing in the lab has a route to the internet or to production
-//! (docs/rules/security.md section 1). Each workload becomes a container
-//! attached to its segment's network *only* (via `network_mode`, never the
-//! default bridge, which would re-add egress). Teardown removes everything, and
-//! [`RunningLab`]'s `Drop` is a best-effort backstop so an interrupted or
-//! panicking run does not leak a network or a container for a later run to
-//! inherit.
+//! model. Each segment becomes one Docker network created `internal: true`
+//! (every segment, the vantage's included), so nothing in the lab has a route to
+//! the internet or to production (docs/rules/security.md section 1). Each
+//! workload becomes a container attached to its segment's network *only* (never
+//! the default bridge, which would re-add egress), aliased by its workload name
+//! so a scope-resolved host like `db` is reachable in the lab by that name.
 //!
-//! The boundary self-check that gates test execution (Decision N step 4) is a
-//! later unit (#19) built on [`RunningLab`]; this unit stands the lab up and
-//! proves, in its integration test, that an internal segment has no egress.
+//! The MVP realises the membership-only model (Decision N): a boundary is
+//! separate networks with no connection between them, and a non-empty `allow` is
+//! refused upstream, so no cross-segment path is wired here; the firewall
+//! gateway for port-level boundaries is Phase 4 / M3.
+//!
+//! This unit stands the lab up and tears it down. It runs no attack and makes no
+//! verdict. That the egress-less flag is set is checked here (the integration
+//! test inspects it); that a forbidden path is actually blocked at run time is
+//! the boundary self-check (Decision N step 4), a later unit (#19) built on
+//! [`RunningLab`].
+
+use std::collections::HashMap;
 
 use bollard::Docker;
-use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
+use bollard::models::{
+    ContainerCreateBody, EndpointSettings, NetworkCreateRequest, NetworkingConfig,
+};
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
 use crate::environment::Environment;
 use crate::error::{Error, Result};
 
-/// A running lab: the Docker networks and containers a [`bring_up`] created,
-/// held by name so [`teardown`](RunningLab::teardown) can remove exactly them.
+/// A segment's Docker network, paired with the segment it was built from so a
+/// later unit (#19's boundary self-check) can map a segment to its network
+/// without reparsing the name.
+#[derive(Debug, Clone)]
+pub struct LabNetwork {
+    segment: String,
+    name: String,
+}
+
+impl LabNetwork {
+    /// The segment this network stands for.
+    pub fn segment(&self) -> &str {
+        &self.segment
+    }
+
+    /// The Docker network name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A workload's Docker container, paired with the workload and segment it was
+/// built from so a later unit can find a named workload's container and its
+/// segment without reparsing the name.
+#[derive(Debug, Clone)]
+pub struct LabContainer {
+    workload: String,
+    segment: String,
+    name: String,
+}
+
+impl LabContainer {
+    /// The workload this container stands for.
+    pub fn workload(&self) -> &str {
+        &self.workload
+    }
+
+    /// The segment the workload sits in.
+    pub fn segment(&self) -> &str {
+        &self.segment
+    }
+
+    /// The Docker container name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A running lab: the Docker networks and containers a [`bring_up`] created.
 ///
 /// The normal path is the explicit async [`teardown`](RunningLab::teardown).
-/// `Drop` is the backstop: if teardown was not called (an early return, a
-/// panic), it removes what it can on a short-lived runtime and warns on failure,
-/// never panicking. A leaked network or container is a resource leak, not a
-/// scope escape (the networks are egress-less), but teardown is not optional
-/// (docs/rules/security.md section 1).
+/// `Drop` is the backstop for a forgotten teardown or a panic: it removes what
+/// it can and warns, never panicking. A leaked network or container is a
+/// resource leak, not a scope escape (the networks are egress-less), but
+/// teardown is not optional (docs/rules/security.md section 1).
 pub struct RunningLab {
     docker: Docker,
-    /// Created network names, for teardown.
-    networks: Vec<String>,
-    /// Created container names, for teardown.
-    containers: Vec<String>,
+    networks: Vec<LabNetwork>,
+    containers: Vec<LabContainer>,
     torn_down: bool,
 }
 
-/// A short, process-unique tag so concurrent or repeated runs do not collide and
-/// teardown targets exactly this run's objects.
-fn run_tag() -> String {
+/// A short, process-unique tag so repeated runs do not collide and teardown
+/// targets exactly this run's objects. Unique within a process via the counter;
+/// unlikely to collide across processes via the time and pid mix.
+fn run_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -59,10 +113,20 @@ fn run_tag() -> String {
     )
 }
 
-fn orchestration(err: impl std::fmt::Display) -> Error {
-    Error::Orchestration {
+fn lab_unavailable(err: impl std::fmt::Display) -> Error {
+    Error::LabUnavailable {
         reason: err.to_string(),
     }
+}
+
+/// The network name for a segment in this run.
+fn network_name(run_id: &str, segment: &str) -> String {
+    format!("{run_id}-net-{segment}")
+}
+
+/// The container name for a workload in this run.
+fn container_name(run_id: &str, workload: &str) -> String {
+    format!("{run_id}-{workload}")
 }
 
 /// Bring `env` up: one egress-less network per segment, then each workload as a
@@ -70,7 +134,7 @@ fn orchestration(err: impl std::fmt::Display) -> Error {
 /// controls the connection. On any failure, what was already created is torn
 /// down before returning, so a partial lab never leaks.
 pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> {
-    let tag = run_tag();
+    let run_id = run_id();
     let mut lab = RunningLab {
         docker: docker.clone(),
         networks: Vec::new(),
@@ -78,30 +142,28 @@ pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> 
         torn_down: false,
     };
 
-    match build(docker, env, &tag, &mut lab).await {
+    match provision(docker, env, &run_id, &mut lab).await {
         Ok(()) => Ok(lab),
         Err(e) => {
-            // Tear down the partial lab before surfacing the error.
-            let _ = lab.teardown_inner().await;
+            // Tear down the partial lab before surfacing the error; report a
+            // cleanup failure rather than hiding it under the original error.
+            if let Err(cleanup) = remove_all(docker, &lab.containers, &lab.networks).await {
+                eprintln!("redstep: cleanup after a failed bring-up also failed: {cleanup}");
+            }
             lab.torn_down = true;
             Err(e)
         }
     }
 }
 
-/// The network name for a segment in this run.
-fn network_name(tag: &str, segment: &str) -> String {
-    format!("{tag}-net-{segment}")
-}
-
-/// The container name for a workload in this run.
-fn container_name(tag: &str, workload: &str) -> String {
-    format!("{tag}-{workload}")
-}
-
-async fn build(docker: &Docker, env: &Environment, tag: &str, lab: &mut RunningLab) -> Result<()> {
+async fn provision(
+    docker: &Docker,
+    env: &Environment,
+    run_id: &str,
+    lab: &mut RunningLab,
+) -> Result<()> {
     for segment in env.segments() {
-        let name = network_name(tag, segment.name());
+        let name = network_name(run_id, segment.name());
         docker
             .create_network(NetworkCreateRequest {
                 name: name.clone(),
@@ -109,13 +171,24 @@ async fn build(docker: &Docker, env: &Environment, tag: &str, lab: &mut RunningL
                 ..Default::default()
             })
             .await
-            .map_err(orchestration)?;
-        lab.networks.push(name);
+            .map_err(lab_unavailable)?;
+        lab.networks.push(LabNetwork {
+            segment: segment.name().to_owned(),
+            name,
+        });
     }
 
     for workload in env.workloads() {
-        let cname = container_name(tag, workload.name());
-        let net = network_name(tag, workload.segment());
+        let cname = container_name(run_id, workload.name());
+        let net = network_name(run_id, workload.segment());
+        // Attach to the segment network ONLY, via networking_config (so the
+        // container is not also on the default bridge, which would re-add
+        // egress), aliased by the workload name so `db` resolves in the lab.
+        let endpoint = EndpointSettings {
+            aliases: Some(vec![workload.name().to_owned()]),
+            ..Default::default()
+        };
+        let endpoints = HashMap::from([(net, endpoint)]);
         docker
             .create_container(
                 Some(CreateContainerOptions {
@@ -126,76 +199,81 @@ async fn build(docker: &Docker, env: &Environment, tag: &str, lab: &mut RunningL
                     image: Some(workload.image().to_owned()),
                     // Keep a stand-in alive so it is inspectable as attached.
                     cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
-                    host_config: Some(HostConfig {
-                        // Attach to the segment network ONLY. network_mode
-                        // replaces the default bridge, so the container gets no
-                        // egress path (security.md section 1).
-                        network_mode: Some(net),
-                        ..Default::default()
+                    networking_config: Some(NetworkingConfig {
+                        endpoints_config: Some(endpoints),
                     }),
                     ..Default::default()
                 },
             )
             .await
-            .map_err(orchestration)?;
-        lab.containers.push(cname.clone());
+            .map_err(lab_unavailable)?;
+        lab.containers.push(LabContainer {
+            workload: workload.name().to_owned(),
+            segment: workload.segment().to_owned(),
+            name: cname.clone(),
+        });
         docker
             .start_container(
                 &cname,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(orchestration)?;
+            .map_err(lab_unavailable)?;
     }
 
     Ok(())
 }
 
+/// Remove every listed container (forced) then every listed network, best
+/// effort: keep going past a failure and return the first error, if any.
+async fn remove_all(
+    docker: &Docker,
+    containers: &[LabContainer],
+    networks: &[LabNetwork],
+) -> Result<()> {
+    let mut first_err: Option<Error> = None;
+    for c in containers {
+        if let Err(e) = docker
+            .remove_container(
+                c.name(),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            first_err.get_or_insert_with(|| lab_unavailable(e));
+        }
+    }
+    for n in networks {
+        if let Err(e) = docker.remove_network(n.name()).await {
+            first_err.get_or_insert_with(|| lab_unavailable(e));
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 impl RunningLab {
-    /// The names of the networks this lab created, one per segment.
-    pub fn networks(&self) -> &[String] {
+    /// The networks this lab created, one per segment.
+    pub fn networks(&self) -> &[LabNetwork] {
         &self.networks
     }
 
-    /// The names of the containers this lab created, one per workload.
-    pub fn containers(&self) -> &[String] {
+    /// The containers this lab created, one per workload.
+    pub fn containers(&self) -> &[LabContainer] {
         &self.containers
     }
 
     /// Remove every container and network this lab created. The normal,
     /// error-surfacing teardown path.
     pub async fn teardown(mut self) -> Result<()> {
-        let result = self.teardown_inner().await;
+        let result = remove_all(&self.docker, &self.containers, &self.networks).await;
         self.torn_down = true;
         result
-    }
-
-    async fn teardown_inner(&mut self) -> Result<()> {
-        let mut first_err: Option<Error> = None;
-        for name in &self.containers {
-            if let Err(e) = self
-                .docker
-                .remove_container(
-                    name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
-                first_err.get_or_insert_with(|| orchestration(e));
-            }
-        }
-        for name in &self.networks {
-            if let Err(e) = self.docker.remove_network(name).await {
-                first_err.get_or_insert_with(|| orchestration(e));
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
     }
 }
 
@@ -204,28 +282,60 @@ impl Drop for RunningLab {
         if self.torn_down {
             return;
         }
-        // Best-effort backstop for a forgotten teardown or a panic. Drop cannot
-        // be async, and blocking inside an active runtime panics, so run the
-        // removal on a fresh current-thread runtime and swallow any failure: a
-        // leak is better than a panic in Drop.
-        let built = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        match built {
-            Ok(rt) => {
-                if rt.block_on(self.teardown_inner()).is_err() {
-                    eprintln!(
-                        "redstep: lab teardown backstop could not remove every object; \
-                         some Docker networks or containers may remain"
-                    );
-                }
-            }
-            Err(_) => {
-                eprintln!(
-                    "redstep: lab teardown backstop could not start a runtime; \
-                     some Docker networks or containers may remain"
-                );
-            }
+        // Backstop for a forgotten teardown or a panic. Drop cannot be async,
+        // and `block_on` panics when it runs on a thread that is already inside
+        // a runtime (the common case: a `?`/panic/cancel between `bring_up` and
+        // an explicit teardown). So run the removal on a dedicated thread, which
+        // has no ambient runtime, and join it. Best effort: warn, never panic.
+        let docker = self.docker.clone();
+        let containers = std::mem::take(&mut self.containers);
+        let networks = std::mem::take(&mut self.networks);
+        let ok = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return false;
+            };
+            rt.block_on(remove_all(&docker, &containers, &networks))
+                .is_ok()
+        })
+        .join()
+        .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "redstep: lab teardown backstop could not remove every object; \
+                 some Docker networks or containers may remain"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard: dropping a `RunningLab` without calling `teardown`, from inside an
+    /// active tokio runtime, does not panic (the backstop runs on a dedicated
+    /// thread). Mutation: replace the `std::thread::spawn(...).join()` with a
+    /// direct `block_on` on a fresh runtime -> this panics with "Cannot start a
+    /// runtime from within a runtime" -> the test fails. The connection is lazy
+    /// and the lab is empty, so no Docker daemon is needed.
+    #[test]
+    fn drop_without_teardown_does_not_panic_inside_a_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+            let lab = RunningLab {
+                docker,
+                networks: Vec::new(),
+                containers: Vec::new(),
+                torn_down: false,
+            };
+            drop(lab);
+        });
     }
 }

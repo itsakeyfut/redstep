@@ -46,12 +46,14 @@ pub enum Error {
         got: crate::intensity::Intensity,
     },
 
-    /// The lab could not be brought up or torn down with Docker. Carries a
-    /// stringified reason rather than a `bollard` error, so the model error stays
-    /// free of the orchestration layer's types (docs/rules/design.md section 2).
-    #[error("orchestration failed: {reason}")]
-    Orchestration {
-        /// What went wrong, as reported by the Docker client.
+    /// The lab could not be provisioned or torn down. Carries a stringified
+    /// reason rather than the orchestration backend's error type, so the model
+    /// error stays free of that layer (docs/rules/design.md section 2). Named for
+    /// the failure, not the backend: a later provider (Decision M) may not be
+    /// Docker.
+    #[error("lab unavailable: {reason}")]
+    LabUnavailable {
+        /// What went wrong, as reported by the orchestration backend.
         reason: String,
     },
 
