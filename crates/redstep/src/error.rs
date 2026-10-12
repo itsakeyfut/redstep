@@ -45,6 +45,16 @@ pub enum Error {
         /// The intensity the capability reported.
         got: crate::intensity::Intensity,
     },
+
+    /// A lab definition did not validate: a boundary or workload referenced an
+    /// undeclared segment, the attacker's segment was missing or undeclared, or a
+    /// name was duplicated (See Decision C). Reported by `Lab`'s builder before
+    /// anything is stood up, so an invalid topology never reaches bollard.
+    #[error("invalid lab: {reason}")]
+    InvalidLab {
+        /// What was wrong with the topology.
+        reason: String,
+    },
 }
 
 /// The result type carried through a security test.
