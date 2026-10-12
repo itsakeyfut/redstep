@@ -120,6 +120,14 @@ environment:
 
 **未決(今後詰める)**: 環境定義フォーマットの詳細(DSL / A の Attack Scenario DSL との統合)、compose サービスを引き取りつつ独自ネットワーク定義を無視する統合ロジック、境界(firewall / routing)を Docker ネットワーク上でどう実装するか(iptables / 独立ネットワーク + ゲートウェイ等)、VPN 境界の表現方法。
 
+**MVP implementation note (settled in #17)**: the lab definition model is a pure, validated value, built in code. The bring-up (#18), the boundary self-check (#19), and scope resolution (#20) read it.
+
+- The `environment` module holds `Segment`, `Workload { name, image, segment }`, `Boundary { from, to, allow }`, and `Environment`, built through `Environment::builder()` (valid by construction, like `Scope::builder`). `allow` is the raw `workload:port` specs (this sketch's shape), held as given; parsing and enforcing them belongs to the firewall gateway (Decision N) in a later unit.
+- `build` validates references (every boundary and workload segment, and the vantage segment, is declared; names are unique) and returns `Error::InvalidEnvironment` otherwise, so the bring-up unit reads a validated topology.
+- The model refuses a non-empty `allow` fail-closed: the membership-only MVP (Decision N) cannot enforce a port-level permission, and this project's off-scale rule says the lab must not be able to *express* an unenforceable opening, rather than leaving the refusal to two downstream units. The `allow` field and accessor stay for the firewall gateway (Decision N, M3) that will enforce it; until then every boundary's `allow` is empty. (This reverses the #17 design comment, which accepted a non-empty `allow` and deferred the refusal to the enforcement layer; the review moved it into the model.)
+- The YAML/DSL *definition format* above is deferred (M2); the MVP constructs the environment in code. `image` is a plain reference (Decision C's `compose(...)` source is deferred).
+- The MVP topology the later units build: segments `internet`/`internal`; workloads `web`/`api`/`db` in `internal`; the vantage in `internet`; boundary `internet -> internal` with an empty `allow`.
+
 ---
 
 ### Decision D — Evidence & Attack Path: Layered(確定)
