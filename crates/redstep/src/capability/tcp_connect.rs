@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use crate::capability::{Authorized, Capability};
+use crate::capability::{Capability, IntensityCleared};
 use crate::evidence::{EvidenceDraft, Reproduction};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
@@ -78,7 +78,7 @@ impl Capability for TcpConnect {
 
     async fn execute(
         &self,
-        _authorized: Authorized,
+        _authorized: IntensityCleared,
     ) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
         let target = format!("{}:{}", self.target.host(), self.target.port());
         let dial = target.clone();
@@ -379,7 +379,7 @@ mod tests {
         let (observation, draft) = rt
             .block_on(
                 TcpConnect::new(target)
-                    .execute(Authorized::issue(Intensity::Safe).expect("Safe is authorized")),
+                    .execute(IntensityCleared::issue(Intensity::Safe).expect("Safe is authorized")),
             )
             .expect("the capability runs");
 

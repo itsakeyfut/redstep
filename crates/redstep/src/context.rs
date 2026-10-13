@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use bollard::Docker;
 
-use crate::capability::{Authorized, Capability};
+use crate::capability::{Capability, IntensityCleared};
 use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
@@ -192,14 +192,16 @@ impl TestContext {
     /// Run a capability and return its [`Recorded`] result, recording one
     /// evidence draft.
     ///
-    /// This is the one place that mints the gate token: it calls
-    /// `Authorized::issue`, which refuses anything but `Safe` (the
-    /// authorization and isolation proof the higher rungs require are not built
-    /// yet, See ADR-0006), and the resulting [`Authorized`] is what
-    /// `Capability::execute` requires. Because the token's only constructor is
-    /// that gate and `execute` cannot be reached without one, the intensity gate
-    /// is compiler-held, not a convention this call site happens to keep (#9).
-    /// The trait is sealed besides, so no external capability exists to bypass it.
+    /// This is the gate seam: it calls `IntensityCleared::issue`, which refuses
+    /// anything but `Safe` (the authorization and isolation proof the higher
+    /// rungs require are not built yet, See ADR-0006), and the resulting
+    /// [`IntensityCleared`] is what `Capability::execute` requires. `execute`
+    /// cannot be reached without a token, and nothing outside the crate can mint
+    /// one or implement a capability, so the gate is compiler-held against
+    /// external code. In-crate, that `run` mints the token from the capability's
+    /// *own* intensity is this seam's convention, not a compiler fact (the token
+    /// is not bound to the capability); it is guarded by the refusal tests below,
+    /// and binding it is deferred to the first non-`Safe` capability (#9).
     ///
     /// On a successful execution the capability's [`EvidenceDraft`] is recorded in
     /// the evidence sink and `run` returns a [`Recorded`] that carries the
@@ -226,7 +228,7 @@ impl TestContext {
     pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
         // The gate: `issue` mints the token only for a `Safe` capability, and
         // `execute` cannot be called without it.
-        let authorized = Authorized::issue(capability.intensity())?;
+        let authorized = IntensityCleared::issue(capability.intensity())?;
         let (observation, draft) = capability.execute(authorized).await?;
         let draft_ref = self.record_draft(draft);
         Ok(Recorded {
@@ -253,7 +255,12 @@ impl TestContext {
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound (a
     /// host run): there is no vantage to act from. Generalizing to "run any
     /// capability from the vantage" waits on the M3 tool adapters, which shape the
-    /// in-container seam (one capability in the MVP, as in #27).
+    /// in-container seam (one capability in the MVP, as in #27). That seam does
+    /// not go through the [`run`](Self::run) intensity gate (it mints no
+    /// [`IntensityCleared`]); it is `Safe` by
+    /// construction today (busybox `nc`), but it is the path where M3's
+    /// Controlled/Aggressive adapters will live, so M3 must require the gate token
+    /// here too (#9's deferred full-gate work).
     ///
     /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
     /// against this context's own `scope`: a target's scope provenance is not yet
@@ -421,7 +428,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _authorized: Authorized,
+            _authorized: IntensityCleared,
         ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
@@ -444,7 +451,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _authorized: Authorized,
+            _authorized: IntensityCleared,
         ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
@@ -501,7 +508,7 @@ mod tests {
         }
         async fn execute(
             &self,
-            _authorized: Authorized,
+            _authorized: IntensityCleared,
         ) -> Result<(Observation<bool>, EvidenceDraft)> {
             Ok((
                 Observation {

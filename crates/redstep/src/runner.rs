@@ -491,14 +491,19 @@ mod tests {
 /// Capability-driven evidence collection and judgement linking, exercised through
 /// the public `run` path. These were external-crate tests (`tests/public_api.rs`)
 /// until the `Capability` trait was sealed (#9): an external crate can no longer
-/// implement it, so a stub capability that drives `run` must live in-crate. The
-/// run-level pub surface (`run`, `TestContext`, evidence access) is still proven
-/// external by `public_api_items_are_reachable`; these prove the runner's
-/// behaviour, which does not depend on the external path.
+/// implement it, so a stub capability that drives `run` must live in-crate.
+///
+/// One thing the move genuinely gives up: there is no longer any test that an
+/// external crate can drive `run` with its *own* capability, because by design it
+/// now cannot (the trait is sealed). That is intended, not an oversight. What
+/// stays externally proven is only the reachability of the run-level items
+/// (`run`, `Scope`, `TestContext`, `resolve`) by `public_api_items_are_reachable`;
+/// the evidence accessors and this capability-driven behaviour are proven here,
+/// in-crate.
 #[cfg(test)]
-mod evidence_integration_tests {
+mod run_evidence_tests {
     use super::run;
-    use crate::capability::{Authorized, Capability};
+    use crate::capability::{Capability, IntensityCleared};
     use crate::evidence::{EvidenceDraft, EvidenceId, Reproduction};
     use crate::intensity::Intensity;
     use crate::observation::{Confidence, Observation};
@@ -528,7 +533,7 @@ mod evidence_integration_tests {
 
         async fn execute(
             &self,
-            _authorized: Authorized,
+            _authorized: IntensityCleared,
         ) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
             Ok((
                 Observation {
@@ -614,8 +619,12 @@ mod evidence_integration_tests {
             ["stub:earlier", "stub:alpha", "stub:beta"],
             "all three executions collected in execution order"
         );
+        // Ids are sequential, asserted relative to the first stub_reachable record
+        // rather than anchored at 0: another evidence-producing lib test that sorts
+        // earlier would shift the absolute ids, and that is not what this guards.
+        let EvidenceId(base) = records[0].id;
         for (index, record) in records.iter().enumerate() {
-            assert_eq!(record.id, EvidenceId(index as u64));
+            assert_eq!(record.id, EvidenceId(base + index as u64));
         }
         assert_eq!(records[0].observed, serde_json::Value::Bool(true));
         // The runner stamps a real wall clock, not a constant or seconds: this is
