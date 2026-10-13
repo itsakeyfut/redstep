@@ -46,10 +46,10 @@ use std::time::Duration;
 use crate::capability::tcp_connect::{ConnectOutcome, classify_connect, connect_summary};
 use crate::environment::Environment;
 use crate::error::{Error, Result};
-use crate::evidence::{EvidenceDraft, Reproduction};
+use crate::evidence::{EvidenceDraft, NodeRef, Reproduction};
 use crate::intensity::Intensity;
 use crate::observation::Observation;
-use crate::scope::ScopedTarget;
+use crate::scope::{Scope, ScopedTarget};
 
 /// A segment's Docker network, paired with the segment it was built from so the
 /// boundary self-check (and later units) can map a segment to its network
@@ -591,8 +591,10 @@ fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
 ///
 /// The observation reuses `tcp_connect`'s classification (a completed connect is
 /// reachable at `High`; a failure is unreachable at `Low`, because busybox `nc`
-/// cannot prove the port closed), so the native and vantage paths agree on what a
-/// connect means. The confidence still differs by path in the one way that
+/// cannot prove the port closed), so the native and vantage paths agree on the
+/// reachability value a connect means. The confidence still differs by path (a
+/// refused port is `High` unreachable natively but `Low` from the vantage) in
+/// the one way that
 /// matters: a `Low` "unreachable" from a single vantage connect cannot by itself
 /// certify that a boundary held (the oracle's default `High` keeps it out of a
 /// confident PASS); that certification is [`boundary_self_check`]'s job, with its
@@ -601,10 +603,12 @@ fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
 /// mistake an in-lab vantage probe for a host-run connect. An abnormal probe is
 /// `Error::LabUnavailable`, fail-closed.
 ///
-/// The recorded reproduction is minimal and not yet a faithful replay witness
-/// (ADR-0004's `source` node and ADR-0022's pinned replay are a follow-up):
-/// it records the applied timeout and the vantage network, not the full lab the
-/// probe ran against.
+/// The draft carries a first-class `source` (ADR-0004's `NodeRef::Vantage`) and
+/// a reproduction faithful enough to replay: it records the stable vantage
+/// *segment*, not the run-scoped network name, so [`replay_vantage_probe`] can
+/// re-run it against a fresh lab (ADR-0022, #29). Image-digest and data-pack
+/// pinning stay deferred (ADR-0019, ADR-0018), so a replay reproduces against
+/// the same `Environment`, not across image drift.
 pub(crate) async fn tcp_reachable_from(
     docker: &Docker,
     vantage: &LabNetwork,
@@ -631,23 +635,154 @@ pub(crate) async fn tcp_reachable_from(
     let observation = classify_connect(outcome);
 
     let spec = format!("{host}:{port}");
-    let draft = EvidenceDraft {
+    let draft = vantage_draft(
+        vantage.segment(),
+        spec,
+        &observation,
+        connect_summary(outcome),
+        applied,
+    );
+    Ok((observation, draft))
+}
+
+/// Compose the evidence draft for a vantage probe. Pure, so the first-class
+/// `source` and the witness (the stable segment, not the run-scoped network
+/// name) are testable without Docker, which is why it is lifted out of
+/// [`tcp_reachable_from`]. The segment appears in both `source` (ADR-0004's
+/// `NodeRef`) and the reproduction params: ADR-0004 keeps the reproduction
+/// self-contained, the same reason `capability` and `target` sit on both.
+fn vantage_draft(
+    segment: &str,
+    target_spec: String,
+    observation: &Observation<bool>,
+    summary: &str,
+    applied: Duration,
+) -> EvidenceDraft {
+    EvidenceDraft {
         capability: "tcp_connect_vantage",
-        target: spec.clone(),
+        target: target_spec.clone(),
         intensity: Intensity::Safe,
         observed: serde_json::Value::Bool(observation.value),
         confidence: observation.confidence,
-        summary: connect_summary(outcome).to_owned(),
+        summary: summary.to_owned(),
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
         reproduction: Reproduction {
             capability: "tcp_connect_vantage".to_owned(),
-            target: spec,
+            target: target_spec,
             params: serde_json::json!({
                 "timeout_ms": applied.as_millis() as u64,
-                "vantage_network": vantage.name(),
+                "vantage_segment": segment,
             }),
         },
+    }
+}
+
+/// The env-independent replay inputs parsed from a vantage witness: the segment
+/// to probe from, the target, and the applied timeout. Pure and Docker-free, so
+/// "a witness missing a field cannot replay" is a guard that runs offline,
+/// before [`replay_vantage_probe`] stands a lab up. A missing or ill-typed field
+/// is `Error::InvalidTarget`, fail-closed: a witness that cannot be read cannot
+/// be replayed, and that is not a silent default (ADR-0022, #29).
+fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Duration)> {
+    let invalid = |reason: &str| Error::InvalidTarget {
+        spec: witness.target.clone(),
+        reason: reason.to_owned(),
     };
-    Ok((observation, draft))
+    if witness.target.is_empty() {
+        return Err(invalid("replay witness has an empty target"));
+    }
+    let segment = witness
+        .params
+        .get("vantage_segment")
+        .and_then(|v| v.as_str())
+        // Reject a blank or whitespace-only segment here, so the error blames the
+        // witness rather than leaking to `vantage_network` as a weaker
+        // "environment has no such segment".
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| invalid("replay witness has no vantage_segment"))?;
+    let timeout_ms = witness
+        .params
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
+    Ok((
+        segment.to_owned(),
+        witness.target.clone(),
+        Duration::from_millis(timeout_ms),
+    ))
+}
+
+/// Replay a vantage probe from its witness against `env`: the first piece of
+/// ADR-0022's pinned replay (#29). It reconstructs the exact probe the witness
+/// records, brings `env` up fresh, runs it from the recorded vantage segment,
+/// and returns the observation, so a caller can check it reproduces the original.
+///
+/// The witness is parsed before any Docker work, so a witness that cannot be
+/// replayed fails closed without standing a lab up. The target is re-resolved
+/// through the scope from `env` (so a replay cannot aim outside scope any more
+/// than the original could), and the lab is always torn down, mirroring
+/// [`run_in_lab`](crate::runner): a teardown failure warns but does not mask the
+/// observation.
+///
+/// The guarantee is narrower than byte-reproducibility: the same observation
+/// against the same `Environment`. Image-digest and data-pack pinning (ADR-0019,
+/// ADR-0018) are a later milestone, so image drift in `env` is not pinned here.
+/// Its only M1 caller is the replay guard; the auto-generation that calls it in
+/// a codified regression (ADR-0022, ADR-0015) is deferred.
+///
+/// Unlike [`run_in_running_lab`](crate::runner), replay deliberately does *not*
+/// run [`boundary_self_check`] before probing, even though ADR-0011 gates a test
+/// run on it. Replay reproduces one probe's observation; it does not re-certify
+/// the lab's boundaries, and it returns the raw `Observation` for a caller to
+/// compare, not a verdict. The `High` certification that a declared boundary
+/// holds stays with the self-check (ADR-0011), which a real run performs; a
+/// replayed observation carries only the probe's own confidence. The probe runs
+/// inside the egress-less lab regardless, so skipping the self-check cannot let
+/// traffic escape.
+// allow(dead_code): no M1 production caller. This is the first piece of
+// ADR-0022's pinned replay (#29); the codify step that calls it in a generated
+// regression is deferred, and the replay guard exercises it under `cfg(test)`,
+// which dead_code does not count.
+#[allow(dead_code)]
+pub(crate) async fn replay_vantage_probe(
+    docker: &Docker,
+    env: &Environment,
+    witness: &Reproduction,
+) -> Result<Observation<bool>> {
+    let (segment, target, timeout) = parse_vantage_witness(witness)?;
+    let scoped = Scope::from_environment(env).resolve(&target)?;
+
+    let lab = bring_up(docker, env).await?;
+    // Find the network, then probe; keep the result so teardown always runs,
+    // mirroring run_in_lab (a teardown failure warns, it does not mask the
+    // observation).
+    let probed = match vantage_network(&lab, &segment) {
+        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout)
+            .await
+            .map(|(observation, _draft)| observation),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = lab.teardown().await {
+        eprintln!("redstep: teardown after a replay also failed: {e}");
+    }
+    probed
+}
+
+/// The lab network for `segment`, or `Error::LabUnavailable` if the environment
+/// declares no such segment (fail-closed: a witness naming a segment the
+/// environment does not have cannot be replayed). Pure over a built lab (no
+/// Docker call), so the lookup and its fail-closed absence are testable offline.
+fn vantage_network<'a>(lab: &'a RunningLab, segment: &str) -> Result<&'a LabNetwork> {
+    lab.networks()
+        .iter()
+        .find(|n| n.segment() == segment)
+        .ok_or_else(|| Error::LabUnavailable {
+            reason: format!(
+                "environment declares no segment {segment:?} to replay the vantage from"
+            ),
+        })
 }
 
 impl RunningLab {
@@ -718,6 +853,7 @@ impl Drop for RunningLab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observation::Confidence;
 
     /// Guard: dropping a `RunningLab` without calling `teardown`, from inside an
     /// active tokio runtime, does not panic (the backstop runs on a dedicated
@@ -1185,21 +1321,306 @@ mod tests {
                 same.value,
                 "a listener on the probe's own network is reachable"
             );
-            // The draft marks itself a vantage probe and records the vantage
-            // network, so it is not mistaken for a native host-run tcp_connect.
+            // The draft marks itself a vantage probe, names its source as the
+            // vantage segment, and records that segment in the witness, so it is
+            // not mistaken for a native host-run tcp_connect and can be replayed.
             assert_eq!(same_draft.capability, "tcp_connect_vantage");
             assert_eq!(same_draft.target, spec);
             assert_eq!(
-                same_draft.reproduction.params["vantage_network"].as_str(),
-                Some(net_a.as_str()),
-                "the reproduction records which vantage the probe ran from"
+                same_draft.source,
+                Some(NodeRef::Vantage {
+                    segment: "a".to_owned()
+                }),
+                "the draft names its source as the vantage segment"
+            );
+            assert_eq!(
+                same_draft.reproduction.params["vantage_segment"].as_str(),
+                Some("a"),
+                "the reproduction records the stable segment the probe ran from"
+            );
+            // The evidence record must mirror the observation the probe returned,
+            // not a hard-coded value: the record feeds the report, the canonical
+            // JSON and the replay witness (ADR-0004), so a desynced record is a
+            // faithful-looking projection of a lie. This is the only guard (on
+            // the CI Docker leg) that `tcp_reachable_from` wires the real
+            // observation and the real segment into the draft; `vantage_draft`'s
+            // offline tests cannot see which values the caller passes it.
+            assert_eq!(
+                same_draft.observed,
+                serde_json::Value::Bool(same.value),
+                "the draft's observed mirrors the reachable observation"
+            );
+            assert_eq!(
+                same_draft.confidence, same.confidence,
+                "the draft's confidence mirrors the reachable observation"
             );
 
-            let (cross, _) = cross_net.expect("cross-network probe ran");
+            let (cross, cross_draft) = cross_net.expect("cross-network probe ran");
             assert!(
                 !cross.value,
                 "a listener whose name does not resolve on a different, isolated network is not reachable from the vantage"
             );
+            // The unreachable record must mirror its observation too (the decisive
+            // false/Low case): without this, a draft wired to a constant `true`
+            // would pass the same-net assertion above and go uncaught here.
+            assert_eq!(
+                cross_draft.observed,
+                serde_json::Value::Bool(cross.value),
+                "the draft's observed mirrors the unreachable observation"
+            );
+            assert_eq!(
+                cross_draft.confidence, cross.confidence,
+                "the draft's confidence mirrors the unreachable observation"
+            );
+        });
+    }
+
+    /// Guard: a vantage draft names its source as a structured `NodeRef::Vantage`
+    /// and records the stable segment (not the run-scoped network name) in the
+    /// witness, so a replay can reconstruct it. Pure, no Docker. Mutation: in
+    /// `vantage_draft` set `source: None`, or key the witness param
+    /// `vantage_network` with a run-scoped name instead of `vantage_segment` ->
+    /// the literal assertion fails (the Docker path only reaches one segment, so
+    /// it cannot catch a hard-coded one here).
+    #[test]
+    fn vantage_draft_names_its_source_and_witness() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = vantage_draft(
+            "internet",
+            "db:5432".to_owned(),
+            &observation,
+            "reachable",
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(draft.capability, "tcp_connect_vantage");
+        assert_eq!(
+            draft.source,
+            Some(NodeRef::Vantage {
+                segment: "internet".to_owned()
+            }),
+            "the draft names its source as the vantage segment"
+        );
+        assert_eq!(
+            draft.reproduction.params["vantage_segment"].as_str(),
+            Some("internet"),
+            "the witness records the stable segment, not the run-scoped network"
+        );
+        assert_eq!(draft.reproduction.params["timeout_ms"], 2_000);
+    }
+
+    /// Guard: the vantage draft mirrors the observation and the probed target
+    /// rather than hard-coding them, so the recorded evidence matches what the
+    /// probe actually saw. The sibling to `build_draft_mirrors_the_observation`
+    /// for the vantage path. It uses the decisive unreachable/`Low` case and a
+    /// distinctive summary and target, which the source/witness test above does
+    /// not, so a hard-coded value cannot pass as a mirrored one. Mutation: set
+    /// `observed` to a fixed `true`, `summary` to a constant, or `target` to a
+    /// constant in `vantage_draft` -> this fails (the Docker path asserts the
+    /// returned observation, not the draft's copy of it, so it cannot catch this).
+    #[test]
+    fn vantage_draft_mirrors_the_observation() {
+        let observation = Observation {
+            value: false,
+            confidence: Confidence::Low,
+        };
+        let draft = vantage_draft(
+            "internet",
+            "db:5432".to_owned(),
+            &observation,
+            "unreachable",
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(draft.target, "db:5432");
+        assert_eq!(draft.intensity, Intensity::Safe);
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.summary, "unreachable");
+        assert_eq!(draft.reproduction.capability, "tcp_connect_vantage");
+        assert_eq!(draft.reproduction.target, "db:5432");
+    }
+
+    /// Guard: a witness whose replay inputs cannot be read is rejected rather
+    /// than replayed with a default (a witness that cannot be read cannot be
+    /// replayed; ADR-0022). Covers a complete witness parsing, a missing
+    /// segment, a blank/whitespace segment, a wrong-typed segment, a missing
+    /// timeout, a wrong-typed timeout, and an empty target. Mutations, each
+    /// caught by one of the `is_err` assertions: delete `.filter(..trim..)` ->
+    /// the blank-segment case passes; replace the segment `.ok_or_else(..)?`
+    /// with `.unwrap_or("")` -> the missing/wrong-typed cases pass; drop the
+    /// `timeout_ms` `.ok_or_else(..)?` -> the missing/wrong-typed timeout cases
+    /// pass; drop the empty-target check -> the empty-target case passes.
+    #[test]
+    fn parse_vantage_witness_rejects_an_incomplete_witness() {
+        let complete = Reproduction {
+            capability: "tcp_connect_vantage".to_owned(),
+            target: "db:5432".to_owned(),
+            params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+        };
+        let (segment, target, timeout) =
+            parse_vantage_witness(&complete).expect("a complete witness parses");
+        assert_eq!(segment, "internet");
+        assert_eq!(target, "db:5432");
+        assert_eq!(timeout, Duration::from_millis(2_000));
+
+        // Each of these cannot be replayed and must error, not default.
+        let rejected = [
+            (
+                "no segment",
+                serde_json::json!({ "timeout_ms": 2_000 }),
+                "db:5432",
+            ),
+            (
+                "blank segment",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "   " }),
+                "db:5432",
+            ),
+            (
+                "numeric segment",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": 5 }),
+                "db:5432",
+            ),
+            (
+                "no timeout",
+                serde_json::json!({ "vantage_segment": "internet" }),
+                "db:5432",
+            ),
+            (
+                "string timeout",
+                serde_json::json!({ "timeout_ms": "2000", "vantage_segment": "internet" }),
+                "db:5432",
+            ),
+            (
+                "empty target",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+                "",
+            ),
+        ];
+        for (label, params, target) in rejected {
+            let witness = Reproduction {
+                capability: "tcp_connect_vantage".to_owned(),
+                target: target.to_owned(),
+                params,
+            };
+            assert!(
+                parse_vantage_witness(&witness).is_err(),
+                "a witness with {label} cannot be replayed"
+            );
+        }
+    }
+
+    /// Guard: the replay segment lookup returns the network for the *named*
+    /// segment, not merely the first, and fails closed when the environment
+    /// declares no such segment. Pure, no Docker (the fabricated lab is
+    /// `torn_down`). The networks are ordered so the wanted segment is not first.
+    /// Mutation: in `vantage_network`, replace the `find` with `networks().first()`
+    /// -> the `"internet"` lookup returns the `"internal"` network -> the segment
+    /// assertion fails; make the absent case default to the first network instead
+    /// of erroring -> the `is_err` assertion fails.
+    #[test]
+    fn vantage_network_finds_the_named_segment_or_fails_closed() {
+        let lab = lab(
+            vec![
+                net("internal", "net-internal"),
+                net("internet", "net-internet"),
+            ],
+            vec![],
+        );
+        let found = vantage_network(&lab, "internet").expect("the internet segment is present");
+        assert_eq!(
+            found.segment(),
+            "internet",
+            "the lookup returns the named segment's network, not the first"
+        );
+        assert!(
+            vantage_network(&lab, "dmz").is_err(),
+            "a segment the environment does not declare fails closed"
+        );
+    }
+
+    /// Guard: replay re-resolves the witness target through the scope gate
+    /// before standing a lab up, so a crafted witness naming a host outside the
+    /// environment's scope fails closed (`Error::OutOfScope`) with no Docker
+    /// work (ADR-0006). The witness target is attacker-influenced data read back
+    /// from a reproduction, so it must not be trusted verbatim. Runs offline
+    /// because the resolve precedes `bring_up`; the lazy `Docker` handle is never
+    /// used. Mutation: in `replay_vantage_probe`, resolve the target against a
+    /// witness-trusting scope (e.g. `Scope::builder().allow(&target)?.build()`)
+    /// instead of `Scope::from_environment(env)` -> `evil:1234` resolves ->
+    /// replay reaches `bring_up` and no longer returns `OutOfScope` -> this fails.
+    #[test]
+    fn replay_re_resolves_the_witness_target_through_scope() {
+        let env = mvp_env();
+        let witness = Reproduction {
+            capability: "tcp_connect_vantage".to_owned(),
+            target: "evil:1234".to_owned(),
+            params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+        };
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_vantage_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::OutOfScope { .. })),
+            "a witness target outside the env scope is refused before bring-up, got {result:?}"
+        );
+    }
+
+    /// Guard: a vantage probe recorded against the MVP lab replays from its
+    /// witness through the full pipeline (parse, bring-up, resolve, probe,
+    /// teardown) and agrees with the recording that `db` is unreachable from the
+    /// `internet` vantage (ADR-0022, #29). The witness is produced by the real
+    /// recorder, not hand-assembled. The name says "agrees on an unreachable
+    /// target", not "reproduces an observation": an all-unreachable MVP lab
+    /// cannot distinguish a reproduced `false` from a hard-coded one, so this
+    /// proves the pipeline runs end to end and does not disagree, while the
+    /// segment-selection and witness-shape mutations are carried by the offline
+    /// guards above. Mutation: break `parse_vantage_witness` so it rejects the
+    /// recorded witness, or `vantage_network` so the `internet` segment is not
+    /// found -> `replay` returns `Err` -> the `expect` panics -> this fails.
+    /// Docker-gated, self-skipping. RK-010: it asserts the reproduced
+    /// observation, not a global Docker object count.
+    #[test]
+    fn replay_vantage_probe_agrees_with_the_recording_on_an_unreachable_target() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping replay_vantage_probe_agrees_with_the_recording_on_an_unreachable_target: no Linux Docker daemon"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("internal")
+                .segment("internet")
+                .workload("db", PROBE_IMAGE, "internal")
+                .vantage("internet")
+                .boundary("internet", "internal", &[])
+                .build()
+                .expect("a valid environment");
+
+            // Record a real vantage probe: db is unreachable from the internet
+            // vantage (cross-segment, and the stand-in does not listen).
+            let lab = bring_up(&docker, &env).await.expect("bring up the lab");
+            let internet = vantage_network(&lab, "internet").expect("the internet network");
+            let scoped = Scope::from_environment(&env)
+                .resolve("db:5432")
+                .expect("db is in scope");
+            let (recorded, draft) =
+                tcp_reachable_from(&docker, internet, &scoped, Duration::from_secs(2))
+                    .await
+                    .expect("the probe ran");
+            lab.teardown().await.expect("teardown after recording");
+
+            // Replay from the recorded witness and check it reproduces.
+            let replayed = replay_vantage_probe(&docker, &env, &draft.reproduction)
+                .await
+                .expect("replay from the witness runs");
+            assert_eq!(
+                replayed.value, recorded.value,
+                "replaying the witness reproduces the recorded observation"
+            );
+            assert_eq!(replayed.confidence, recorded.confidence);
         });
     }
 }

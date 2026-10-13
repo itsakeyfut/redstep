@@ -272,6 +272,7 @@ mod tests {
                     observed: serde_json::Value::Bool(true),
                     confidence: Confidence::High,
                     summary: "reachable".to_owned(),
+                    source: None,
                     reproduction: Reproduction {
                         capability: "tcp_connect".to_owned(),
                         target: target.to_owned(),

@@ -505,6 +505,7 @@ mod tests {
                     observed: serde_json::Value::Bool(true),
                     confidence: Confidence::High,
                     summary: "reachable".to_owned(),
+                    source: None,
                     reproduction: crate::evidence::Reproduction {
                         capability: self.name().to_owned(),
                         target: "stub:0".to_owned(),

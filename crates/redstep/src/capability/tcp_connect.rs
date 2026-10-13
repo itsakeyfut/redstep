@@ -184,6 +184,9 @@ fn build_draft(
         observed: serde_json::Value::Bool(observation.value),
         confidence: observation.confidence,
         summary: connect_summary(outcome).to_owned(),
+        // No attack-graph source: this is a host-run connect, and the host is
+        // not a lab node (ADR-0004). The vantage path records one (#27, #29).
+        source: None,
         reproduction: Reproduction {
             capability: capability.to_owned(),
             target,
@@ -277,11 +280,12 @@ mod tests {
     /// Guard: the draft mirrors every field it is given, including on the
     /// decisive Indeterminate/Low path: `observed` tracks the value, `confidence`
     /// and `intensity` are copied not hard-coded, and the reproduction restates
-    /// the target and timeout. Passing `Intensity::Controlled` (a value TcpConnect
+    /// the target and timeout, and `source` is `None` (a host-run connect has no
+    /// attack-graph source). Passing `Intensity::Controlled` (a value TcpConnect
     /// never uses) proves the field is copied. Mutation: set `confidence` to a
-    /// fixed `High`, `intensity` to a fixed `Safe`, or hard-code `observed` ->
-    /// this fails (the integration tests only reach the reachable/High/Safe case,
-    /// so they cannot catch it).
+    /// fixed `High`, `intensity` to a fixed `Safe`, hard-code `observed`, or set
+    /// `source: Some(..)` -> this fails (the integration tests only reach the
+    /// reachable/High/Safe case, so they cannot catch it).
     #[test]
     fn build_draft_mirrors_the_observation() {
         let observation = Observation {
@@ -301,6 +305,7 @@ mod tests {
         assert_eq!(draft.intensity, Intensity::Controlled);
         assert_eq!(draft.observed, serde_json::Value::Bool(false));
         assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.source, None);
         assert_eq!(draft.reproduction.capability, "tcp_connect");
         assert_eq!(draft.reproduction.target, "web:80");
         assert_eq!(draft.reproduction.params["timeout_ms"], 250);
