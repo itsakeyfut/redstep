@@ -591,8 +591,10 @@ fn nc_result(state: &ContainerState) -> Result<ConnectOutcome> {
 ///
 /// The observation reuses `tcp_connect`'s classification (a completed connect is
 /// reachable at `High`; a failure is unreachable at `Low`, because busybox `nc`
-/// cannot prove the port closed), so the native and vantage paths agree on what a
-/// connect means. The confidence still differs by path in the one way that
+/// cannot prove the port closed), so the native and vantage paths agree on the
+/// reachability value a connect means. The confidence still differs by path (a
+/// refused port is `High` unreachable natively but `Low` from the vantage) in
+/// the one way that
 /// matters: a `Low` "unreachable" from a single vantage connect cannot by itself
 /// certify that a boundary held (the oracle's default `High` keeps it out of a
 /// confident PASS); that certification is [`boundary_self_check`]'s job, with its
@@ -683,9 +685,6 @@ fn vantage_draft(
 /// before [`replay_vantage_probe`] stands a lab up. A missing or ill-typed field
 /// is `Error::InvalidTarget`, fail-closed: a witness that cannot be read cannot
 /// be replayed, and that is not a silent default (ADR-0022, #29).
-// allow(dead_code): called only by `replay_vantage_probe` (see its note) and the
-// offline witness-parse guard.
-#[allow(dead_code)]
 fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Duration)> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: witness.target.clone(),
@@ -698,7 +697,10 @@ fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Dura
         .params
         .get("vantage_segment")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        // Reject a blank or whitespace-only segment here, so the error blames the
+        // witness rather than leaking to `vantage_network` as a weaker
+        // "environment has no such segment".
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| invalid("replay witness has no vantage_segment"))?;
     let timeout_ms = witness
         .params
@@ -762,9 +764,6 @@ pub(crate) async fn replay_vantage_probe(
 /// declares no such segment (fail-closed: a witness naming a segment the
 /// environment does not have cannot be replayed). Pure over a built lab (no
 /// Docker call), so the lookup and its fail-closed absence are testable offline.
-// allow(dead_code): called only by `replay_vantage_probe` (see its note) and the
-// offline segment-lookup guard.
-#[allow(dead_code)]
 fn vantage_network<'a>(lab: &'a RunningLab, segment: &str) -> Result<&'a LabNetwork> {
     lab.networks()
         .iter()
@@ -1329,11 +1328,39 @@ mod tests {
                 Some("a"),
                 "the reproduction records the stable segment the probe ran from"
             );
+            // The evidence record must mirror the observation the probe returned,
+            // not a hard-coded value: the record feeds the report, the canonical
+            // JSON and the replay witness (ADR-0004), so a desynced record is a
+            // faithful-looking projection of a lie. This is the only guard (on
+            // the CI Docker leg) that `tcp_reachable_from` wires the real
+            // observation and the real segment into the draft; `vantage_draft`'s
+            // offline tests cannot see which values the caller passes it.
+            assert_eq!(
+                same_draft.observed,
+                serde_json::Value::Bool(same.value),
+                "the draft's observed mirrors the reachable observation"
+            );
+            assert_eq!(
+                same_draft.confidence, same.confidence,
+                "the draft's confidence mirrors the reachable observation"
+            );
 
-            let (cross, _) = cross_net.expect("cross-network probe ran");
+            let (cross, cross_draft) = cross_net.expect("cross-network probe ran");
             assert!(
                 !cross.value,
                 "a listener whose name does not resolve on a different, isolated network is not reachable from the vantage"
+            );
+            // The unreachable record must mirror its observation too (the decisive
+            // false/Low case): without this, a draft wired to a constant `true`
+            // would pass the same-net assertion above and go uncaught here.
+            assert_eq!(
+                cross_draft.observed,
+                serde_json::Value::Bool(cross.value),
+                "the draft's observed mirrors the unreachable observation"
+            );
+            assert_eq!(
+                cross_draft.confidence, cross.confidence,
+                "the draft's confidence mirrors the unreachable observation"
             );
         });
     }
@@ -1405,13 +1432,16 @@ mod tests {
         assert_eq!(draft.reproduction.target, "db:5432");
     }
 
-    /// Guard: a witness missing any field needed to replay is rejected rather
+    /// Guard: a witness whose replay inputs cannot be read is rejected rather
     /// than replayed with a default (a witness that cannot be read cannot be
-    /// replayed; ADR-0022). Covers a missing segment, a missing timeout, and an
-    /// empty target, and a complete witness parsing. Mutation: in
-    /// `parse_vantage_witness`, default a missing `vantage_segment` to `""`
-    /// instead of erroring, or drop the empty-target check -> one of the
-    /// `is_err` assertions fails.
+    /// replayed; ADR-0022). Covers a complete witness parsing, a missing
+    /// segment, a blank/whitespace segment, a wrong-typed segment, a missing
+    /// timeout, a wrong-typed timeout, and an empty target. Mutations, each
+    /// caught by one of the `is_err` assertions: delete `.filter(..trim..)` ->
+    /// the blank-segment case passes; replace the segment `.ok_or_else(..)?`
+    /// with `.unwrap_or("")` -> the missing/wrong-typed cases pass; drop the
+    /// `timeout_ms` `.ok_or_else(..)?` -> the missing/wrong-typed timeout cases
+    /// pass; drop the empty-target check -> the empty-target case passes.
     #[test]
     fn parse_vantage_witness_rejects_an_incomplete_witness() {
         let complete = Reproduction {
@@ -1425,32 +1455,50 @@ mod tests {
         assert_eq!(target, "db:5432");
         assert_eq!(timeout, Duration::from_millis(2_000));
 
-        let no_segment = Reproduction {
-            params: serde_json::json!({ "timeout_ms": 2_000 }),
-            ..complete.clone()
-        };
-        assert!(
-            parse_vantage_witness(&no_segment).is_err(),
-            "a witness with no vantage_segment cannot be replayed"
-        );
-
-        let no_timeout = Reproduction {
-            params: serde_json::json!({ "vantage_segment": "internet" }),
-            ..complete.clone()
-        };
-        assert!(
-            parse_vantage_witness(&no_timeout).is_err(),
-            "a witness with no timeout_ms cannot be replayed"
-        );
-
-        let empty_target = Reproduction {
-            target: String::new(),
-            ..complete.clone()
-        };
-        assert!(
-            parse_vantage_witness(&empty_target).is_err(),
-            "a witness with no target cannot be replayed"
-        );
+        // Each of these cannot be replayed and must error, not default.
+        let rejected = [
+            (
+                "no segment",
+                serde_json::json!({ "timeout_ms": 2_000 }),
+                "db:5432",
+            ),
+            (
+                "blank segment",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "   " }),
+                "db:5432",
+            ),
+            (
+                "numeric segment",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": 5 }),
+                "db:5432",
+            ),
+            (
+                "no timeout",
+                serde_json::json!({ "vantage_segment": "internet" }),
+                "db:5432",
+            ),
+            (
+                "string timeout",
+                serde_json::json!({ "timeout_ms": "2000", "vantage_segment": "internet" }),
+                "db:5432",
+            ),
+            (
+                "empty target",
+                serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+                "",
+            ),
+        ];
+        for (label, params, target) in rejected {
+            let witness = Reproduction {
+                capability: "tcp_connect_vantage".to_owned(),
+                target: target.to_owned(),
+                params,
+            };
+            assert!(
+                parse_vantage_witness(&witness).is_err(),
+                "a witness with {label} cannot be replayed"
+            );
+        }
     }
 
     /// Guard: the replay segment lookup returns the network for the *named*
@@ -1482,22 +1530,51 @@ mod tests {
         );
     }
 
+    /// Guard: replay re-resolves the witness target through the scope gate
+    /// before standing a lab up, so a crafted witness naming a host outside the
+    /// environment's scope fails closed (`Error::OutOfScope`) with no Docker
+    /// work (ADR-0006). The witness target is attacker-influenced data read back
+    /// from a reproduction, so it must not be trusted verbatim. Runs offline
+    /// because the resolve precedes `bring_up`; the lazy `Docker` handle is never
+    /// used. Mutation: in `replay_vantage_probe`, resolve the target against a
+    /// witness-trusting scope (e.g. `Scope::builder().allow(&target)?.build()`)
+    /// instead of `Scope::from_environment(env)` -> `evil:1234` resolves ->
+    /// replay reaches `bring_up` and no longer returns `OutOfScope` -> this fails.
+    #[test]
+    fn replay_re_resolves_the_witness_target_through_scope() {
+        let env = mvp_env();
+        let witness = Reproduction {
+            capability: "tcp_connect_vantage".to_owned(),
+            target: "evil:1234".to_owned(),
+            params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+        };
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_vantage_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::OutOfScope { .. })),
+            "a witness target outside the env scope is refused before bring-up, got {result:?}"
+        );
+    }
+
     /// Guard: a vantage probe recorded against the MVP lab replays from its
     /// witness through the full pipeline (parse, bring-up, resolve, probe,
-    /// teardown) and reproduces the original observation (ADR-0022, #29). The
-    /// witness is produced by the real recorder, not hand-assembled. Mutation:
-    /// break `parse_vantage_witness` so it rejects the recorded witness, or
-    /// `vantage_network` so the `internet` segment is not found -> `replay`
-    /// returns `Err` -> the `expect` panics -> this fails. Docker-gated,
-    /// self-skipping; the segment-selection and witness-shape mutations are
-    /// carried by the offline guards above (an all-unreachable MVP lab cannot
-    /// distinguish a reproduced `false` from a hard-coded one). RK-010: it asserts
-    /// the reproduced observation, not a global Docker object count.
+    /// teardown) and agrees with the recording that `db` is unreachable from the
+    /// `internet` vantage (ADR-0022, #29). The witness is produced by the real
+    /// recorder, not hand-assembled. The name says "agrees on an unreachable
+    /// target", not "reproduces an observation": an all-unreachable MVP lab
+    /// cannot distinguish a reproduced `false` from a hard-coded one, so this
+    /// proves the pipeline runs end to end and does not disagree, while the
+    /// segment-selection and witness-shape mutations are carried by the offline
+    /// guards above. Mutation: break `parse_vantage_witness` so it rejects the
+    /// recorded witness, or `vantage_network` so the `internet` segment is not
+    /// found -> `replay` returns `Err` -> the `expect` panics -> this fails.
+    /// Docker-gated, self-skipping. RK-010: it asserts the reproduced
+    /// observation, not a global Docker object count.
     #[test]
-    fn replay_vantage_probe_reproduces_a_recorded_observation() {
+    fn replay_vantage_probe_agrees_with_the_recording_on_an_unreachable_target() {
         if !linux_docker_available() {
             eprintln!(
-                "skipping replay_vantage_probe_reproduces_a_recorded_observation: no Linux Docker daemon"
+                "skipping replay_vantage_probe_agrees_with_the_recording_on_an_unreachable_target: no Linux Docker daemon"
             );
             return;
         }
