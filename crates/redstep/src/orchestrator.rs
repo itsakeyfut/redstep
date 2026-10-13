@@ -44,7 +44,7 @@ use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 use std::time::Duration;
 
 use crate::capability::tcp_connect::{ConnectOutcome, classify_connect, connect_summary};
-use crate::environment::Environment;
+use crate::environment::{Environment, WorkloadKind};
 use crate::error::{Error, Result};
 use crate::evidence::{EvidenceDraft, NodeRef, Reproduction};
 use crate::intensity::Intensity;
@@ -147,6 +147,19 @@ fn container_name(run_id: &str, workload: &str) -> String {
     format!("{run_id}-{workload}")
 }
 
+/// The container command for a workload, by kind (#46). A `Standin` runs
+/// `sleep 3600` to stay alive and inspectable (its image, e.g. busybox, would
+/// otherwise exit at once); a `Service` runs its own command, where `None`
+/// omits `Cmd` from the create request so the daemon uses the image's own
+/// default `CMD`, and `Some` is an explicit command. Pure, so the mapping is
+/// testable without Docker.
+fn workload_cmd(kind: &WorkloadKind) -> Option<Vec<String>> {
+    match kind {
+        WorkloadKind::Standin => Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+        WorkloadKind::Service { command } => command.clone(),
+    }
+}
+
 /// Bring `env` up: one egress-less network per segment, then each workload as a
 /// container attached to its segment's network. `docker` is injected so a test
 /// controls the connection. On any failure, what was already created is torn
@@ -247,8 +260,9 @@ async fn provision(
                 }),
                 ContainerCreateBody {
                     image: Some(workload.image().to_owned()),
-                    // Keep a stand-in alive so it is inspectable as attached.
-                    cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                    // A stand-in runs `sleep` to stay inspectable; a real service
+                    // runs its own command (#46, see `workload_cmd`).
+                    cmd: workload_cmd(workload.kind()),
                     networking_config: Some(NetworkingConfig {
                         endpoints_config: Some(endpoints),
                     }),
@@ -855,6 +869,28 @@ mod tests {
     use super::*;
     use crate::observation::Confidence;
 
+    /// Guard: the container command follows the workload kind (#46). A `Standin`
+    /// sleeps so it stays alive and inspectable (its image would otherwise exit
+    /// at once); a `Service` with no command defers to the image's own `CMD`
+    /// (`None`); a `Service` with a command runs it. Mutation: make `Standin`
+    /// return `None` -> a busybox stand-in exits at once, breaking the boundary
+    /// demo's inspectable topology -> this fails; make a `Service` sleep -> its
+    /// service never runs.
+    #[test]
+    fn workload_cmd_follows_the_kind() {
+        assert_eq!(
+            workload_cmd(&WorkloadKind::Standin),
+            Some(vec!["sleep".to_owned(), "3600".to_owned()])
+        );
+        assert_eq!(workload_cmd(&WorkloadKind::Service { command: None }), None);
+        assert_eq!(
+            workload_cmd(&WorkloadKind::Service {
+                command: Some(vec!["nc".to_owned(), "-l".to_owned()]),
+            }),
+            Some(vec!["nc".to_owned(), "-l".to_owned()])
+        );
+    }
+
     /// Guard: dropping a `RunningLab` without calling `teardown`, from inside an
     /// active tokio runtime, does not panic (the backstop runs on a dedicated
     /// thread). Mutation: replace the `std::thread::spawn(...).join()` with a
@@ -960,9 +996,9 @@ mod tests {
         Environment::builder()
             .segment("internal")
             .segment("internet")
-            .workload("web", "busybox:1", "internal")
-            .workload("api", "busybox:1", "internal")
-            .workload("db", "busybox:1", "internal")
+            .standin("web", "busybox:1", "internal")
+            .standin("api", "busybox:1", "internal")
+            .standin("db", "busybox:1", "internal")
             .vantage("internet")
             .boundary("internet", "internal", &[])
             .build()
@@ -1076,8 +1112,8 @@ mod tests {
         let env = Environment::builder()
             .segment("a")
             .segment("b")
-            .workload("wa", "busybox:1", "a")
-            .workload("wb", "busybox:1", "b")
+            .standin("wa", "busybox:1", "a")
+            .standin("wb", "busybox:1", "b")
             .vantage("a")
             .boundary("a", "b", &[])
             .boundary("b", "a", &[])
@@ -1375,6 +1411,55 @@ mod tests {
         });
     }
 
+    /// Guard: a `Service` workload runs its command, so its listener is
+    /// reachable from the vantage (#46). This is the positive control that
+    /// `bring_up` honours the workload kind rather than forcing `sleep`: the
+    /// service and the vantage share one segment so the probe reaches it (a
+    /// cross-segment probe is the boundary demo's job). Mutation: make
+    /// `workload_cmd` return the `sleep` command for a `Service` (ignore the
+    /// kind) -> the listener never runs -> the probe is unreachable -> this
+    /// fails. Docker-gated, self-skipping; it asserts the probe observation, not
+    /// a global object count (RK-010).
+    #[test]
+    fn a_service_workload_runs_its_command_and_is_reachable() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping a_service_workload_runs_its_command_and_is_reachable: no Linux Docker daemon"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let port = 9100u16;
+            let listen = format!("while true; do nc -l -p {port} >/dev/null 2>&1; done");
+            let env = Environment::builder()
+                .segment("edge")
+                .vantage("edge")
+                .service_cmd("svc", PROBE_IMAGE, "edge", &["sh", "-c", &listen])
+                .build()
+                .expect("a single-segment service environment is valid");
+
+            let lab = bring_up(&docker, &env).await.expect("bring up the lab");
+            let edge = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "edge")
+                .expect("the edge network")
+                .clone();
+            let target = crate::scope::Scope::from_environment(&env)
+                .resolve(&format!("svc:{port}"))
+                .expect("svc is in scope");
+            let probe = tcp_reachable_from(&docker, &edge, &target, Duration::from_secs(3)).await;
+            let _ = lab.teardown().await;
+
+            let (observation, _draft) = probe.expect("the probe ran");
+            assert!(
+                observation.value,
+                "a Service workload runs its listener, so the vantage reaches it"
+            );
+        });
+    }
+
     /// Guard: a vantage draft names its source as a structured `NodeRef::Vantage`
     /// and records the stable segment (not the run-scoped network name) in the
     /// witness, so a replay can reconstruct it. Pure, no Docker. Mutation: in
@@ -1593,7 +1678,7 @@ mod tests {
             let env = Environment::builder()
                 .segment("internal")
                 .segment("internet")
-                .workload("db", PROBE_IMAGE, "internal")
+                .standin("db", PROBE_IMAGE, "internal")
                 .vantage("internet")
                 .boundary("internet", "internal", &[])
                 .build()

@@ -28,13 +28,33 @@ impl Segment {
     }
 }
 
+/// What a workload runs in the lab (#46). This is a lab-topology distinction
+/// (what command the container runs), not the scanner sense of a "service"
+/// discovered at a `host:port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// A placeholder kept alive by `sleep` so the topology is inspectable; it
+    /// runs no service. The boundary demo's stand-ins are this (#18/#28): a
+    /// busybox image whose default command would exit at once. Assumes the image
+    /// declares no `ENTRYPOINT`: Docker appends `Cmd` to an entrypoint, so with
+    /// one the `sleep` would become its argument rather than the command.
+    Standin,
+    /// A real service. `command: None` runs the image's own default command (a
+    /// real app image: postgres, the vulnerable web tier of #47); `Some` runs an
+    /// explicit command (a listener in a test, or an app needing start args). An
+    /// empty `Some` command is refused by [`EnvironmentBuilder::build`].
+    Service { command: Option<Vec<String>> },
+}
+
 /// A workload placed in a segment. The framework owns the boundary; the user
-/// supplies the content, referenced by `image` (ADR-0003).
+/// supplies the content, referenced by `image` (ADR-0003). It is either a
+/// `Standin` (kept alive, no service) or a real `Service` (#46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workload {
     name: String,
     image: String,
     segment: String,
+    kind: WorkloadKind,
 }
 
 impl Workload {
@@ -51,6 +71,11 @@ impl Workload {
     /// The segment the workload sits in.
     pub fn segment(&self) -> &str {
         &self.segment
+    }
+
+    /// Whether this is a stand-in or a real service, and what it runs (#46).
+    pub fn kind(&self) -> &WorkloadKind {
+        &self.kind
     }
 }
 
@@ -137,7 +162,7 @@ impl Environment {
 #[derive(Debug, Default)]
 pub struct EnvironmentBuilder {
     segments: Vec<String>,
-    workloads: Vec<(String, String, String)>,
+    workloads: Vec<(String, String, String, WorkloadKind)>,
     boundaries: Vec<(String, String, Vec<String>)>,
     vantage: Option<String>,
 }
@@ -149,10 +174,47 @@ impl EnvironmentBuilder {
         self
     }
 
-    /// Declare a workload (`name`) from `image`, placed in `segment`.
-    pub fn workload(mut self, name: &str, image: &str, segment: &str) -> Self {
-        self.workloads
-            .push((name.to_owned(), image.to_owned(), segment.to_owned()));
+    /// Declare a stand-in workload (`name`) from `image`, placed in `segment`:
+    /// a placeholder kept alive by `sleep`, running no service (#46). Use
+    /// [`service`](Self::service) for a workload that runs its image's own
+    /// service: a stand-in's `image` is never started, so a real app image
+    /// declared here would silently run `sleep` instead of its service.
+    pub fn standin(mut self, name: &str, image: &str, segment: &str) -> Self {
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Standin,
+        ));
+        self
+    }
+
+    /// Declare a real-service workload that runs its image's own default command
+    /// (a real app image, e.g. a database or the vulnerable web tier, #46/#47).
+    /// An image that declares no `CMD` (and no `ENTRYPOINT`) fails to start at
+    /// bring-up, surfaced as [`Error::LabUnavailable`].
+    pub fn service(mut self, name: &str, image: &str, segment: &str) -> Self {
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Service { command: None },
+        ));
+        self
+    }
+
+    /// Declare a real-service workload that runs an explicit `command` (a
+    /// listener in a test, or an app needing start args, #46).
+    pub fn service_cmd(mut self, name: &str, image: &str, segment: &str, command: &[&str]) -> Self {
+        let command = command.iter().map(|c| (*c).to_owned()).collect();
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Service {
+                command: Some(command),
+            },
+        ));
         self
     }
 
@@ -207,7 +269,7 @@ impl EnvironmentBuilder {
         }
 
         let mut workloads: Vec<Workload> = Vec::new();
-        for (name, image, segment) in self.workloads {
+        for (name, image, segment, kind) in self.workloads {
             if !is_valid_lab_name(&name) {
                 return Err(invalid(format!(
                     "workload name {name:?} is not a valid lab name \
@@ -222,10 +284,26 @@ impl EnvironmentBuilder {
                     "workload {name:?} is in undeclared segment {segment:?}"
                 )));
             }
+            // A `Service` with an explicit but empty command is refused: an empty
+            // argv serializes as `"Cmd": []`, which the daemon treats like no
+            // command at all, so it silently behaves as `.service(..)` while the
+            // type says a command was given. `.service(..)` is the way to ask for
+            // the image default (#46 review).
+            if let WorkloadKind::Service {
+                command: Some(argv),
+            } = &kind
+                && (argv.is_empty() || argv[0].trim().is_empty())
+            {
+                return Err(invalid(format!(
+                    "workload {name:?} has an empty service command; use .service(..) \
+                     for the image's own command, or give a non-empty one"
+                )));
+            }
             workloads.push(Workload {
                 name,
                 image,
                 segment,
+                kind,
             });
         }
 
@@ -292,6 +370,62 @@ fn is_valid_lab_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Guard: the builder tags each workload with its kind (#46). `.standin`
+    /// is a stand-in; `.service` is a real service running the image's own
+    /// command (`None`); `.service_cmd` is a real service with an explicit
+    /// command. Mutation: make `.service` build a `Standin` (or `.standin` a
+    /// `Service`) -> the kind assertion fails.
+    #[test]
+    fn builder_tags_each_workload_with_its_kind() {
+        let env = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .standin("standin", "busybox:1", "s")
+            .service("app", "postgres:16", "s")
+            .service_cmd("listener", "busybox:1", "s", &["nc", "-l"])
+            .build()
+            .expect("valid environment");
+
+        let kind = |name: &str| env.workload(name).expect("declared").kind().clone();
+        assert_eq!(kind("standin"), WorkloadKind::Standin);
+        assert_eq!(kind("app"), WorkloadKind::Service { command: None });
+        assert_eq!(
+            kind("listener"),
+            WorkloadKind::Service {
+                command: Some(vec!["nc".to_owned(), "-l".to_owned()]),
+            }
+        );
+    }
+
+    /// Guard: a service workload with an explicit but empty command is refused,
+    /// because an empty argv serializes as `"Cmd": []` and the daemon then runs
+    /// the image default, silently behaving as `.service(..)` while the type says
+    /// a command was given (#46 review). An empty first argument (the program) is
+    /// refused the same way. Mutation: drop the empty-command check in `build`
+    /// -> `service_cmd(.., &[])` builds -> this fails.
+    #[test]
+    fn a_service_with_an_empty_command_is_refused() {
+        let empty = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .service_cmd("svc", "busybox:1", "s", &[])
+            .build();
+        assert!(
+            matches!(&empty, Err(Error::InvalidEnvironment { reason }) if reason.contains("empty service command")),
+            "an empty command: {empty:?}"
+        );
+
+        let blank_program = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .service_cmd("svc", "busybox:1", "s", &["   "])
+            .build();
+        assert!(
+            matches!(&blank_program, Err(Error::InvalidEnvironment { reason }) if reason.contains("empty service command")),
+            "a blank program argument: {blank_program:?}"
+        );
+    }
+
     /// The MVP topology: internet/internal, the 3-tier app in internal, the
     /// attacker's vantage external, and the internet -> internal path blocked.
     /// `internal` is declared first so the vantage (`internet`) is not the first
@@ -300,9 +434,9 @@ mod tests {
         Environment::builder()
             .segment("internal")
             .segment("internet")
-            .workload("web", "redstep/web:mvp", "internal")
-            .workload("api", "redstep/api:mvp", "internal")
-            .workload("db", "postgres:16", "internal")
+            .standin("web", "redstep/web:mvp", "internal")
+            .standin("api", "redstep/api:mvp", "internal")
+            .standin("db", "postgres:16", "internal")
             .vantage("internet")
             .boundary("internet", "internal", &[])
     }
@@ -379,7 +513,7 @@ mod tests {
     /// check in `build` -> the environment builds -> fails.
     #[test]
     fn workload_in_unknown_segment_is_rejected() {
-        let result = mvp().workload("cache", "redis:7", "nowhere").build();
+        let result = mvp().standin("cache", "redis:7", "nowhere").build();
         assert!(
             matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("cache") && reason.contains("nowhere")),
             "got {result:?}"
@@ -423,7 +557,7 @@ mod tests {
         );
 
         // Same name, different image and segment: still a duplicate by name.
-        let dup_workload = mvp().workload("db", "mysql:8", "internet").build();
+        let dup_workload = mvp().standin("db", "mysql:8", "internet").build();
         assert!(
             matches!(&dup_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("workload") && reason.contains("db")),
             "duplicate workload: {dup_workload:?}"
@@ -464,7 +598,7 @@ mod tests {
             let as_workload = Environment::builder()
                 .segment("internet")
                 .vantage("internet")
-                .workload(name, "busybox:1", "internet")
+                .standin(name, "busybox:1", "internet")
                 .build();
             assert!(
                 matches!(&as_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("lab name")),
@@ -485,7 +619,7 @@ mod tests {
             let built = Environment::builder()
                 .segment("internet")
                 .vantage("internet")
-                .workload(name, "busybox:1", "internet")
+                .standin(name, "busybox:1", "internet")
                 .build();
             assert!(
                 built.is_ok(),
