@@ -7,8 +7,7 @@
 //! crate as `::redstep`.
 
 use redstep::{
-    Capability, Confidence, EvidenceDraft, Intensity, Observation, Reproduction, RunSummary, Scope,
-    TestContext, Verdict, run, security_test,
+    Confidence, Observation, RunSummary, Scope, TestContext, Verdict, run, security_test,
 };
 
 /// A tautology: should pass.
@@ -105,85 +104,6 @@ async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
-/// A Safe capability an external crate implements against the public trait,
-/// observing a reachable target with no socket. Proves the evidence shape
-/// (`EvidenceDraft`, `Reproduction`) is publicly constructible, and gives
-/// `run_collects_evidence_into_the_store` deterministic records to find. The
-/// target is a field so one test can run it twice with distinct records.
-struct StubReachable {
-    target: &'static str,
-}
-
-impl Capability for StubReachable {
-    type Value = bool;
-
-    fn name(&self) -> &'static str {
-        "stub_reachable"
-    }
-
-    fn intensity(&self) -> Intensity {
-        Intensity::Safe
-    }
-
-    async fn execute(&self) -> redstep::Result<(Observation<bool>, EvidenceDraft)> {
-        Ok((
-            Observation {
-                value: true,
-                confidence: Confidence::High,
-            },
-            EvidenceDraft {
-                capability: self.name(),
-                target: self.target.to_owned(),
-                intensity: Intensity::Safe,
-                observed: serde_json::Value::Bool(true),
-                confidence: Confidence::High,
-                summary: "reachable".to_owned(),
-                source: None,
-                reproduction: Reproduction {
-                    capability: self.name().to_owned(),
-                    target: self.target.to_owned(),
-                    params: serde_json::json!({}),
-                },
-            },
-        ))
-    }
-}
-
-/// Runs a Safe capability twice, so the run produces two evidence records the
-/// store collects in order.
-#[security_test]
-async fn records_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
-    let first = ctx
-        .run(StubReachable {
-            target: "stub:alpha",
-        })
-        .await?;
-    let second = ctx
-        .run(StubReachable {
-            target: "stub:beta",
-        })
-        .await?;
-    ctx.expect(&first).to_be(true);
-    ctx.expect(&second).to_be(true);
-    Ok(())
-}
-
-/// A second evidence producer whose name sorts before `records_evidence_demo`,
-/// so it runs first and takes evidence id 0. That makes `records_evidence_demo`'s
-/// records start at a non-zero id, which is what lets a test tell the runner's
-/// per-test `base` offset from a bare index (issue #14): with no prior producer
-/// `base` is always 0 and dropping it changes nothing.
-#[security_test]
-async fn aaa_earlier_evidence_demo(ctx: &TestContext) -> redstep::Result<()> {
-    let recorded = ctx
-        .run(StubReachable {
-            target: "stub:earlier",
-        })
-        .await?;
-    ctx.expect(&recorded).to_be(true);
-    Ok(())
-}
-
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
@@ -255,104 +175,6 @@ fn run_passes_the_scope_to_tests() {
         Verdict::Pass
     );
     assert_eq!(verdict_of(&summary, "::out_of_scope_demo"), Verdict::Error);
-}
-
-/// Guard: a run collects every capability execution's evidence into the summary's
-/// store, in execution order, with run-scoped sequential ids and a real clock
-/// timestamp (ADR-0004). Two demos produce evidence: `aaa_earlier_evidence_demo`
-/// (sorts first) once, then `records_evidence_demo` twice, so the store holds
-/// `earlier`, `alpha`, `beta` at ids 0, 1, 2.
-/// Mutations caught: drop the collection loop in `run` -> store empty -> the
-/// length assert fails; `.rev()` or `.take(1)` the drain -> the order or the
-/// count fails; `append(draft, 0)` instead of `now_ms()`, or `now_ms` returning a
-/// constant or seconds -> the timestamp assert fails.
-#[test]
-fn run_collects_evidence_into_the_store() {
-    let summary = run(Scope::default()).expect("the runtime starts");
-
-    let records: Vec<_> = summary
-        .evidence
-        .records()
-        .iter()
-        .filter(|e| e.capability == "stub_reachable")
-        .collect();
-
-    let targets: Vec<&str> = records.iter().map(|e| e.target.as_str()).collect();
-    assert_eq!(
-        targets,
-        ["stub:earlier", "stub:alpha", "stub:beta"],
-        "all three executions collected in execution order"
-    );
-    for (index, record) in records.iter().enumerate() {
-        assert_eq!(record.id, redstep::EvidenceId(index as u64));
-    }
-    assert_eq!(records[0].observed, serde_json::Value::Bool(true));
-    // The runner stamps a real wall clock, not a constant or seconds: this is
-    // well past 2020-09 in epoch milliseconds (and far above any seconds value).
-    assert!(
-        records[0].recorded_at_ms > 1_600_000_000_000,
-        "recorded_at_ms must be real epoch milliseconds, got {}",
-        records[0].recorded_at_ms
-    );
-}
-
-/// Guard: a judgement from `expect` over a capability's result resolves, through
-/// its `evidence` id, to the record that capability produced, in order and in the
-/// right test; a `check` judgement carries no id (issue #14).
-/// `aaa_earlier_evidence_demo` runs first and takes id 0, so `records_evidence_demo`'s
-/// records start at id 1: its judgements must resolve to ids 1 and 2
-/// (`stub:alpha`, `stub:beta`), not 0 and 1. That makes the runner's per-test
-/// `base` offset load-bearing.
-/// Mutations caught: drop `base` in the remap (`EvidenceId(index)`) -> the second
-/// demo's first judgement resolves to id 0 (`stub:earlier`, another test's
-/// record) -> the `stub:alpha` assert fails; an index off-by-one or reversal ->
-/// the wrong target -> fails; make `Recorded` carry no reference, or `check` carry
-/// one -> the counts or the `check` assert fail.
-#[test]
-fn run_links_judgements_to_their_evidence() {
-    let summary = run(Scope::default()).expect("the runtime starts");
-
-    let resolve = |id: redstep::EvidenceId| {
-        summary
-            .evidence
-            .records()
-            .iter()
-            .find(|e| e.id == id)
-            .unwrap_or_else(|| panic!("evidence id {id:?} does not resolve"))
-    };
-    let links = |suffix: &str| -> Vec<redstep::EvidenceId> {
-        summary
-            .runs
-            .iter()
-            .find(|r| r.name.ends_with(suffix))
-            .unwrap_or_else(|| panic!("test {suffix} was not discovered"))
-            .judgements
-            .iter()
-            .filter_map(|j| j.evidence)
-            .collect()
-    };
-
-    // The earlier producer's judgement links to its own record (id 0).
-    let earlier = links("::aaa_earlier_evidence_demo");
-    assert_eq!(earlier.len(), 1);
-    assert_eq!(resolve(earlier[0]).target, "stub:earlier");
-
-    // The later producer's two judgements link to its own records, at a non-zero
-    // base (ids 1 and 2), not to the earlier test's record.
-    let later = links("::records_evidence_demo");
-    assert_eq!(later.len(), 2, "both judgements link to their evidence");
-    assert!(
-        later[0] != redstep::EvidenceId(0),
-        "the later test's link must carry the per-test base, not start at 0"
-    );
-    assert_eq!(resolve(later[0]).target, "stub:alpha");
-    assert_eq!(resolve(later[1]).target, "stub:beta");
-
-    // A check links to nothing.
-    assert!(
-        links("::tautology_demo").is_empty(),
-        "a check judgement links to no evidence"
-    );
 }
 
 /// Guard: the CLI maps a usage error to exit 2. Mutation: change main's

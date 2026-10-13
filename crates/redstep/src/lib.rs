@@ -44,7 +44,7 @@ mod runner;
 mod scope;
 mod verdict;
 
-pub use capability::{Capability, TcpConnect};
+pub use capability::{Authorized, Capability, TcpConnect};
 pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
 pub use environment::{Boundary, Environment, EnvironmentBuilder, Segment, Workload};
 pub use error::{Error, Result};
