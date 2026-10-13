@@ -23,11 +23,10 @@ use std::time::Duration;
 
 use bollard::Docker;
 
-use crate::capability::Capability;
+use crate::capability::{Capability, IntensityCleared};
 use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
-use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{LabNetwork, tcp_reachable_from};
 use crate::scope::{Scope, ScopedTarget};
@@ -193,14 +192,16 @@ impl TestContext {
     /// Run a capability and return its [`Recorded`] result, recording one
     /// evidence draft.
     ///
-    /// This is the intended invocation path: it checks the intensity as a value
-    /// and refuses anything but `Safe`, because the authorization and isolation
-    /// proof the higher rungs require are not built yet (See ADR-0006). The
-    /// check lives here rather than in the type system: `Capability::execute` is
-    /// a public trait method a hand-written capability could call directly, so
-    /// the gate is a runtime check this one place holds. Making the `Capability`
-    /// trait unbypassable (sealing it, a crate-private `execute`) is scheduled
-    /// before the first non-Safe capability lands.
+    /// This is the gate seam: it calls `IntensityCleared::issue`, which refuses
+    /// anything but `Safe` (the authorization and isolation proof the higher
+    /// rungs require are not built yet, See ADR-0006), and the resulting
+    /// [`IntensityCleared`] is what `Capability::execute` requires. `execute`
+    /// cannot be reached without a token, and nothing outside the crate can mint
+    /// one or implement a capability, so the gate is compiler-held against
+    /// external code. In-crate, that `run` mints the token from the capability's
+    /// *own* intensity is this seam's convention, not a compiler fact (the token
+    /// is not bound to the capability); it is guarded by the refusal tests below,
+    /// and binding it is deferred to the first non-`Safe` capability (#9).
     ///
     /// On a successful execution the capability's [`EvidenceDraft`] is recorded in
     /// the evidence sink and `run` returns a [`Recorded`] that carries the
@@ -225,12 +226,10 @@ impl TestContext {
     /// type, not run a `Capability` host-side and let it stand in for a vantage
     /// observation.
     pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
-        if capability.intensity() != Intensity::Safe {
-            return Err(Error::IntensityRefused {
-                got: capability.intensity(),
-            });
-        }
-        let (observation, draft) = capability.execute().await?;
+        // The gate: `issue` mints the token only for a `Safe` capability, and
+        // `execute` cannot be called without it.
+        let authorized = IntensityCleared::issue(capability.intensity())?;
+        let (observation, draft) = capability.execute(authorized).await?;
         let draft_ref = self.record_draft(draft);
         Ok(Recorded {
             observation,
@@ -256,7 +255,12 @@ impl TestContext {
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound (a
     /// host run): there is no vantage to act from. Generalizing to "run any
     /// capability from the vantage" waits on the M3 tool adapters, which shape the
-    /// in-container seam (one capability in the MVP, as in #27).
+    /// in-container seam (one capability in the MVP, as in #27). That seam does
+    /// not go through the [`run`](Self::run) intensity gate (it mints no
+    /// [`IntensityCleared`]); it is `Safe` by
+    /// construction today (busybox `nc`), but it is the path where M3's
+    /// Controlled/Aggressive adapters will live, so M3 must require the gate token
+    /// here too (#9's deferred full-gate work).
     ///
     /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
     /// against this context's own `scope`: a target's scope provenance is not yet
@@ -403,12 +407,14 @@ impl<'a, T: PartialEq + Debug> ExpectationBuilder<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intensity::Intensity;
     use crate::observation::Confidence;
 
     /// A capability that is not `Safe` and panics if executed, so a test can
     /// prove the intensity gate refuses it before it runs.
     struct NonSafe;
 
+    impl crate::capability::sealed::Sealed for NonSafe {}
     impl Capability for NonSafe {
         type Value = ();
 
@@ -420,7 +426,10 @@ mod tests {
             Intensity::Controlled
         }
 
-        async fn execute(&self) -> Result<(Observation<()>, EvidenceDraft)> {
+        async fn execute(
+            &self,
+            _authorized: IntensityCleared,
+        ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
     }
@@ -428,6 +437,7 @@ mod tests {
     /// An Aggressive capability that panics if executed.
     struct Aggressive;
 
+    impl crate::capability::sealed::Sealed for Aggressive {}
     impl Capability for Aggressive {
         type Value = ();
 
@@ -439,7 +449,10 @@ mod tests {
             Intensity::Aggressive
         }
 
-        async fn execute(&self) -> Result<(Observation<()>, EvidenceDraft)> {
+        async fn execute(
+            &self,
+            _authorized: IntensityCleared,
+        ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
     }
@@ -484,6 +497,7 @@ mod tests {
 
     /// A Safe stub capability that observes a reachable target, for the run path.
     struct AlwaysReachable;
+    impl crate::capability::sealed::Sealed for AlwaysReachable {}
     impl Capability for AlwaysReachable {
         type Value = bool;
         fn name(&self) -> &'static str {
@@ -492,7 +506,10 @@ mod tests {
         fn intensity(&self) -> Intensity {
             Intensity::Safe
         }
-        async fn execute(&self) -> Result<(Observation<bool>, EvidenceDraft)> {
+        async fn execute(
+            &self,
+            _authorized: IntensityCleared,
+        ) -> Result<(Observation<bool>, EvidenceDraft)> {
             Ok((
                 Observation {
                     value: true,

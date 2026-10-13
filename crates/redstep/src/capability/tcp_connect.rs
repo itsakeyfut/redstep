@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use crate::capability::Capability;
+use crate::capability::{Capability, IntensityCleared};
 use crate::evidence::{EvidenceDraft, Reproduction};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
@@ -62,6 +62,9 @@ impl TcpConnect {
     }
 }
 
+// Sealed so only this crate implements `Capability` (see `capability::sealed`).
+impl crate::capability::sealed::Sealed for TcpConnect {}
+
 impl Capability for TcpConnect {
     type Value = bool;
 
@@ -73,7 +76,10 @@ impl Capability for TcpConnect {
         Intensity::Safe
     }
 
-    async fn execute(&self) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
+    async fn execute(
+        &self,
+        _authorized: IntensityCleared,
+    ) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
         let target = format!("{}:{}", self.target.host(), self.target.port());
         let dial = target.clone();
         let outcome = connect_outcome(self.timeout, async move {
@@ -371,7 +377,10 @@ mod tests {
             .build()
             .expect("current-thread runtime with net builds");
         let (observation, draft) = rt
-            .block_on(TcpConnect::new(target).execute())
+            .block_on(
+                TcpConnect::new(target)
+                    .execute(IntensityCleared::issue(Intensity::Safe).expect("Safe is authorized")),
+            )
             .expect("the capability runs");
 
         assert!(observation.value, "a bound port is reachable");
