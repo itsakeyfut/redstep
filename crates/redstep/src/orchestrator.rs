@@ -149,10 +149,10 @@ fn container_name(run_id: &str, workload: &str) -> String {
 
 /// The container command for a workload, by kind (#46). A `Standin` runs
 /// `sleep 3600` to stay alive and inspectable (its image, e.g. busybox, would
-/// otherwise exit at once); a `Service` runs its own command, where `None` is
-/// the image's own default `CMD` (bollard runs it when `cmd` is `None`) and
-/// `Some` is an explicit command. Pure, so the mapping is testable without
-/// Docker.
+/// otherwise exit at once); a `Service` runs its own command, where `None`
+/// omits `Cmd` from the create request so the daemon uses the image's own
+/// default `CMD`, and `Some` is an explicit command. Pure, so the mapping is
+/// testable without Docker.
 fn workload_cmd(kind: &WorkloadKind) -> Option<Vec<String>> {
     match kind {
         WorkloadKind::Standin => Some(vec!["sleep".to_owned(), "3600".to_owned()]),

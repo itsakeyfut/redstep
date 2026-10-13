@@ -28,16 +28,21 @@ impl Segment {
     }
 }
 
-/// What a workload runs in the lab (#46).
+/// What a workload runs in the lab (#46). This is a lab-topology distinction
+/// (what command the container runs), not the scanner sense of a "service"
+/// discovered at a `host:port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadKind {
     /// A placeholder kept alive by `sleep` so the topology is inspectable; it
     /// runs no service. The boundary demo's stand-ins are this (#18/#28): a
-    /// busybox image whose default command would exit at once.
+    /// busybox image whose default command would exit at once. Assumes the image
+    /// declares no `ENTRYPOINT`: Docker appends `Cmd` to an entrypoint, so with
+    /// one the `sleep` would become its argument rather than the command.
     Standin,
     /// A real service. `command: None` runs the image's own default command (a
     /// real app image: postgres, the vulnerable web tier of #47); `Some` runs an
-    /// explicit command (a listener in a test, or an app needing start args).
+    /// explicit command (a listener in a test, or an app needing start args). An
+    /// empty `Some` command is refused by [`EnvironmentBuilder::build`].
     Service { command: Option<Vec<String>> },
 }
 
@@ -186,6 +191,8 @@ impl EnvironmentBuilder {
 
     /// Declare a real-service workload that runs its image's own default command
     /// (a real app image, e.g. a database or the vulnerable web tier, #46/#47).
+    /// An image that declares no `CMD` (and no `ENTRYPOINT`) fails to start at
+    /// bring-up, surfaced as [`Error::LabUnavailable`].
     pub fn service(mut self, name: &str, image: &str, segment: &str) -> Self {
         self.workloads.push((
             name.to_owned(),
@@ -275,6 +282,21 @@ impl EnvironmentBuilder {
             if !declared(&segment) {
                 return Err(invalid(format!(
                     "workload {name:?} is in undeclared segment {segment:?}"
+                )));
+            }
+            // A `Service` with an explicit but empty command is refused: an empty
+            // argv serializes as `"Cmd": []`, which the daemon treats like no
+            // command at all, so it silently behaves as `.service(..)` while the
+            // type says a command was given. `.service(..)` is the way to ask for
+            // the image default (#46 review).
+            if let WorkloadKind::Service {
+                command: Some(argv),
+            } = &kind
+                && (argv.is_empty() || argv[0].trim().is_empty())
+            {
+                return Err(invalid(format!(
+                    "workload {name:?} has an empty service command; use .service(..) \
+                     for the image's own command, or give a non-empty one"
                 )));
             }
             workloads.push(Workload {
@@ -372,6 +394,35 @@ mod tests {
             WorkloadKind::Service {
                 command: Some(vec!["nc".to_owned(), "-l".to_owned()]),
             }
+        );
+    }
+
+    /// Guard: a service workload with an explicit but empty command is refused,
+    /// because an empty argv serializes as `"Cmd": []` and the daemon then runs
+    /// the image default, silently behaving as `.service(..)` while the type says
+    /// a command was given (#46 review). An empty first argument (the program) is
+    /// refused the same way. Mutation: drop the empty-command check in `build`
+    /// -> `service_cmd(.., &[])` builds -> this fails.
+    #[test]
+    fn a_service_with_an_empty_command_is_refused() {
+        let empty = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .service_cmd("svc", "busybox:1", "s", &[])
+            .build();
+        assert!(
+            matches!(&empty, Err(Error::InvalidEnvironment { reason }) if reason.contains("empty service command")),
+            "an empty command: {empty:?}"
+        );
+
+        let blank_program = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .service_cmd("svc", "busybox:1", "s", &["   "])
+            .build();
+        assert!(
+            matches!(&blank_program, Err(Error::InvalidEnvironment { reason }) if reason.contains("empty service command")),
+            "a blank program argument: {blank_program:?}"
         );
     }
 
