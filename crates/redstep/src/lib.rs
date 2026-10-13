@@ -46,7 +46,7 @@ mod verdict;
 
 pub use capability::{Capability, IntensityCleared, TcpConnect};
 pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
-pub use environment::{Boundary, Environment, EnvironmentBuilder, Segment, Workload};
+pub use environment::{Boundary, Environment, EnvironmentBuilder, Segment, Workload, WorkloadKind};
 pub use error::{Error, Result};
 pub use evidence::{
     DraftRef, Evidence, EvidenceDraft, EvidenceId, EvidenceStore, NodeRef, Reproduction,

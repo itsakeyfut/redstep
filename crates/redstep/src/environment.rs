@@ -28,13 +28,28 @@ impl Segment {
     }
 }
 
+/// What a workload runs in the lab (#46).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// A placeholder kept alive by `sleep` so the topology is inspectable; it
+    /// runs no service. The boundary demo's stand-ins are this (#18/#28): a
+    /// busybox image whose default command would exit at once.
+    Standin,
+    /// A real service. `command: None` runs the image's own default command (a
+    /// real app image: postgres, the vulnerable web tier of #47); `Some` runs an
+    /// explicit command (a listener in a test, or an app needing start args).
+    Service { command: Option<Vec<String>> },
+}
+
 /// A workload placed in a segment. The framework owns the boundary; the user
-/// supplies the content, referenced by `image` (ADR-0003).
+/// supplies the content, referenced by `image` (ADR-0003). It is either a
+/// `Standin` (kept alive, no service) or a real `Service` (#46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workload {
     name: String,
     image: String,
     segment: String,
+    kind: WorkloadKind,
 }
 
 impl Workload {
@@ -51,6 +66,11 @@ impl Workload {
     /// The segment the workload sits in.
     pub fn segment(&self) -> &str {
         &self.segment
+    }
+
+    /// Whether this is a stand-in or a real service, and what it runs (#46).
+    pub fn kind(&self) -> &WorkloadKind {
+        &self.kind
     }
 }
 
@@ -137,7 +157,7 @@ impl Environment {
 #[derive(Debug, Default)]
 pub struct EnvironmentBuilder {
     segments: Vec<String>,
-    workloads: Vec<(String, String, String)>,
+    workloads: Vec<(String, String, String, WorkloadKind)>,
     boundaries: Vec<(String, String, Vec<String>)>,
     vantage: Option<String>,
 }
@@ -149,10 +169,42 @@ impl EnvironmentBuilder {
         self
     }
 
-    /// Declare a workload (`name`) from `image`, placed in `segment`.
+    /// Declare a stand-in workload (`name`) from `image`, placed in `segment`:
+    /// a placeholder kept alive by `sleep`, running no service (#46).
     pub fn workload(mut self, name: &str, image: &str, segment: &str) -> Self {
-        self.workloads
-            .push((name.to_owned(), image.to_owned(), segment.to_owned()));
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Standin,
+        ));
+        self
+    }
+
+    /// Declare a real-service workload that runs its image's own default command
+    /// (a real app image, e.g. a database or the vulnerable web tier, #46/#47).
+    pub fn service(mut self, name: &str, image: &str, segment: &str) -> Self {
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Service { command: None },
+        ));
+        self
+    }
+
+    /// Declare a real-service workload that runs an explicit `command` (a
+    /// listener in a test, or an app needing start args, #46).
+    pub fn service_cmd(mut self, name: &str, image: &str, segment: &str, command: &[&str]) -> Self {
+        let command = command.iter().map(|c| (*c).to_owned()).collect();
+        self.workloads.push((
+            name.to_owned(),
+            image.to_owned(),
+            segment.to_owned(),
+            WorkloadKind::Service {
+                command: Some(command),
+            },
+        ));
         self
     }
 
@@ -207,7 +259,7 @@ impl EnvironmentBuilder {
         }
 
         let mut workloads: Vec<Workload> = Vec::new();
-        for (name, image, segment) in self.workloads {
+        for (name, image, segment, kind) in self.workloads {
             if !is_valid_lab_name(&name) {
                 return Err(invalid(format!(
                     "workload name {name:?} is not a valid lab name \
@@ -226,6 +278,7 @@ impl EnvironmentBuilder {
                 name,
                 image,
                 segment,
+                kind,
             });
         }
 
@@ -291,6 +344,33 @@ fn is_valid_lab_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: the builder tags each workload with its kind (#46). `.workload`
+    /// is a stand-in; `.service` is a real service running the image's own
+    /// command (`None`); `.service_cmd` is a real service with an explicit
+    /// command. Mutation: make `.service` build a `Standin` (or `.workload` a
+    /// `Service`) -> the kind assertion fails.
+    #[test]
+    fn builder_tags_each_workload_with_its_kind() {
+        let env = Environment::builder()
+            .segment("s")
+            .vantage("s")
+            .workload("standin", "busybox:1", "s")
+            .service("app", "postgres:16", "s")
+            .service_cmd("listener", "busybox:1", "s", &["nc", "-l"])
+            .build()
+            .expect("valid environment");
+
+        let kind = |name: &str| env.workload(name).expect("declared").kind().clone();
+        assert_eq!(kind("standin"), WorkloadKind::Standin);
+        assert_eq!(kind("app"), WorkloadKind::Service { command: None });
+        assert_eq!(
+            kind("listener"),
+            WorkloadKind::Service {
+                command: Some(vec!["nc".to_owned(), "-l".to_owned()]),
+            }
+        );
+    }
 
     /// The MVP topology: internet/internal, the 3-tier app in internal, the
     /// attacker's vantage external, and the internet -> internal path blocked.
