@@ -1,5 +1,5 @@
 # Multi-stage build: compile the thin Rust web tier inside a pinned rust image,
-# then run it on a minimal distroless runtime (ADR-0019). No shell in the
+# then run it on a minimal, pinned distroless runtime. No shell in the
 # runtime, so the HEALTHCHECK runs the binary's own `healthcheck` subcommand.
 FROM rust:1.90-slim-bookworm AS build
 WORKDIR /src

@@ -64,8 +64,9 @@ fn handle(url: &str) -> (u16, String) {
 /// tolerant of the db starting after the api. `simple_query` runs the raw SQL
 /// string with no parameters, which is exactly the injectable path. The column
 /// count is read from each row (not assumed), so a one-column query like
-/// `/health`'s `SELECT 1` and a two-column `/lookup` both work and a UNION that
-/// changes the shape cannot panic.
+/// `/health`'s `SELECT 1` and a two-column `/lookup` both format without panic. A
+/// UNION whose column count does not match is a Postgres error, surfaced to the
+/// caller as an HTTP 500, not a panic (and not a successful read).
 fn db_rows(sql: &str) -> Result<String, postgres::Error> {
     let mut client = postgres::Client::connect(DB_CONN, postgres::NoTls)?;
     let mut out = String::new();
@@ -87,20 +88,24 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Decode `%XX` escapes and `+` in a query value. Lossy for invalid UTF-8, which
-/// a fixture does not need to preserve.
+/// Decode `%XX` escapes and `+` in a query value, operating on bytes. Decoding on
+/// bytes (not slicing the `&str`) is deliberate: `%` followed by a multibyte
+/// character would otherwise slice on a non-char boundary and panic, and a panic
+/// here kills the single-threaded request loop. `hex` also rejects a leading
+/// `+`/`-`, which `u8::from_str_radix` would have accepted (so `%+f` stays
+/// literal). Lossy for invalid UTF-8, which a fixture need not preserve.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(high), Some(low)) => {
+                    out.push(high << 4 | low);
                     i += 3;
                 }
-                Err(_) => {
+                _ => {
                     out.push(b'%');
                     i += 1;
                 }
@@ -118,9 +123,21 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A single hex digit's value, or `None` for any non-hex byte (so `%zz`, a
+/// trailing `%`, and a leading `+`/`-` are all left literal).
+fn hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// A minimal blocking HTTP/1.0 GET, used by the `healthcheck` subcommand to reach
 /// this process's own `/health`. Connection: close, so the server ends the body
-/// and `read_to_string` sees EOF.
+/// and `read_to_string` sees EOF. Duplicated in the web fixture on purpose: the
+/// two are separate, workspace-excluded crates with no shared crate to hold it.
 fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<(u16, String)> {
     let mut stream = std::net::TcpStream::connect((host, port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -141,4 +158,45 @@ fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<(u16, String)>
         .map(|(_, body)| body.to_owned())
         .unwrap_or_default();
     Ok((status, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard: percent_decode never panics on a `%` followed by a multibyte
+    /// character (it decodes on bytes, not by slicing the str), and decodes the
+    /// payloads the playground actually uses. Mutation: restore the str-slice form
+    /// (`&s[i + 1..i + 3]`) -> percent_decode("%a\u{e9}") panics on a non-char
+    /// boundary -> this test fails.
+    #[test]
+    fn percent_decode_handles_escapes_and_never_panics() {
+        assert_eq!(percent_decode("a+b%20c"), "a b c");
+        assert_eq!(percent_decode("%27%20%2C"), "' ,");
+        assert!(percent_decode("%27%20UNION").starts_with("' UNION"));
+        // A `%` before a multibyte character: left literal, and crucially no panic.
+        assert_eq!(percent_decode("%a\u{e9}"), "%a\u{e9}");
+        // Malformed or truncated escapes stay literal.
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("a%4"), "a%4");
+        // A leading sign is not read as hex (u8::from_str_radix would have).
+        assert_ne!(percent_decode("%+f"), "\u{f}");
+    }
+
+    /// Guard: hex rejects every non-hex byte, including the `+`/`-` that
+    /// `u8::from_str_radix` accepts. Mutation: implement `hex` via
+    /// `u8::from_str_radix` on a one-byte str -> `hex(b'+')` becomes `Some` -> the
+    /// sign asserts fail.
+    #[test]
+    fn hex_rejects_non_hex_including_signs() {
+        assert_eq!(hex(b'0'), Some(0));
+        assert_eq!(hex(b'9'), Some(9));
+        assert_eq!(hex(b'a'), Some(10));
+        assert_eq!(hex(b'F'), Some(15));
+        assert_eq!(hex(b'+'), None);
+        assert_eq!(hex(b'-'), None);
+        assert_eq!(hex(b'g'), None);
+        assert_eq!(hex(b' '), None);
+    }
 }

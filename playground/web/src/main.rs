@@ -1,5 +1,6 @@
-//! The externally-reachable web tier of the redstep SQLi playground (#47): a
-//! thin forwarder. It relays `GET /lookup?<query>` to the internal api verbatim,
+//! The attacker-facing web tier of the redstep SQLi playground (#47): a thin
+//! forwarder, and the entry the attacker vantage reaches (nothing is published
+//! outside the egress-less lab). It relays `GET /lookup?<query>` to the api verbatim,
 //! so the injectable parameter is preserved, and its `/health` reaches the api so
 //! the readiness gate (bring_up, #47) waits for the whole `web -> api -> db`
 //! chain. A security test fixture, not product code; excluded from the cargo
@@ -44,6 +45,8 @@ fn handle(url: &str) -> (u16, String) {
 
 /// A minimal blocking HTTP/1.0 GET for the forward hop and the healthcheck.
 /// Connection: close, so the upstream ends the body and `read_to_string` sees EOF.
+/// Duplicated in the api fixture on purpose: the two are separate,
+/// workspace-excluded crates with no shared crate to hold it.
 fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<(u16, String)> {
     let mut stream = std::net::TcpStream::connect((host, port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
