@@ -731,6 +731,16 @@ fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Dura
 /// ADR-0018) are a later milestone, so image drift in `env` is not pinned here.
 /// Its only M1 caller is the replay guard; the auto-generation that calls it in
 /// a codified regression (ADR-0022, ADR-0015) is deferred.
+///
+/// Unlike [`run_in_running_lab`](crate::runner), replay deliberately does *not*
+/// run [`boundary_self_check`] before probing, even though ADR-0011 gates a test
+/// run on it. Replay reproduces one probe's observation; it does not re-certify
+/// the lab's boundaries, and it returns the raw `Observation` for a caller to
+/// compare, not a verdict. The `High` certification that a declared boundary
+/// holds stays with the self-check (ADR-0011), which a real run performs; a
+/// replayed observation carries only the probe's own confidence. The probe runs
+/// inside the egress-less lab regardless, so skipping the self-check cannot let
+/// traffic escape.
 // allow(dead_code): no M1 production caller. This is the first piece of
 // ADR-0022's pinned replay (#29); the codify step that calls it in a generated
 // regression is deferred, and the replay guard exercises it under `cfg(test)`,
