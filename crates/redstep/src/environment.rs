@@ -170,8 +170,11 @@ impl EnvironmentBuilder {
     }
 
     /// Declare a stand-in workload (`name`) from `image`, placed in `segment`:
-    /// a placeholder kept alive by `sleep`, running no service (#46).
-    pub fn workload(mut self, name: &str, image: &str, segment: &str) -> Self {
+    /// a placeholder kept alive by `sleep`, running no service (#46). Use
+    /// [`service`](Self::service) for a workload that runs its image's own
+    /// service: a stand-in's `image` is never started, so a real app image
+    /// declared here would silently run `sleep` instead of its service.
+    pub fn standin(mut self, name: &str, image: &str, segment: &str) -> Self {
         self.workloads.push((
             name.to_owned(),
             image.to_owned(),
@@ -345,17 +348,17 @@ fn is_valid_lab_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Guard: the builder tags each workload with its kind (#46). `.workload`
+    /// Guard: the builder tags each workload with its kind (#46). `.standin`
     /// is a stand-in; `.service` is a real service running the image's own
     /// command (`None`); `.service_cmd` is a real service with an explicit
-    /// command. Mutation: make `.service` build a `Standin` (or `.workload` a
+    /// command. Mutation: make `.service` build a `Standin` (or `.standin` a
     /// `Service`) -> the kind assertion fails.
     #[test]
     fn builder_tags_each_workload_with_its_kind() {
         let env = Environment::builder()
             .segment("s")
             .vantage("s")
-            .workload("standin", "busybox:1", "s")
+            .standin("standin", "busybox:1", "s")
             .service("app", "postgres:16", "s")
             .service_cmd("listener", "busybox:1", "s", &["nc", "-l"])
             .build()
@@ -380,9 +383,9 @@ mod tests {
         Environment::builder()
             .segment("internal")
             .segment("internet")
-            .workload("web", "redstep/web:mvp", "internal")
-            .workload("api", "redstep/api:mvp", "internal")
-            .workload("db", "postgres:16", "internal")
+            .standin("web", "redstep/web:mvp", "internal")
+            .standin("api", "redstep/api:mvp", "internal")
+            .standin("db", "postgres:16", "internal")
             .vantage("internet")
             .boundary("internet", "internal", &[])
     }
@@ -459,7 +462,7 @@ mod tests {
     /// check in `build` -> the environment builds -> fails.
     #[test]
     fn workload_in_unknown_segment_is_rejected() {
-        let result = mvp().workload("cache", "redis:7", "nowhere").build();
+        let result = mvp().standin("cache", "redis:7", "nowhere").build();
         assert!(
             matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("cache") && reason.contains("nowhere")),
             "got {result:?}"
@@ -503,7 +506,7 @@ mod tests {
         );
 
         // Same name, different image and segment: still a duplicate by name.
-        let dup_workload = mvp().workload("db", "mysql:8", "internet").build();
+        let dup_workload = mvp().standin("db", "mysql:8", "internet").build();
         assert!(
             matches!(&dup_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("workload") && reason.contains("db")),
             "duplicate workload: {dup_workload:?}"
@@ -544,7 +547,7 @@ mod tests {
             let as_workload = Environment::builder()
                 .segment("internet")
                 .vantage("internet")
-                .workload(name, "busybox:1", "internet")
+                .standin(name, "busybox:1", "internet")
                 .build();
             assert!(
                 matches!(&as_workload, Err(Error::InvalidEnvironment { reason }) if reason.contains("lab name")),
@@ -565,7 +568,7 @@ mod tests {
             let built = Environment::builder()
                 .segment("internet")
                 .vantage("internet")
-                .workload(name, "busybox:1", "internet")
+                .standin(name, "busybox:1", "internet")
                 .build();
             assert!(
                 built.is_ok(),
