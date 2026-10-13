@@ -1374,6 +1374,37 @@ mod tests {
         assert_eq!(draft.reproduction.params["timeout_ms"], 2_000);
     }
 
+    /// Guard: the vantage draft mirrors the observation and the probed target
+    /// rather than hard-coding them, so the recorded evidence matches what the
+    /// probe actually saw. The sibling to `build_draft_mirrors_the_observation`
+    /// for the vantage path. It uses the decisive unreachable/`Low` case and a
+    /// distinctive summary and target, which the source/witness test above does
+    /// not, so a hard-coded value cannot pass as a mirrored one. Mutation: set
+    /// `observed` to a fixed `true`, `summary` to a constant, or `target` to a
+    /// constant in `vantage_draft` -> this fails (the Docker path asserts the
+    /// returned observation, not the draft's copy of it, so it cannot catch this).
+    #[test]
+    fn vantage_draft_mirrors_the_observation() {
+        let observation = Observation {
+            value: false,
+            confidence: Confidence::Low,
+        };
+        let draft = vantage_draft(
+            "internet",
+            "db:5432".to_owned(),
+            &observation,
+            "unreachable",
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(draft.target, "db:5432");
+        assert_eq!(draft.intensity, Intensity::Safe);
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.summary, "unreachable");
+        assert_eq!(draft.reproduction.capability, "tcp_connect_vantage");
+        assert_eq!(draft.reproduction.target, "db:5432");
+    }
+
     /// Guard: a witness missing any field needed to replay is rejected rather
     /// than replayed with a default (a witness that cannot be read cannot be
     /// replayed; ADR-0022). Covers a missing segment, a missing timeout, and an
