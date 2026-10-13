@@ -216,6 +216,11 @@ async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
 /// unconditional [`pull_image`] would 404 on it; a registry image that is absent
 /// locally is pulled as before. An image that is neither present nor pullable
 /// still surfaces the pull's 404 as [`Error::LabUnavailable`].
+///
+/// A present image is therefore never re-pulled, so a mutable registry tag is not
+/// refreshed once it is local. That is acceptable here: the MVP's tags are pinned
+/// (`busybox:1.37`, `postgres:16`) and the playground tags are local-only, and it
+/// is the whole point, since a local-only image cannot be pulled at all.
 async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
@@ -230,8 +235,7 @@ async fn provision(
     lab: &mut RunningLab,
 ) -> Result<()> {
     // Ensure each distinct workload image is present before any container is
-    // created, pulling only those not already local (the playground's bespoke
-    // images are local-only, #47).
+    // created (see `ensure_image` for why a present image is not re-pulled).
     let mut ensured = std::collections::HashSet::new();
     for workload in env.workloads() {
         if ensured.insert(workload.image()) {
@@ -383,6 +387,14 @@ impl HealthPoller for DockerHealthPoller<'_> {
 /// [`Error::LabUnavailable`] naming it, and if the budget runs out with any still
 /// `Waiting` it returns `LabUnavailable` naming them, so a never-healthy service
 /// is a bounded error rather than a hang (CLAUDE.md row 5).
+///
+/// It reads only the health status, not whether the container is still running,
+/// so a `Service` that declares no HEALTHCHECK and then exits reads `None` ->
+/// `Ready`. That is a known limit, not a verdict hazard: the playground tiers all
+/// declare healthchecks (a crash shows as unhealthy, not `None`), and a dead
+/// target downstream fails the boundary self-check's positive control closed and
+/// reads as `Low`-confidence unreachable at a vantage probe, which the oracle's
+/// default-`High` keeps out of a confident PASS.
 async fn await_readiness<P: HealthPoller>(
     containers: &[LabContainer],
     poller: &P,
@@ -1173,6 +1185,12 @@ mod tests {
         ]);
         assert!(block_on(await_readiness(&containers, &all_ready, fast, 3)).is_ok());
 
+        // max_polls is clamped to at least one real round, so a 0 budget still
+        // polls once and returns Ok when all are ready, not a spurious timeout.
+        // Mutation: drop the `.max(1)` -> the 0 budget skips the loop and returns
+        // the timeout Err -> this fails.
+        assert!(block_on(await_readiness(&containers, &all_ready, fast, 0)).is_ok());
+
         // A non-first container that starts, then becomes ready: it must be waited
         // out, not read as ready too early.
         let becomes_ready = ScriptedPoller::new(&[
@@ -1192,7 +1210,7 @@ mod tests {
         ]);
         let err = block_on(await_readiness(&containers, &unhealthy, fast, 3));
         assert!(
-            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("db") && reason.contains("unhealthy")),
+            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("\"db\"") && reason.contains("unhealthy")),
             "an unhealthy non-first workload fails closed naming it, got {err:?}"
         );
 
@@ -1203,7 +1221,7 @@ mod tests {
         ]);
         let err = block_on(await_readiness(&containers, &stuck, fast, 3));
         assert!(
-            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("db") && reason.contains("not ready")),
+            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("\"db\"") && reason.contains("not ready")),
             "a stuck non-first workload times out naming it, got {err:?}"
         );
     }
@@ -1715,8 +1733,27 @@ mod tests {
 
     /// The DB-only witness flag seeded in `playground/db/seed.sql`; it is reachable
     /// only by injection, so its presence in an HTTP response is an unambiguous
-    /// witness that the SQL injection executed. Kept in sync with that seed file.
+    /// witness that the SQL injection executed. Kept in sync with that seed file,
+    /// which `witness_flag_matches_the_seed` checks offline on every gate.
     const SQLI_WITNESS: &str = "REDSTEP_SQLI_WITNESS_7F3A";
+
+    /// Guard: the flag the exploit greps for is the one the db image actually
+    /// seeds. This runs offline on every gate, unlike `sqli_playground_is_exploitable`
+    /// which self-skips without Docker or the built images, so a drift between the
+    /// two copies of the witness cannot hide behind that self-skip and silently
+    /// disarm the exploit check (CLAUDE.md row 6, reached through a guard that did
+    /// not run). `include_str!` resolves the path across the workspace `exclude`
+    /// boundary at compile time. Mutation: change `SQLI_WITNESS` or the seed
+    /// literal so the two differ -> this fails.
+    #[test]
+    fn witness_flag_matches_the_seed() {
+        let seed = include_str!("../../../playground/db/seed.sql");
+        assert!(
+            seed.contains(SQLI_WITNESS),
+            "SQLI_WITNESS {SQLI_WITNESS:?} is not seeded in playground/db/seed.sql; \
+             the exploit grep and the db seed have drifted"
+        );
+    }
 
     /// A URL-encoded UNION injection for the `name` parameter that reads the flag
     /// from the `secrets` table (two columns, matching the `notes` lookup's two).
@@ -1724,9 +1761,11 @@ mod tests {
 
     /// A one-shot busybox probe: fetch web's `/lookup?name=<name>` and succeed
     /// (exit 0) only if the response carries the witness flag, so the existing
-    /// exit-code seam (`classify_probe`) reads the result. The `sh -c` pipe is a
-    /// test probe with a compile-time-constant command; it is not the
-    /// attacker-controlled target path that `nc_cmd` keeps shell-free.
+    /// exit-code seam (`classify_probe`) reads the result. `name` is interpolated
+    /// into a single-quoted `sh -c` string and is NOT shell-escaped, so callers
+    /// must pass a constant (both here do): an attacker-chosen `name` could break
+    /// out of the quotes. This is a test probe, not the product-path target string
+    /// that `nc_cmd` keeps shell-free for exactly that reason.
     fn sqli_probe_cmd(name: &str) -> Vec<String> {
         vec![
             "sh".to_owned(),
@@ -1746,9 +1785,11 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// Guard (Docker, Linux CI leg; self-skips without a daemon or the built
-    /// images): the bespoke `web -> api -> db` playground exposes a real,
-    /// exploitable SQLi (#47 AC 1). An injection through web's `/lookup` returns
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// bespoke `web -> api -> db` playground exposes a real, exploitable SQLi
+    /// (#47 AC 1). It runs locally after `playground/build.sh`; CI does not build
+    /// the playground images yet, so there it self-skips rather than running.
+    /// An injection through web's `/lookup` returns
     /// the DB-only witness flag (the injection executed), while a benign lookup
     /// does not, so the differential is real rather than a constant-true probe.
     /// It also exercises the readiness gate: `bring_up` returns only once web is
