@@ -1,5 +1,8 @@
 # --- Rust / Cargo ---
 /target/
+# The playground fixtures (#47) are standalone crates excluded from the
+# workspace, so they build into their own target dirs.
+playground/*/target/
 **/*.rs.bk
 *.pdb
 

@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use bollard::Docker;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, EndpointSettings,
-    NetworkCreateRequest, NetworkingConfig,
+    HealthStatusEnum, NetworkCreateRequest, NetworkingConfig,
 };
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
@@ -211,17 +211,35 @@ async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensure `image` is present locally, pulling it only if it is not. A locally
+/// built image (the playground's `redstep/*:mvp`, #47) is in no registry, so an
+/// unconditional [`pull_image`] would 404 on it; a registry image that is absent
+/// locally is pulled as before. An image that is neither present nor pullable
+/// still surfaces the pull's 404 as [`Error::LabUnavailable`].
+///
+/// A present image is therefore never re-pulled, so a mutable registry tag is not
+/// refreshed once it is local. That is acceptable here: the MVP's tags are pinned
+/// (`busybox:1.37`, `postgres:16`) and the playground tags are local-only, and it
+/// is the whole point, since a local-only image cannot be pulled at all.
+async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
+    if docker.inspect_image(image).await.is_ok() {
+        return Ok(());
+    }
+    pull_image(docker, image).await
+}
+
 async fn provision(
     docker: &Docker,
     env: &Environment,
     run_id: &str,
     lab: &mut RunningLab,
 ) -> Result<()> {
-    // Pull each distinct workload image before any container is created.
-    let mut pulled = std::collections::HashSet::new();
+    // Ensure each distinct workload image is present before any container is
+    // created (see `ensure_image` for why a present image is not re-pulled).
+    let mut ensured = std::collections::HashSet::new();
     for workload in env.workloads() {
-        if pulled.insert(workload.image()) {
-            pull_image(docker, workload.image()).await?;
+        if ensured.insert(workload.image()) {
+            ensure_image(docker, workload.image()).await?;
         }
     }
 
@@ -285,7 +303,131 @@ async fn provision(
             .map_err(lab_unavailable)?;
     }
 
+    // Wait until every workload reports healthy before returning, so a probe
+    // after bring-up is meaningful rather than racing a slow-start real image
+    // (#47). A stand-in declares no HEALTHCHECK and is ready at once, so the
+    // boundary demo is unchanged. On failure this propagates as `Err`, which
+    // `bring_up` tears the partial lab down on.
+    await_readiness(
+        &lab.containers,
+        &DockerHealthPoller { docker },
+        READINESS_POLL,
+        READINESS_MAX_POLLS,
+    )
+    .await?;
+
     Ok(())
+}
+
+/// How often `await_readiness` re-polls, and how many times before it gives up.
+/// The budget (`500ms * 120 = 60s`) is generous enough for a first-boot postgres
+/// to run its initdb seed and open its TCP listener; the images use a short
+/// HEALTHCHECK interval so `healthy` appears well inside it.
+const READINESS_POLL: Duration = Duration::from_millis(500);
+const READINESS_MAX_POLLS: u32 = 120;
+
+/// Whether a container is ready to be probed, read from its Docker health status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    /// Ready now: healthy, or no HEALTHCHECK declared (a stand-in).
+    Ready,
+    /// Still coming up (starting, or no result reported yet): re-poll.
+    Waiting,
+    /// Reported unhealthy: a definite failure, not something to wait out.
+    Failed,
+}
+
+/// Map a container's Docker health status to a [`Readiness`]. A container with no
+/// HEALTHCHECK reports no status (`None`) or `NONE` and is ready at once, so a
+/// stand-in (busybox `sleep`, no healthcheck) keeps its pre-#47 behaviour and the
+/// boundary demo is unchanged. `HEALTHY` is ready; `STARTING`/`EMPTY` (a
+/// healthcheck declared but with no result yet) is still coming up; `UNHEALTHY`
+/// is a failure that must not be waited out. Pure, so the mapping is unit-tested
+/// without Docker.
+fn health_readiness(status: Option<&HealthStatusEnum>) -> Readiness {
+    match status {
+        None | Some(HealthStatusEnum::NONE) | Some(HealthStatusEnum::HEALTHY) => Readiness::Ready,
+        Some(HealthStatusEnum::STARTING) | Some(HealthStatusEnum::EMPTY) => Readiness::Waiting,
+        Some(HealthStatusEnum::UNHEALTHY) => Readiness::Failed,
+    }
+}
+
+/// Reads a container's [`Readiness`]. [`DockerHealthPoller`] inspects the real
+/// container; the trait is the seam a unit test fills, so `await_readiness`'s loop
+/// (all ready / any failed / timeout) is verified without a Docker daemon, the way
+/// [`Prober`] does for the boundary self-check.
+trait HealthPoller {
+    async fn readiness(&self, container: &str) -> Result<Readiness>;
+}
+
+/// The real poller: inspect the container and classify its health status.
+struct DockerHealthPoller<'a> {
+    docker: &'a Docker,
+}
+
+impl HealthPoller for DockerHealthPoller<'_> {
+    async fn readiness(&self, container: &str) -> Result<Readiness> {
+        let info = self
+            .docker
+            .inspect_container(
+                container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(lab_unavailable)?;
+        let status = info.state.and_then(|s| s.health).and_then(|h| h.status);
+        Ok(health_readiness(status.as_ref()))
+    }
+}
+
+/// Wait until every container is [`Readiness::Ready`]. Polls every container each
+/// round (not a representative, so a non-first laggard is not missed, RK-009) over
+/// an injectable `poller`, re-polling every `interval` up to `max_polls` rounds.
+/// Fails closed: the moment any container is `Failed` it returns
+/// [`Error::LabUnavailable`] naming it, and if the budget runs out with any still
+/// `Waiting` it returns `LabUnavailable` naming them, so a never-healthy service
+/// is a bounded error rather than a hang (CLAUDE.md row 5).
+///
+/// It reads only the health status, not whether the container is still running,
+/// so a `Service` that declares no HEALTHCHECK and then exits reads `None` ->
+/// `Ready`. That is a known limit, not a verdict hazard: the playground tiers all
+/// declare healthchecks (a crash shows as unhealthy, not `None`), and a dead
+/// target downstream fails the boundary self-check's positive control closed and
+/// reads as `Low`-confidence unreachable at a vantage probe, which the oracle's
+/// default-`High` keeps out of a confident PASS.
+async fn await_readiness<P: HealthPoller>(
+    containers: &[LabContainer],
+    poller: &P,
+    interval: Duration,
+    max_polls: u32,
+) -> Result<()> {
+    let mut waiting: Vec<String> = Vec::new();
+    for _ in 0..max_polls.max(1) {
+        waiting.clear();
+        for c in containers {
+            match poller.readiness(c.name()).await? {
+                Readiness::Ready => {}
+                Readiness::Waiting => waiting.push(c.workload().to_owned()),
+                Readiness::Failed => {
+                    return Err(Error::LabUnavailable {
+                        reason: format!(
+                            "workload {:?} reported its healthcheck unhealthy during bring-up",
+                            c.workload()
+                        ),
+                    });
+                }
+            }
+        }
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(interval).await;
+    }
+    Err(Error::LabUnavailable {
+        reason: format!(
+            "lab workloads were not ready within the bring-up budget; still starting: {waiting:?}"
+        ),
+    })
 }
 
 /// Remove every listed container (forced) then every listed network, best
@@ -955,6 +1097,135 @@ mod tests {
         }
     }
 
+    /// A health poller that answers each container from a scripted sequence of
+    /// readiness values, advancing one per poll and repeating the last once the
+    /// script runs out. It lets `await_readiness`'s loop be tested without Docker:
+    /// a sequence like `[Waiting, Waiting, Ready]` models a slow-start service.
+    struct ScriptedPoller {
+        scripts: std::collections::HashMap<String, std::cell::RefCell<Vec<Readiness>>>,
+    }
+
+    impl ScriptedPoller {
+        fn new(scripts: &[(&str, &[Readiness])]) -> Self {
+            Self {
+                scripts: scripts
+                    .iter()
+                    .map(|(name, seq)| ((*name).to_owned(), std::cell::RefCell::new(seq.to_vec())))
+                    .collect(),
+            }
+        }
+    }
+
+    impl HealthPoller for ScriptedPoller {
+        async fn readiness(&self, container: &str) -> Result<Readiness> {
+            let mut seq = self
+                .scripts
+                .get(container)
+                .expect("a scripted container")
+                .borrow_mut();
+            // Advance while more than one step remains; the last value repeats.
+            Ok(if seq.len() > 1 { seq.remove(0) } else { seq[0] })
+        }
+    }
+
+    /// Guard: a container's Docker health status maps to the right readiness. No
+    /// HEALTHCHECK (`None`/`NONE`) and `HEALTHY` are ready (so a stand-in is ready
+    /// at once and the boundary demo is unchanged); `STARTING`/`EMPTY` are still
+    /// coming up; `UNHEALTHY` is a failure. Mutation: map `UNHEALTHY -> Ready` ->
+    /// the Failed assert here fails and the fail-closed `await_readiness` test
+    /// stops erroring; map `None -> Waiting` -> a stand-in never readies (the demo
+    /// would hang) and the None assert fails.
+    #[test]
+    fn health_readiness_maps_each_status() {
+        assert_eq!(health_readiness(None), Readiness::Ready);
+        assert_eq!(
+            health_readiness(Some(&HealthStatusEnum::NONE)),
+            Readiness::Ready
+        );
+        assert_eq!(
+            health_readiness(Some(&HealthStatusEnum::HEALTHY)),
+            Readiness::Ready
+        );
+        assert_eq!(
+            health_readiness(Some(&HealthStatusEnum::STARTING)),
+            Readiness::Waiting
+        );
+        assert_eq!(
+            health_readiness(Some(&HealthStatusEnum::EMPTY)),
+            Readiness::Waiting
+        );
+        assert_eq!(
+            health_readiness(Some(&HealthStatusEnum::UNHEALTHY)),
+            Readiness::Failed
+        );
+    }
+
+    /// Guard: `await_readiness` returns `Ok` only when every container is ready,
+    /// waits out a container that is still starting, fails closed the moment one
+    /// is unhealthy, and times out (bounded) on one stuck starting. The unhealthy
+    /// and the stuck container are NON-FIRST (`c-db`), so a check that looked only
+    /// at the first container would wrongly pass (RK-009). Mutation: return `Ok`
+    /// as soon as the first container is ready -> the unhealthy and stuck cases
+    /// return `Ok` -> this fails; treat `Failed` as `Waiting` -> the unhealthy case
+    /// times out instead of naming it "unhealthy" -> the reason assert fails; drop
+    /// the `max_polls` bound (loop forever) -> the stuck case hangs.
+    #[test]
+    fn await_readiness_waits_for_all_and_fails_closed() {
+        let containers = vec![
+            container("web", "lab", "c-web"),
+            container("api", "lab", "c-api"),
+            container("db", "lab", "c-db"),
+        ];
+        let fast = Duration::from_millis(1);
+
+        let all_ready = ScriptedPoller::new(&[
+            ("c-web", &[Readiness::Ready]),
+            ("c-api", &[Readiness::Ready]),
+            ("c-db", &[Readiness::Ready]),
+        ]);
+        assert!(block_on(await_readiness(&containers, &all_ready, fast, 3)).is_ok());
+
+        // max_polls is clamped to at least one real round, so a 0 budget still
+        // polls once and returns Ok when all are ready, not a spurious timeout.
+        // Mutation: drop the `.max(1)` -> the 0 budget skips the loop and returns
+        // the timeout Err -> this fails.
+        assert!(block_on(await_readiness(&containers, &all_ready, fast, 0)).is_ok());
+
+        // A non-first container that starts, then becomes ready: it must be waited
+        // out, not read as ready too early.
+        let becomes_ready = ScriptedPoller::new(&[
+            ("c-web", &[Readiness::Ready]),
+            (
+                "c-api",
+                &[Readiness::Waiting, Readiness::Waiting, Readiness::Ready],
+            ),
+            ("c-db", &[Readiness::Ready]),
+        ]);
+        assert!(block_on(await_readiness(&containers, &becomes_ready, fast, 5)).is_ok());
+
+        let unhealthy = ScriptedPoller::new(&[
+            ("c-web", &[Readiness::Ready]),
+            ("c-api", &[Readiness::Ready]),
+            ("c-db", &[Readiness::Failed]),
+        ]);
+        let err = block_on(await_readiness(&containers, &unhealthy, fast, 3));
+        assert!(
+            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("\"db\"") && reason.contains("unhealthy")),
+            "an unhealthy non-first workload fails closed naming it, got {err:?}"
+        );
+
+        let stuck = ScriptedPoller::new(&[
+            ("c-web", &[Readiness::Ready]),
+            ("c-api", &[Readiness::Ready]),
+            ("c-db", &[Readiness::Waiting]),
+        ]);
+        let err = block_on(await_readiness(&containers, &stuck, fast, 3));
+        assert!(
+            matches!(&err, Err(Error::LabUnavailable { reason }) if reason.contains("\"db\"") && reason.contains("not ready")),
+            "a stuck non-first workload times out naming it, got {err:?}"
+        );
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1456,6 +1727,155 @@ mod tests {
             assert!(
                 observation.value,
                 "a Service workload runs its listener, so the vantage reaches it"
+            );
+        });
+    }
+
+    /// The DB-only witness flag seeded in `playground/db/seed.sql`; it is reachable
+    /// only by injection, so its presence in an HTTP response is an unambiguous
+    /// witness that the SQL injection executed. Kept in sync with that seed file,
+    /// which `witness_flag_matches_the_seed` checks offline on every gate.
+    const SQLI_WITNESS: &str = "REDSTEP_SQLI_WITNESS_7F3A";
+
+    /// Guard: the flag the exploit greps for is the one the db image actually
+    /// seeds. This runs offline on every gate, unlike `sqli_playground_is_exploitable`
+    /// which self-skips without Docker or the built images, so a drift between the
+    /// two copies of the witness cannot hide behind that self-skip and silently
+    /// disarm the exploit check (CLAUDE.md row 6, reached through a guard that did
+    /// not run). `include_str!` resolves the path across the workspace `exclude`
+    /// boundary at compile time. Mutation: change `SQLI_WITNESS` or the seed
+    /// literal so the two differ -> this fails.
+    #[test]
+    fn witness_flag_matches_the_seed() {
+        let seed = include_str!("../../../playground/db/seed.sql");
+        assert!(
+            seed.contains(SQLI_WITNESS),
+            "SQLI_WITNESS {SQLI_WITNESS:?} is not seeded in playground/db/seed.sql; \
+             the exploit grep and the db seed have drifted"
+        );
+    }
+
+    /// A URL-encoded UNION injection for the `name` parameter that reads the flag
+    /// from the `secrets` table (two columns, matching the `notes` lookup's two).
+    const SQLI_INJECTION: &str = "%27%20UNION%20SELECT%20flag%2C%27x%27%20FROM%20secrets--%20";
+
+    /// A one-shot busybox probe: fetch web's `/lookup?name=<name>` and succeed
+    /// (exit 0) only if the response carries the witness flag, so the existing
+    /// exit-code seam (`classify_probe`) reads the result. `name` is interpolated
+    /// into a single-quoted `sh -c` string and is NOT shell-escaped, so callers
+    /// must pass a constant (both here do): an attacker-chosen `name` could break
+    /// out of the quotes. This is a test probe, not the product-path target string
+    /// that `nc_cmd` keeps shell-free for exactly that reason.
+    fn sqli_probe_cmd(name: &str) -> Vec<String> {
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("wget -qO- 'http://web:8080/lookup?name={name}' | grep -q '{SQLI_WITNESS}'"),
+        ]
+    }
+
+    /// Whether a local image tag exists, so the playground test self-skips (green)
+    /// when the `redstep/*:mvp` images have not been built (`playground/build.sh`),
+    /// the way `linux_docker_available` self-skips without a daemon.
+    fn image_present(image: &str) -> bool {
+        std::process::Command::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// bespoke `web -> api -> db` playground exposes a real, exploitable SQLi
+    /// (#47 AC 1). It runs locally after `playground/build.sh`; CI does not build
+    /// the playground images yet, so there it self-skips rather than running.
+    /// An injection through web's `/lookup` returns
+    /// the DB-only witness flag (the injection executed), while a benign lookup
+    /// does not, so the differential is real rather than a constant-true probe.
+    /// It also exercises the readiness gate: `bring_up` returns only once web is
+    /// healthy, and web is healthy only when api and the seeded db are, so the
+    /// probe does not race a slow-start image. Mutation: have `api` use a
+    /// parameterized query (the fix, the check slice) -> the exploit probe no
+    /// longer finds the flag -> this fails; make the control use the injection too
+    /// -> the control is no longer `false` -> this fails.
+    ///
+    /// The flat single-segment topology is this demo's: the attacker vantage and
+    /// all three tiers share one egress-less network, and `web -> api -> db` is an
+    /// application chain by DNS name. The network-segmented boundary ("db not
+    /// directly reachable") is the boundary demo's own lab; the enforced port
+    /// boundary is M3. It reuses the one-shot probe seam (`run_probe_cmd`) with a
+    /// busybox `wget | grep`, so no first-class HTTP capability is built here (that
+    /// is the check slice). It lives in-crate because `run_probe_cmd` is
+    /// `pub(crate)` and it reads a run-scoped network name off the `RunningLab`.
+    #[test]
+    fn sqli_playground_is_exploitable() {
+        if !linux_docker_available() {
+            eprintln!("skipping sqli_playground_is_exploitable: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/web:mvp", "redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping sqli_playground_is_exploitable: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            pull_image(&docker, PROBE_IMAGE)
+                .await
+                .expect("pull the probe image");
+
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("web", "redstep/web:mvp", "lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat playground environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let net = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .name()
+                .to_owned();
+
+            let exploit = run_probe_cmd(
+                &docker,
+                &net,
+                sqli_probe_cmd(SQLI_INJECTION),
+                Duration::from_secs(10),
+            )
+            .await;
+            let control = run_probe_cmd(
+                &docker,
+                &net,
+                sqli_probe_cmd("welcome"),
+                Duration::from_secs(10),
+            )
+            .await;
+
+            // Clean up before asserting so a failed assertion does not leak the lab.
+            let _ = lab.teardown().await;
+
+            let exploited = classify_probe(&exploit.expect("the exploit probe ran"))
+                .expect("the exploit probe exited cleanly");
+            let control_hit = classify_probe(&control.expect("the control probe ran"))
+                .expect("the control probe exited cleanly");
+            assert!(
+                exploited,
+                "the UNION injection returns the DB-only witness flag: the SQLi executed"
+            );
+            assert!(
+                !control_hit,
+                "a benign lookup never returns the witness flag: the differential is real"
             );
         });
     }

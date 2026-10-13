@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/redstep", "crates/redstep-macros"]
+# The playground targets (#47) are deliberately vulnerable fixtures built only as
+# Docker images, never by the gate: excluded so the framework's own lints never
+# see their raw-concat SQL and so their deps stay out of the workspace lockfile.
+exclude = ["playground"]
 
 # unsafe is off by default across the tree; a future -sys binding or raw-socket
 # primitive opts a single module back in. See docs/rules/unsafe.md.
