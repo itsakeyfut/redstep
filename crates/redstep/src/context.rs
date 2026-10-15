@@ -299,7 +299,7 @@ impl TestContext {
     /// request from a container on the vantage network (`sqli_exploit_from`) and
     /// captures the response body, so the observation and its evidence are what the
     /// attacker's vantage would see, not a host-run request. `request_path` carries
-    /// the payload (URL-encoded), and `witness` is the DB-only value whose presence
+    /// the payload (URL-encoded), and `marker` is the DB-only value whose presence
     /// in the response proves the injection executed. An exploit is observed at
     /// `High`, a clean non-exploit at `High`, and an abnormal probe at `Low`
     /// (Inconclusive under the default gate), so a probe that could not reach the
@@ -307,13 +307,17 @@ impl TestContext {
     ///
     /// The diagnostic is the built-in check's, not the author's (ADR-0009): the
     /// test writes `ctx.expect(&recorded).to_be(false)` and the framework supplies
-    /// the cause and the remediation. Errors with [`Error::LabUnavailable`] on a
-    /// context with no lab bound, like [`connect_from_vantage`](Self::connect_from_vantage).
+    /// the cause and the remediation. It is carried only when the injection
+    /// actually executed (`observation.value`): its text asserts the injection ran,
+    /// which is true only then, so a `to_be(true)` expectation observing a clean
+    /// `false` gets `judge`'s generic text, not a false "the injection executed".
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound, like
+    /// [`connect_from_vantage`](Self::connect_from_vantage).
     pub async fn exploit_sqli_from_vantage(
         &self,
         target: &ScopedTarget,
         request_path: &str,
-        witness: &str,
+        marker: &str,
     ) -> Result<Recorded<bool>> {
         let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
             reason: "no attacker vantage is bound to this run; exploit_sqli_from_vantage needs a lab (run_in_lab)"
@@ -324,24 +328,18 @@ impl TestContext {
             &binding.vantage_network,
             target,
             request_path,
-            witness,
+            marker,
             DEFAULT_CONNECT_TIMEOUT,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
-        let diagnostic = Diagnostic {
-            probable_cause: format!(
-                "the injected request returned {witness:?}, a value present only in the database, \
-                 so the endpoint interpolated request input into its SQL and the injection executed"
-            ),
-            remediation: "use a parameterized query (a prepared statement with bound parameters) \
-                 so request input cannot alter the SQL"
-                .to_owned(),
-        };
+        // Only an executed injection earns the domain diagnostic; its text asserts
+        // the injection ran, which holds iff the marker was observed.
+        let diagnostic = observation.value.then(|| sqli_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
-            diagnostic: Some(diagnostic),
+            diagnostic,
         })
     }
 
@@ -349,7 +347,8 @@ impl TestContext {
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
     /// base id to resolve the run-scoped `EvidenceId` (issue #14). Shared by
-    /// [`run`](Self::run) and [`connect_from_vantage`](Self::connect_from_vantage).
+    /// [`run`](Self::run), [`connect_from_vantage`](Self::connect_from_vantage) and
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage).
     fn record_draft(&self, draft: EvidenceDraft) -> DraftRef {
         let mut drafts = self.evidence_drafts.borrow_mut();
         let index = drafts.len();
@@ -358,7 +357,25 @@ impl TestContext {
     }
 }
 
-/// What [`TestContext::run`] and [`TestContext::connect_from_vantage`] return:
+/// The ADR-0009 domain diagnostic for a successful SQL injection: the cause names
+/// the `marker` the injection exfiltrated and that input reached the SQL, and the
+/// remediation is a parameterized query. Framework-emitted, not author-written
+/// (ADR-0009). Pure, so the text is guarded without Docker
+/// (`sqli_diagnostic_names_the_marker_and_the_fix`).
+fn sqli_diagnostic(marker: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the injected request returned {marker:?}, a value present only in the database, \
+             so the endpoint interpolated request input into its SQL and the injection executed"
+        ),
+        remediation: "use a parameterized query (a prepared statement with bound parameters) \
+             so request input cannot alter the SQL"
+            .to_owned(),
+    }
+}
+
+/// What [`TestContext::run`], [`TestContext::connect_from_vantage`] and
+/// [`TestContext::exploit_sqli_from_vantage`] return:
 /// the capability's [`Observation`] and a per-test reference to the evidence it
 /// produced. Passing it to [`expect`](TestContext::expect) links the judgement to
 /// that evidence automatically.
@@ -847,6 +864,27 @@ mod tests {
             matches!(result, Err(Error::LabUnavailable { .. })),
             "exploit_sqli_from_vantage without a vantage must fail closed (got Ok: {})",
             result.is_ok()
+        );
+    }
+
+    /// Guard: the SQLi domain diagnostic names the exfiltrated marker and the
+    /// injection in its cause, and a parameterized query in its remediation, so a
+    /// reader gets the ADR-0009 actionable guidance rather than generic text. Pure,
+    /// no Docker (the diagnostic text otherwise has only the Docker-gated demo as a
+    /// guard). Mutation: drop the marker from the cause, or change "parameterized"
+    /// in the remediation -> the matching assertion fails.
+    #[test]
+    fn sqli_diagnostic_names_the_marker_and_the_fix() {
+        let d = sqli_diagnostic("FLAG123");
+        assert!(
+            d.probable_cause.contains("FLAG123") && d.probable_cause.contains("injection"),
+            "the cause names the marker and the injection: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("parameterized"),
+            "the remediation names a parameterized query: {:?}",
+            d.remediation
         );
     }
 }
