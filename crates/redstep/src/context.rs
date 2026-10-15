@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
-use crate::orchestrator::{LabNetwork, tcp_reachable_from};
+use crate::orchestrator::{LabNetwork, sqli_exploit_from, tcp_reachable_from};
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
 
@@ -162,6 +162,7 @@ impl TestContext {
             ctx: self,
             observation: subject.observation(),
             draft_ref: subject.draft_ref(),
+            diagnostic: subject.diagnostic(),
             min_confidence: Confidence::High,
         }
     }
@@ -234,6 +235,7 @@ impl TestContext {
         Ok(Recorded {
             observation,
             draft_ref,
+            diagnostic: None,
         })
     }
 
@@ -284,6 +286,60 @@ impl TestContext {
         Ok(Recorded {
             observation,
             draft_ref,
+            diagnostic: None,
+        })
+    }
+
+    /// Attempt a SQL injection against `target` from the attacker's vantage and
+    /// return its [`Recorded`] result, carrying an ADR-0009 domain diagnostic that
+    /// [`to_be`](ExpectationBuilder::to_be) attaches if the expectation fails.
+    ///
+    /// The lab-wired counterpart of [`run`](Self::run) for the SQLi check, parallel
+    /// to [`connect_from_vantage`](Self::connect_from_vantage): it runs an injected
+    /// request from a container on the vantage network (`sqli_exploit_from`) and
+    /// captures the response body, so the observation and its evidence are what the
+    /// attacker's vantage would see, not a host-run request. `request_path` carries
+    /// the payload (URL-encoded), and `marker` is the DB-only value whose presence
+    /// in the response proves the injection executed. An exploit is observed at
+    /// `High`, a clean non-exploit at `High`, and an abnormal probe at `Low`
+    /// (Inconclusive under the default gate), so a probe that could not reach the
+    /// endpoint never reads as a confident "secure" (ADR-0010, RK-002).
+    ///
+    /// The diagnostic is the built-in check's, not the author's (ADR-0009): the
+    /// test writes `ctx.expect(&recorded).to_be(false)` and the framework supplies
+    /// the cause and the remediation. It is carried only when the injection
+    /// actually executed (`observation.value`): its text asserts the injection ran,
+    /// which is true only then, so a `to_be(true)` expectation observing a clean
+    /// `false` gets `judge`'s generic text, not a false "the injection executed".
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound, like
+    /// [`connect_from_vantage`](Self::connect_from_vantage).
+    pub async fn exploit_sqli_from_vantage(
+        &self,
+        target: &ScopedTarget,
+        request_path: &str,
+        marker: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_sqli_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = sqli_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            request_path,
+            marker,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only an executed injection earns the domain diagnostic; its text asserts
+        // the injection ran, which holds iff the marker was observed.
+        let diagnostic = observation.value.then(|| sqli_diagnostic(marker));
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
         })
     }
 
@@ -291,7 +347,8 @@ impl TestContext {
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
     /// base id to resolve the run-scoped `EvidenceId` (issue #14). Shared by
-    /// [`run`](Self::run) and [`connect_from_vantage`](Self::connect_from_vantage).
+    /// [`run`](Self::run), [`connect_from_vantage`](Self::connect_from_vantage) and
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage).
     fn record_draft(&self, draft: EvidenceDraft) -> DraftRef {
         let mut drafts = self.evidence_drafts.borrow_mut();
         let index = drafts.len();
@@ -300,7 +357,25 @@ impl TestContext {
     }
 }
 
-/// What [`TestContext::run`] and [`TestContext::connect_from_vantage`] return:
+/// The ADR-0009 domain diagnostic for a successful SQL injection: the cause names
+/// the `marker` the injection exfiltrated and that input reached the SQL, and the
+/// remediation is a parameterized query. Framework-emitted, not author-written
+/// (ADR-0009). Pure, so the text is guarded without Docker
+/// (`sqli_diagnostic_names_the_marker_and_the_fix`).
+fn sqli_diagnostic(marker: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the injected request returned {marker:?}, a value present only in the database, \
+             so the endpoint interpolated request input into its SQL and the injection executed"
+        ),
+        remediation: "use a parameterized query (a prepared statement with bound parameters) \
+             so request input cannot alter the SQL"
+            .to_owned(),
+    }
+}
+
+/// What [`TestContext::run`], [`TestContext::connect_from_vantage`] and
+/// [`TestContext::exploit_sqli_from_vantage`] return:
 /// the capability's [`Observation`] and a per-test reference to the evidence it
 /// produced. Passing it to [`expect`](TestContext::expect) links the judgement to
 /// that evidence automatically.
@@ -310,7 +385,8 @@ impl TestContext {
 /// `Observation` a `Capability` returns to all carry a link they cannot fill, and
 /// would make `execute`'s observation meaningless until `run` rewrote it. So the
 /// observation stays a plain signal and only a capability's result carries a link
-/// (ADR-0010, issue #14). Only `run` and `connect_from_vantage` construct one.
+/// (ADR-0010, issue #14). Only `run`, `connect_from_vantage` and
+/// `exploit_sqli_from_vantage` construct one.
 ///
 /// The reference is a per-test index (see [`DraftRef`]), so a
 /// `Recorded` is only meaningful to the context that produced it. Judging one on
@@ -322,6 +398,12 @@ pub struct Recorded<T> {
     /// The signal the capability observed.
     pub observation: Observation<T>,
     draft_ref: DraftRef,
+    /// A domain [`Diagnostic`] (ADR-0009) a built-in check supplies, which
+    /// [`to_be`](ExpectationBuilder::to_be) attaches on a `Fail`, replacing
+    /// `judge`'s generic text. `None` for `run`/`connect_from_vantage`, whose
+    /// expectations get the generic diagnostic; `Some` for a domain check like
+    /// `exploit_sqli_from_vantage`.
+    diagnostic: Option<Diagnostic>,
 }
 
 /// The input [`expect`](TestContext::expect) accepts: a [`Recorded`] result,
@@ -339,6 +421,12 @@ pub trait Expectable<T>: sealed::Sealed {
     fn observation(&self) -> &Observation<T>;
     /// The per-test reference to the evidence the observation came from, if any.
     fn draft_ref(&self) -> Option<DraftRef>;
+    /// The domain diagnostic a built-in check supplied, attached on a `Fail`
+    /// (ADR-0009). Defaults to `None`; a bare `Observation` carries none, and only
+    /// a [`Recorded`] from a domain check overrides it.
+    fn diagnostic(&self) -> Option<Diagnostic> {
+        None
+    }
 }
 
 impl<T> Expectable<T> for Observation<T> {
@@ -356,6 +444,9 @@ impl<T> Expectable<T> for Recorded<T> {
     }
     fn draft_ref(&self) -> Option<DraftRef> {
         Some(self.draft_ref)
+    }
+    fn diagnostic(&self) -> Option<Diagnostic> {
+        self.diagnostic.clone()
     }
 }
 
@@ -382,6 +473,7 @@ pub struct ExpectationBuilder<'a, T> {
     ctx: &'a TestContext,
     observation: &'a Observation<T>,
     draft_ref: Option<DraftRef>,
+    diagnostic: Option<Diagnostic>,
     min_confidence: Confidence,
 }
 
@@ -395,11 +487,28 @@ impl<'a, T: PartialEq + Debug> ExpectationBuilder<'a, T> {
     /// Expect the observed value to be `expected`. Judges, records the judgement
     /// with the reference to the evidence it judged (if the observation came from
     /// a capability), and returns the verdict.
+    ///
+    /// A domain check's diagnostic (carried on the [`Recorded`], ADR-0009) is
+    /// attached on a `Fail`, replacing `judge`'s generic text; a `Pass` or
+    /// `Inconclusive` carries none, and an observation with no domain diagnostic
+    /// keeps `judge`'s generic one.
     pub fn to_be(self, expected: T) -> Verdict {
-        let expectation = Expectation::to_be(expected).min_confidence(self.min_confidence);
-        let judgement = judge(self.observation, &expectation);
+        let Self {
+            ctx,
+            observation,
+            draft_ref,
+            diagnostic,
+            min_confidence,
+        } = self;
+        let expectation = Expectation::to_be(expected).min_confidence(min_confidence);
+        let mut judgement = judge(observation, &expectation);
+        if judgement.verdict == Verdict::Fail
+            && let Some(domain) = diagnostic
+        {
+            judgement.diagnostic = Some(domain);
+        }
         let verdict = judgement.verdict;
-        self.ctx.record(judgement, self.draft_ref);
+        ctx.record(judgement, draft_ref);
         verdict
     }
 }
@@ -645,6 +754,68 @@ mod tests {
         );
     }
 
+    /// Guard: a domain check's diagnostic, carried on the `Recorded` (as
+    /// `exploit_sqli_from_vantage` does), is attached by `to_be` on a `Fail`,
+    /// replacing judge's generic text, and dropped on a `Pass`; a `Recorded` with
+    /// no domain diagnostic keeps judge's generic one. Mutation: attach it
+    /// unconditionally in `to_be` -> the Pass gains it -> the pass assertion fails;
+    /// never attach it -> the Fail keeps the generic text -> the domain-text
+    /// assertion fails.
+    #[test]
+    fn to_be_attaches_a_carried_domain_diagnostic_on_fail_only() {
+        let domain = Diagnostic {
+            probable_cause: "DOMAIN-CAUSE".to_owned(),
+            remediation: "DOMAIN-FIX".to_owned(),
+        };
+        let recorded = |value| Recorded {
+            observation: Observation {
+                value,
+                confidence: Confidence::High,
+            },
+            draft_ref: DraftRef::new(0),
+            diagnostic: Some(domain.clone()),
+        };
+
+        let ctx = TestContext::new(Scope::default());
+        // Observed true against expected-false -> Fail -> the domain diagnostic.
+        assert_eq!(ctx.expect(&recorded(true)).to_be(false), Verdict::Fail);
+        // Observed false against expected-false -> Pass -> no diagnostic.
+        assert_eq!(ctx.expect(&recorded(false)).to_be(false), Verdict::Pass);
+
+        let pairs = ctx.take_judgements();
+        let (failed, _) = &pairs[0];
+        let d = failed
+            .diagnostic
+            .as_ref()
+            .expect("a Fail carries a diagnostic");
+        assert_eq!(d.probable_cause, "DOMAIN-CAUSE");
+        assert_eq!(d.remediation, "DOMAIN-FIX");
+        let (passed, _) = &pairs[1];
+        assert!(passed.diagnostic.is_none(), "a Pass carries no diagnostic");
+
+        // A Recorded carrying no domain diagnostic keeps judge's generic text.
+        let bare = Recorded {
+            observation: Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            draft_ref: DraftRef::new(0),
+            diagnostic: None,
+        };
+        let ctx2 = TestContext::new(Scope::default());
+        ctx2.expect(&bare).to_be(false);
+        let generic = ctx2.take_judgements();
+        let (gen_fail, _) = &generic[0];
+        let gd = gen_fail
+            .diagnostic
+            .as_ref()
+            .expect("a Fail carries a diagnostic");
+        assert_ne!(
+            gd.probable_cause, "DOMAIN-CAUSE",
+            "with no domain diagnostic the Fail keeps judge's generic text"
+        );
+    }
+
     /// Guard: `connect_from_vantage` on a context with no lab bound (the host path, built by
     /// `new`) fails closed with `LabUnavailable` rather than panicking or acting:
     /// a host run has no vantage to probe from, so it must error before any
@@ -667,6 +838,53 @@ mod tests {
             matches!(result, Err(Error::LabUnavailable { .. })),
             "connect_from_vantage without a vantage must fail closed (got Ok: {})",
             result.is_ok()
+        );
+    }
+
+    /// Guard: `exploit_sqli_from_vantage` on a context with no lab bound fails
+    /// closed with `LabUnavailable` rather than panicking or acting, like
+    /// `connect_from_vantage`: a host run has no vantage to inject from, so it must
+    /// error before any Docker call (this needs no daemon). Mutation: unwrap
+    /// `self.lab` instead of the `ok_or_else` -> the `None` case panics -> this
+    /// (expecting an `Err`) fails.
+    #[test]
+    fn exploit_sqli_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("web:8080")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("web:8080").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result =
+            runtime.block_on(ctx.exploit_sqli_from_vantage(&target, "/lookup?name=x", "FLAG"));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_sqli_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the SQLi domain diagnostic names the exfiltrated marker and the
+    /// injection in its cause, and a parameterized query in its remediation, so a
+    /// reader gets the ADR-0009 actionable guidance rather than generic text. Pure,
+    /// no Docker (the diagnostic text otherwise has only the Docker-gated demo as a
+    /// guard). Mutation: drop the marker from the cause, or change "parameterized"
+    /// in the remediation -> the matching assertion fails.
+    #[test]
+    fn sqli_diagnostic_names_the_marker_and_the_fix() {
+        let d = sqli_diagnostic("FLAG123");
+        assert!(
+            d.probable_cause.contains("FLAG123") && d.probable_cause.contains("injection"),
+            "the cause names the marker and the injection: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("parameterized"),
+            "the remediation names a parameterized query: {:?}",
+            d.remediation
         );
     }
 }
