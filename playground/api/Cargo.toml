@@ -10,6 +10,12 @@ publish = false
 name = "app"
 path = "src/main.rs"
 
+# `fixed` builds the patched variant (redstep/api:fixed, #54): `/lookup` runs a
+# parameterized query instead of the string-concatenated one. Default-off, so the
+# plain build is the vulnerable mvp image. Adds no dependency.
+[features]
+fixed = []
+
 [dependencies]
 # A tiny blocking HTTP server; the fixture needs no async runtime of its own.
 tiny_http = "0.12.0"
