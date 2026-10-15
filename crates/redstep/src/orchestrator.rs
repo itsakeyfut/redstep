@@ -48,7 +48,7 @@ use crate::environment::{Environment, WorkloadKind};
 use crate::error::{Error, Result};
 use crate::evidence::{EvidenceDraft, NodeRef, Reproduction};
 use crate::intensity::Intensity;
-use crate::observation::Observation;
+use crate::observation::{Confidence, Observation};
 use crate::scope::{Scope, ScopedTarget};
 
 /// A segment's Docker network, paired with the segment it was built from so the
@@ -615,6 +615,50 @@ async fn run_probe_cmd(
     result
 }
 
+/// Like [`run_probe_cmd`], but capture the container's stdout (for an HTTP probe,
+/// the response body) before removing it. `run_probe_cmd` removes the container as
+/// it returns, so it can only yield an exit code; the SQLi check needs the body to
+/// witness the exfiltrated flag. The logs are read after the probe exits and
+/// before removal. This is the narrow log-capturing path #50 needs; the
+/// generalized in-container seam is M3 (mvp.md).
+async fn run_probe_capturing(
+    docker: &Docker,
+    network: &str,
+    cmd: Vec<String>,
+    max_wait: Duration,
+) -> Result<(ContainerState, String)> {
+    use futures_util::StreamExt;
+
+    let name = format!("{}-probe", run_id());
+    let result = async {
+        let state = run_probe_to_exit(docker, &name, network, cmd, max_wait).await?;
+        let options = bollard::query_parameters::LogsOptionsBuilder::default()
+            .stdout(true)
+            .build();
+        let mut stream = docker.logs(&name, Some(options));
+        let mut stdout = Vec::new();
+        while let Some(frame) = stream.next().await {
+            if let bollard::container::LogOutput::StdOut { message } =
+                frame.map_err(lab_unavailable)?
+            {
+                stdout.extend_from_slice(&message);
+            }
+        }
+        Ok((state, String::from_utf8_lossy(&stdout).into_owned()))
+    }
+    .await;
+    let _ = docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    result
+}
+
 async fn run_probe_to_exit(
     docker: &Docker,
     name: &str,
@@ -830,6 +874,140 @@ fn vantage_draft(
             params: serde_json::json!({
                 "timeout_ms": applied.as_millis() as u64,
                 "vantage_segment": segment,
+            }),
+        },
+    }
+}
+
+/// Observe whether an injected request to `target` from the attacker's vantage
+/// returns the DB-only `witness`, i.e. whether a SQL injection executed. It runs a
+/// busybox `wget` of `http://<target><request_path>` from a container on the
+/// `vantage` network and inspects the captured response body for `witness`.
+/// `request_path` is the full path and query carrying the payload (e.g.
+/// `/lookup?name=<url-encoded UNION>`), already URL-encoded by the caller.
+///
+/// Like [`tcp_reachable_from`], the types are the gate (a [`LabNetwork`] is only
+/// from `bring_up`, a [`ScopedTarget`] only from the resolver, so the probe runs
+/// on a real egress-less network against an in-scope target), the draft is a
+/// first-class vantage record (distinct capability name, the vantage segment as
+/// its `source`), and it records the stable segment so a replay can reconstruct it
+/// (ADR-0022, #50 slice beta). The confidence is [`classify_sqli`]'s: an abnormal
+/// probe is `Low`, never a confident "not exploitable".
+pub(crate) async fn sqli_exploit_from(
+    docker: &Docker,
+    vantage: &LabNetwork,
+    target: &ScopedTarget,
+    request_path: &str,
+    witness: &str,
+    timeout: Duration,
+) -> Result<(Observation<bool>, EvidenceDraft)> {
+    let secs = timeout.as_secs().max(1);
+    let applied = Duration::from_secs(secs);
+    let url = format!("http://{}:{}{}", target.host(), target.port(), request_path);
+    let cmd = wget_cmd(&url, secs);
+    let (state, body) = run_probe_capturing(
+        docker,
+        vantage.name(),
+        cmd,
+        applied + Duration::from_secs(5),
+    )
+    .await?;
+    let observation = classify_sqli(&state, &body, witness);
+    let spec = format!("{}:{}", target.host(), target.port());
+    let draft = sqli_draft(
+        vantage.segment(),
+        spec,
+        request_path,
+        witness,
+        &observation,
+        applied,
+    );
+    Ok((observation, draft))
+}
+
+/// The busybox `wget` probe as argv (never a shell line): fetch `url` to stdout,
+/// giving up after `secs`. Passing argv directly rather than through `sh -c` means
+/// the url is one argument, not text a shell could interpret, so it cannot inject
+/// a command into the probe container (contrast the #47 exploitability test, whose
+/// `sh -c "wget | grep"` was a test probe with a constant command). Pure, so the
+/// argv shape is unit-tested without Docker.
+fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
+    vec![
+        "wget".to_owned(),
+        "-q".to_owned(),
+        "-T".to_owned(),
+        secs.to_string(),
+        "-O".to_owned(),
+        "-".to_owned(),
+        url.to_owned(),
+    ]
+}
+
+/// Classify a captured SQLi probe (see [`sqli_exploit_from`]). A clean exit (0)
+/// whose body contains the `witness` is an exploit (`true`, `High`); a clean exit
+/// whose body lacks it is not-exploitable (`false`, `High`); any other exit code,
+/// or an unclean exit, is `Low` (value `false`), because the probe did not
+/// establish the endpoint's state and must not read as a confident "not
+/// exploitable" (a connect failure or an HTTP error is not a clean negative;
+/// RK-002, CLAUDE.md row 6). Taking the state (not a bare code) folds the
+/// exited-cleanly check in via [`finished_exit_code`], so the whole fail-closed
+/// mapping is unit-tested without Docker.
+fn classify_sqli(state: &ContainerState, body: &str, witness: &str) -> Observation<bool> {
+    match finished_exit_code(state) {
+        Ok(0) if body.contains(witness) => Observation {
+            value: true,
+            confidence: Confidence::High,
+        },
+        Ok(0) => Observation {
+            value: false,
+            confidence: Confidence::High,
+        },
+        _ => Observation {
+            value: false,
+            confidence: Confidence::Low,
+        },
+    }
+}
+
+/// Compose the evidence draft for a SQLi vantage probe (parallel to
+/// [`vantage_draft`]). Pure, so the first-class `source` and the replay witness
+/// (the request path, the witness string, and the stable segment) are testable
+/// without Docker. The request path and witness in the reproduction are what a
+/// replay re-runs (ADR-0022, #50 slice beta); the segment appears in both `source`
+/// and the params for the same self-contained-reproduction reason as `vantage_draft`.
+fn sqli_draft(
+    segment: &str,
+    target_spec: String,
+    request_path: &str,
+    witness: &str,
+    observation: &Observation<bool>,
+    applied: Duration,
+) -> EvidenceDraft {
+    let summary = if observation.value {
+        format!("the response carried the DB-only witness {witness:?}; the injection executed")
+    } else if observation.confidence == Confidence::High {
+        "the response did not carry the witness; not exploitable".to_owned()
+    } else {
+        "the probe did not complete cleanly; exploitation is inconclusive".to_owned()
+    };
+    EvidenceDraft {
+        capability: "sqli_vantage",
+        target: target_spec.clone(),
+        intensity: Intensity::Safe,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary,
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
+        reproduction: Reproduction {
+            capability: "sqli_vantage".to_owned(),
+            target: target_spec,
+            params: serde_json::json!({
+                "request_path": request_path,
+                "witness": witness,
+                "vantage_segment": segment,
+                "timeout_ms": applied.as_millis() as u64,
             }),
         },
     }
@@ -1499,6 +1677,135 @@ mod tests {
         }
     }
 
+    /// Guard: `classify_sqli` reads a captured SQLi probe. A clean exit (0) whose
+    /// body carries the witness is exploited at `High`; a clean exit whose body
+    /// lacks it is not-exploitable at `High`; any other code, or an unclean exit,
+    /// is `Low` (value `false`) so it lands Inconclusive under the default gate,
+    /// never a confident "not exploitable" (RK-002, CLAUDE.md row 6). Mutation:
+    /// give the abnormal arm `High` -> a connect failure reads as a confident clean
+    /// -> the Low assertions fail (the row-6 guard); give clean-no-witness `Low` ->
+    /// the fixed-target PASS path (#50 beta) can never reach a confident Pass ->
+    /// that assertion fails; drop the `body.contains` guard -> a clean 200 with no
+    /// flag reads as exploited -> fails.
+    #[test]
+    fn classify_sqli_reads_the_body_and_fails_closed() {
+        use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
+        let state = |status, code| ContainerState {
+            status,
+            exit_code: code,
+            ..Default::default()
+        };
+        let witness = "REDSTEP_SQLI_WITNESS_7F3A";
+
+        let exploited = classify_sqli(
+            &state(Some(EXITED), Some(0)),
+            "label|REDSTEP_SQLI_WITNESS_7F3A\n",
+            witness,
+        );
+        assert!(exploited.value);
+        assert_eq!(exploited.confidence, Confidence::High);
+
+        let clean = classify_sqli(&state(Some(EXITED), Some(0)), "welcome|hello\n", witness);
+        assert!(!clean.value);
+        assert_eq!(clean.confidence, Confidence::High);
+
+        // A non-zero clean exit (HTTP error / connect failure) and an unclean exit
+        // are both inconclusive, whatever the (empty) body: value false at Low.
+        for abnormal in [
+            state(Some(EXITED), Some(1)),   // wget error (connect/HTTP)
+            state(Some(EXITED), Some(137)), // killed
+            state(Some(EXITED), None),      // no code
+            state(Some(CREATED), Some(0)),  // never ran
+        ] {
+            let obs = classify_sqli(&abnormal, "", witness);
+            assert!(!obs.value, "abnormal: {:?}", abnormal.status);
+            assert_eq!(
+                obs.confidence,
+                Confidence::Low,
+                "an abnormal probe is Low, not a confident not-exploitable: {:?}",
+                abnormal.status
+            );
+        }
+    }
+
+    /// Guard: the SQLi probe command is argv run directly, never a shell line, so
+    /// a crafted URL cannot inject a command into the probe container. Mutation:
+    /// build it as `["sh", "-c", ...]` -> the no-shell assertion fails; drop the
+    /// url argument -> the url-is-one-argument assertion fails.
+    #[test]
+    fn wget_cmd_is_argv_not_a_shell_line() {
+        let url = "http://web:8080/lookup?name='; rm -rf /";
+        let cmd = wget_cmd(url, 5);
+        assert_eq!(cmd[0], "wget", "the probe runs wget directly");
+        assert!(
+            !cmd.iter().any(|a| a == "sh" || a == "-c"),
+            "no shell wrapper, got {cmd:?}"
+        );
+        assert!(
+            cmd.contains(&url.to_owned()),
+            "the url is one argument, not interpreted: {cmd:?}"
+        );
+    }
+
+    /// Guard: `sqli_draft` mirrors the observation into the record (RK-011) and
+    /// carries the replay witness (request path, witness string, stable segment).
+    /// Pure, no Docker. Mutation: hard-code `observed: Bool(true)` -> the
+    /// not-exploitable case's observed assertion fails; drop `request_path` from
+    /// the params -> the replay-witness assertion fails; set `source: None` -> the
+    /// source assertion fails.
+    #[test]
+    fn sqli_draft_mirrors_the_observation_and_carries_the_witness() {
+        let exploited = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = sqli_draft(
+            "lab",
+            "web:8080".to_owned(),
+            "/lookup?name=payload",
+            "FLAG123",
+            &exploited,
+            Duration::from_secs(5),
+        );
+        assert_eq!(draft.capability, "sqli_vantage");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.confidence, Confidence::High);
+        assert_eq!(
+            draft.source,
+            Some(NodeRef::Vantage {
+                segment: "lab".to_owned()
+            })
+        );
+        assert_eq!(
+            draft.reproduction.params["request_path"].as_str(),
+            Some("/lookup?name=payload")
+        );
+        assert_eq!(
+            draft.reproduction.params["witness"].as_str(),
+            Some("FLAG123")
+        );
+        assert_eq!(
+            draft.reproduction.params["vantage_segment"].as_str(),
+            Some("lab")
+        );
+
+        // The not-exploitable observation is mirrored too (the decisive case a
+        // hard-coded `true` would hide).
+        let clean = Observation {
+            value: false,
+            confidence: Confidence::High,
+        };
+        let draft = sqli_draft(
+            "lab",
+            "web:8080".to_owned(),
+            "/lookup?name=welcome",
+            "FLAG123",
+            &clean,
+            Duration::from_secs(5),
+        );
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+    }
+
     /// The vantage executor is Linux containers (egress-less bridge networks,
     /// busybox `nc`), so its integration test needs a daemon in Linux-container
     /// mode, not merely a reachable one: a Windows-container daemon reports
@@ -1877,6 +2184,105 @@ mod tests {
                 !control_hit,
                 "a benign lookup never returns the witness flag: the differential is real"
             );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// built-in SQLi check verdicts `Fail` against the vulnerable playground and
+    /// the `Fail` carries the ADR-0009 domain diagnostic (#50 AC 1). It drives the
+    /// oracle (`TestContext`) directly against the flat playground lab rather than
+    /// through a registered `#[security_test]`: `run_in_lab` runs every registered
+    /// test against one lab, but the boundary demo needs the segmented standin
+    /// topology and this needs the flat playground, which cannot be the same lab
+    /// (the AC amendment). Mutation: `classify_sqli` returns `false` on a witnessed
+    /// body -> no Fail -> the verdict assertion fails; drop the diagnostic plumbing
+    /// in `to_be`/`exploit_sqli_from_vantage` -> the generic text appears -> the
+    /// remediation assertion fails. The draft-mirrors-observation check is RK-011.
+    #[test]
+    fn sqli_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping sqli_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/web:mvp", "redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping sqli_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("web", "redstep/web:mvp", "lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat playground environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("web:8080").expect("web is in scope");
+            let request_path = format!("/lookup?name={SQLI_INJECTION}");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_sqli_from_vantage(&target, &request_path, SQLI_WITNESS)
+                .await
+                .expect("the vantage SQLi probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+
+            let _ = lab.teardown().await;
+
+            // The verdict is a security FAIL (the exploit observed `true` against
+            // the expected-safe `false`), carrying the domain diagnostic.
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the injection executed (the witness was returned)"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(SQLI_WITNESS)
+                    && diagnostic.probable_cause.contains("injection"),
+                "the domain cause names the witness and the injection, not the generic text: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("parameterized"),
+                "the domain remediation names a parameterized query: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation, so the record is
+            // not a faithful-looking projection of a constant.
+            assert_eq!(drafts[0].capability, "sqli_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
         });
     }
 
