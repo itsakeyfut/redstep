@@ -1788,9 +1788,14 @@ mod tests {
             draft.reproduction.params["vantage_segment"].as_str(),
             Some("lab")
         );
+        assert!(
+            draft.summary.contains("injection"),
+            "the exploited summary names the injection: {:?}",
+            draft.summary
+        );
 
         // The not-exploitable observation is mirrored too (the decisive case a
-        // hard-coded `true` would hide).
+        // hard-coded `true` would hide), and its summary does not overclaim.
         let clean = Observation {
             value: false,
             confidence: Confidence::High,
@@ -1804,6 +1809,11 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert!(
+            draft.summary.contains("not exploitable"),
+            "the clean summary says not exploitable: {:?}",
+            draft.summary
+        );
     }
 
     /// The vantage executor is Linux containers (egress-less bridge networks,

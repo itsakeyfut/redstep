@@ -823,4 +823,30 @@ mod tests {
             result.is_ok()
         );
     }
+
+    /// Guard: `exploit_sqli_from_vantage` on a context with no lab bound fails
+    /// closed with `LabUnavailable` rather than panicking or acting, like
+    /// `connect_from_vantage`: a host run has no vantage to inject from, so it must
+    /// error before any Docker call (this needs no daemon). Mutation: unwrap
+    /// `self.lab` instead of the `ok_or_else` -> the `None` case panics -> this
+    /// (expecting an `Err`) fails.
+    #[test]
+    fn exploit_sqli_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("web:8080")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("web:8080").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result =
+            runtime.block_on(ctx.exploit_sqli_from_vantage(&target, "/lookup?name=x", "FLAG"));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_sqli_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
 }
