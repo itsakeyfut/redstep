@@ -8,7 +8,10 @@
 //! #54): `/lookup` then runs a parameterized query, closing the injection, so the
 //! attack-to-defense loop can show the same probe failing against it. The two
 //! `lookup` bodies sit side by side under `#[cfg(feature = "fixed")]` so the fix
-//! is a one-function diff from the vulnerability.
+//! is a one-function diff from the vulnerability. It is a build variant rather
+//! than a runtime flag because the orchestrator selects a workload only by its
+//! image tag and passes it no arguments or environment, so the vulnerable and
+//! fixed services are necessarily two images.
 //!
 //! It is excluded from the cargo workspace (`exclude = ["playground"]`): the
 //! raw-concat query is the vulnerability, so it must not sit in the framework's

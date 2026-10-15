@@ -19,6 +19,7 @@ fixed = []
 [dependencies]
 # A tiny blocking HTTP server; the fixture needs no async runtime of its own.
 tiny_http = "0.12.0"
-# The synchronous postgres client, used through `simple_query` so the raw
-# (unparameterized) SQL string runs as-is: that is the vulnerability.
+# The synchronous postgres client. The default build runs `/lookup` through
+# `simple_query` with the raw SQL string, which is the vulnerability; the `fixed`
+# build runs a parameterized `query` instead.
 postgres = "0.19.7"
