@@ -29,15 +29,18 @@ The orchestrator pulls images by tag and does not build them, so build the local
 tags out of band:
 
 ```sh
-bash playground/build.sh   # builds redstep/{db,api,web}:mvp
+bash playground/build.sh   # builds redstep/{db,api,web}:mvp and redstep/api:fixed
 ```
 
-The orchestrator's `sqli_playground_is_exploitable` test (the exploitability
-guard, #47 AC 1) self-skips when these tags are absent, so the gate stays green
-on a runner that has not built them.
+`redstep/api:fixed` is the `api` crate built with `--features fixed`: a
+parameterized `/lookup` query that closes the injection (#54), against which the
+attack-to-defense loop replays the same probe and sees it fail. The Docker-gated
+tests self-skip when these tags are absent, so the gate stays green on a runner
+that has not built them.
 
-## Scope of this slice (#47)
+## Scope
 
-This slice is the target plus the proof that the SQLi is exploitable. The
-framework-native built-in check that detects it, its remediation diagnostic, the
-fix (a parameterized `api`), and the replay loop are the check slice, issue #50.
+The vulnerable target and the proof that the SQLi is exploitable are #47; the
+framework-native check that detects it and its remediation diagnostic are #50;
+the fixed `api` variant and the replay loop (the same witness reproducing the
+failure against the vulnerable target and a pass against the fixed one) are #54.

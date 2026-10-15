@@ -2,13 +2,21 @@
 //! (#47). This is a security test fixture, NOT product code: `GET /lookup?name=`
 //! builds its SQL by string concatenation on purpose, so a UNION injection reads
 //! a DB-only flag. It exists only to be attacked inside the egress-less lab and
-//! must never be deployed. The fix (a parameterized query) is the check slice,
-//! issue #50.
+//! must never be deployed.
+//!
+//! The `fixed` cargo feature builds the patched variant (`redstep/api:fixed`,
+//! #54): `/lookup` then runs a parameterized query, closing the injection, so the
+//! attack-to-defense loop can show the same probe failing against it. The two
+//! `lookup` bodies sit side by side under `#[cfg(feature = "fixed")]` so the fix
+//! is a one-function diff from the vulnerability. It is a build variant rather
+//! than a runtime flag because the orchestrator selects a workload only by its
+//! image tag and passes it no arguments or environment, so the vulnerable and
+//! fixed services are necessarily two images.
 //!
 //! It is excluded from the cargo workspace (`exclude = ["playground"]`): the
 //! raw-concat query is the vulnerability, so it must not sit in the framework's
 //! own clippy surface, and its behaviour is checked by the orchestrator's
-//! Docker-gated `sqli_playground_is_exploitable` test, not by the main gate.
+//! Docker-gated tests, not by the main gate.
 
 use std::io::{Read, Write};
 
@@ -46,17 +54,41 @@ fn handle(url: &str) -> (u16, String) {
         },
         "/lookup" => {
             let name = percent_decode(&query_param(query, "name").unwrap_or_default());
-            // THE VULNERABILITY: the caller's input is concatenated straight into
-            // the SQL, so `' UNION SELECT flag, 'x' FROM secrets-- ` reads the
-            // DB-only flag. The fix is a parameterized query (#50).
-            let sql = format!("SELECT label, body FROM notes WHERE label = '{name}'");
-            match db_rows(&sql) {
+            match lookup(&name) {
                 Ok(rows) => (200, rows),
                 Err(e) => (500, format!("query error: {e}")),
             }
         }
         _ => (404, "not found".to_owned()),
     }
+}
+
+/// The `/lookup` query, by build. The default (mvp image) is THE VULNERABILITY:
+/// the caller's `name` is concatenated straight into the SQL, so
+/// `' UNION SELECT flag,'x' FROM secrets-- ` reads the DB-only flag.
+#[cfg(not(feature = "fixed"))]
+fn lookup(name: &str) -> Result<String, postgres::Error> {
+    db_rows(&format!(
+        "SELECT label, body FROM notes WHERE label = '{name}'"
+    ))
+}
+
+/// THE FIX (`redstep/api:fixed`, #54): `name` is a bound parameter, so it is a
+/// value the query cannot interpret as SQL. The same injection string becomes a
+/// literal label that matches no row, so the probe reads not-exploitable.
+#[cfg(feature = "fixed")]
+fn lookup(name: &str) -> Result<String, postgres::Error> {
+    let mut client = postgres::Client::connect(DB_CONN, postgres::NoTls)?;
+    let mut out = String::new();
+    for row in client.query("SELECT label, body FROM notes WHERE label = $1", &[&name])? {
+        let label: &str = row.get(0);
+        let body: &str = row.get(1);
+        out.push_str(label);
+        out.push('|');
+        out.push_str(body);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Run a simple (unprepared) query and return its rows as `|`-joined columns,

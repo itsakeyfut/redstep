@@ -1160,6 +1160,93 @@ pub(crate) async fn replay_vantage_probe(
     probed
 }
 
+/// The env-independent replay inputs parsed from a SQLi witness: the segment, the
+/// target, the request path, the marker, and the applied timeout. Pure and
+/// Docker-free (parallel to [`parse_vantage_witness`]), so "a witness missing a
+/// field cannot replay" is a guard that runs offline before [`replay_sqli_probe`]
+/// stands a lab up. A missing or ill-typed field is `Error::InvalidTarget`,
+/// fail-closed (ADR-0022).
+fn parse_sqli_witness(
+    witness: &Reproduction,
+) -> Result<(String, String, String, String, Duration)> {
+    let invalid = |reason: &str| Error::InvalidTarget {
+        spec: witness.target.clone(),
+        reason: reason.to_owned(),
+    };
+    if witness.target.is_empty() {
+        return Err(invalid("replay witness has an empty target"));
+    }
+    let str_param = |key: &str, reason: &'static str| {
+        witness
+            .params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(reason))
+    };
+    let segment = str_param("vantage_segment", "replay witness has no vantage_segment")?;
+    let request_path = str_param("request_path", "replay witness has no request_path")?;
+    let marker = str_param("marker", "replay witness has no marker")?;
+    let timeout_ms = witness
+        .params
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
+    Ok((
+        segment,
+        witness.target.clone(),
+        request_path,
+        marker,
+        Duration::from_millis(timeout_ms),
+    ))
+}
+
+/// Replay a SQLi probe from its witness against `env` (ADR-0022, #54), parallel
+/// to [`replay_vantage_probe`]: reconstruct the probe the witness records, bring
+/// `env` up fresh, re-run it from the recorded vantage segment, and return the raw
+/// `Observation` so a caller can check it reproduces the original. Running the
+/// same witness against an `env` whose api is `redstep/api:mvp` reproduces the
+/// exploit (`true`); against `redstep/api:fixed` it observes not-exploitable
+/// (`false`), which is the attack-to-defense loop's "the fix holds".
+///
+/// It shares `replay_vantage_probe`'s shape exactly, and that function carries
+/// the reasoning for the parts they have in common: the witness is parsed before
+/// any Docker work, the target is re-resolved through
+/// `Scope::from_environment(env)` so a replay cannot aim outside scope, the lab
+/// is always torn down, and it runs no [`boundary_self_check`] and issues no
+/// verdict. What is specific here is that `parse_sqli_witness` then
+/// `validate_sqli_request` re-check the witnessed `request_path` and `marker`, so
+/// an untrusted witness cannot smuggle an authority through the appended request
+/// component (RK-015), which a vantage witness has no equivalent of. The
+/// guarantee is the same observation against the same `Environment`, not
+/// byte-reproducibility; image pinning (ADR-0019) is deferred, so the mvp/fixed
+/// distinction is `env`'s choice.
+// allow(dead_code): no M1 production caller. Like `replay_vantage_probe`, the
+// codify step that calls it in a generated regression (ADR-0022, ADR-0015) is
+// deferred; the loop guard exercises it under `cfg(test)`.
+#[allow(dead_code)]
+pub(crate) async fn replay_sqli_probe(
+    docker: &Docker,
+    env: &Environment,
+    witness: &Reproduction,
+) -> Result<Observation<bool>> {
+    let (segment, target, request_path, marker, timeout) = parse_sqli_witness(witness)?;
+    let scoped = Scope::from_environment(env).resolve(&target)?;
+
+    let lab = bring_up(docker, env).await?;
+    let probed = match vantage_network(&lab, &segment) {
+        Ok(net) => sqli_exploit_from(docker, net, &scoped, &request_path, &marker, timeout)
+            .await
+            .map(|(observation, _draft)| observation),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = lab.teardown().await {
+        eprintln!("redstep: teardown after a replay also failed: {e}");
+    }
+    probed
+}
+
 /// The lab network for `segment`, or `Error::LabUnavailable` if the environment
 /// declares no such segment (fail-closed: a witness naming a segment the
 /// environment does not have cannot be replayed). Pure over a built lab (no
@@ -2642,6 +2729,288 @@ mod tests {
             matches!(result, Err(Error::OutOfScope { .. })),
             "a witness target outside the env scope is refused before bring-up, got {result:?}"
         );
+    }
+
+    /// Guard: `parse_sqli_witness` reads back every field a SQLi replay needs
+    /// (segment, target, request_path, marker, timeout) and fails closed on a
+    /// missing or ill-typed one, so an incomplete witness cannot replay by
+    /// defaulting (ADR-0022, parallel to `parse_vantage_witness`). Pure, no Docker.
+    /// Mutation: drop any one field's check -> the witness missing it parses -> the
+    /// matching `rejected` case fails.
+    #[test]
+    fn parse_sqli_witness_rejects_an_incomplete_witness() {
+        let params = serde_json::json!({
+            "request_path": "/lookup?name=x",
+            "marker": "FLAG123",
+            "vantage_segment": "lab",
+            "timeout_ms": 5_000,
+        });
+        let complete = Reproduction {
+            capability: "http_sqli_vantage".to_owned(),
+            target: "web:8080".to_owned(),
+            params: params.clone(),
+        };
+        let (segment, target, request_path, marker, timeout) =
+            parse_sqli_witness(&complete).expect("a complete witness parses");
+        assert_eq!(segment, "lab");
+        assert_eq!(target, "web:8080");
+        assert_eq!(request_path, "/lookup?name=x");
+        assert_eq!(marker, "FLAG123");
+        assert_eq!(timeout, Duration::from_millis(5_000));
+
+        let rejected = [
+            ("empty target", "", params.clone()),
+            (
+                "no request_path",
+                "web:8080",
+                serde_json::json!({ "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "no marker",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "no vantage_segment",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "timeout_ms": 5_000 }),
+            ),
+            (
+                "string timeout",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": "5000" }),
+            ),
+            // Blank (whitespace-only) string params are rejected too, not just
+            // missing ones: the non-blank filter is the guard, and dropping it
+            // would let a blank param through (a blank marker, for one, would make
+            // the probe's body.contains vacuously true).
+            (
+                "blank request_path",
+                "web:8080",
+                serde_json::json!({ "request_path": "   ", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "blank marker",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "  ", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "blank vantage_segment",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": " ", "timeout_ms": 5_000 }),
+            ),
+        ];
+        for (label, target, params) in rejected {
+            let witness = Reproduction {
+                capability: "http_sqli_vantage".to_owned(),
+                target: target.to_owned(),
+                params,
+            };
+            assert!(
+                parse_sqli_witness(&witness).is_err(),
+                "a witness with {label} cannot be replayed"
+            );
+        }
+    }
+
+    /// Guard: `replay_sqli_probe` re-resolves the witness target through the env
+    /// scope before standing a lab up, so a crafted witness naming a host outside
+    /// the environment's scope fails closed (`Error::OutOfScope`) with no Docker
+    /// work (ADR-0006, parallel to the vantage replay's guard). Mutation: resolve
+    /// against a witness-trusting scope instead of `Scope::from_environment(env)`
+    /// -> `evil:1234` resolves -> replay reaches `bring_up` -> this fails.
+    #[test]
+    fn replay_sqli_re_resolves_the_witness_target_through_scope() {
+        let env = mvp_env();
+        let witness = Reproduction {
+            capability: "http_sqli_vantage".to_owned(),
+            target: "evil:1234".to_owned(),
+            params: serde_json::json!({
+                "request_path": "/lookup?name=x",
+                "marker": "FLAG123",
+                "vantage_segment": "internet",
+                "timeout_ms": 5_000,
+            }),
+        };
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_sqli_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::OutOfScope { .. })),
+            "a witness target outside the env scope is refused before bring-up, got {result:?}"
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/api:fixed`): the SQL-injection attack-to-defense loop
+    /// closes. A genuine exploit is recorded against the vulnerable lab, and its
+    /// own success witness (the reproduction the recorder emits, not one
+    /// hand-assembled here) is replayed against two fresh labs: it reproduces the
+    /// exploit against the vulnerable image and is not-exploitable, and
+    /// confidently so (a clean negative, not an abnormal `Low`), against one
+    /// whose api is the parameterized `redstep/api:fixed`. The built-in SQLi
+    /// check (`exploit_sqli_from_vantage`, issue #50) then verdicts `Pass`
+    /// against that fixed lab. The vulnerable and fixed labs differ only in the
+    /// api image, so the difference is the fix.
+    ///
+    /// Taking the witness from the recorder makes the round-trip a real guard on
+    /// `parse_sqli_witness`: if parse rejected what `sqli_draft` writes, the
+    /// replay below would `Err`. A positive control probes a benign label on the
+    /// fixed lab and requires its row back; it is what distinguishes a working
+    /// parameterized query from a "fix" that served an empty body for every
+    /// lookup, which would satisfy "the injection is closed" just as well.
+    ///
+    /// Mutation: revert the `fixed` `lookup` to the concatenated query -> the
+    /// replay observes `true` and the fixed-lab check `Fail`s (the fix is
+    /// load-bearing) -> this fails. Make the `fixed` `lookup` serve an empty body
+    /// for every request -> `benign.value` is `false` -> this fails (the gap the
+    /// positive control exists to close). Break
+    /// `replay_sqli_probe`/`parse_sqli_witness` -> the replay `Err`s and the
+    /// `expect` panics.
+    #[test]
+    fn sqli_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!("skipping sqli_fix_and_replay_closes_the_loop: no Linux Docker daemon");
+            return;
+        }
+        for image in [
+            "redstep/web:mvp",
+            "redstep/api:mvp",
+            "redstep/api:fixed",
+            "redstep/db:mvp",
+        ] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping sqli_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("web", "redstep/web:mvp", "lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat playground environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let request_path = format!("/lookup?name={SQLI_INJECTION}");
+
+            // Record a genuine exploit against the vulnerable lab, and take ITS
+            // witness: the reproduction `sqli_exploit_from` actually emits, not a
+            // hand-assembled one (the vantage replay guard records its witness the
+            // same way). Replaying this round-trips the recorder's own output
+            // through `parse_sqli_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("web:8080").expect("web is in scope");
+            let (recorded_vuln, draft) = sqli_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                &request_path,
+                SQLI_WITNESS,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording exploit ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            // Replay the recorded witness against fresh labs of each image: it
+            // reproduces the exploit against the vulnerable one and is
+            // not-exploitable, confidently so, against the fixed one. Same witness
+            // and same environment shape, so the difference is the fix.
+            let on_vuln = replay_sqli_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_sqli_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for two checks on one bring-up: a positive
+            // control, then the #50 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("web:8080").expect("web is in scope");
+
+            // Positive control: a benign lookup still returns its row. The label's
+            // own body is the marker, so a working parameterized query returns it
+            // (`true`) and a "fix" that served nothing would not. Without this, an
+            // api whose `/lookup` returned an empty body for every request would
+            // also show the injection closed, and the loop would vouch for a
+            // broken endpoint as a fix.
+            let (benign, _) = sqli_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "/lookup?name=welcome",
+                "hello from the api",
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the benign lookup ran");
+
+            // The #50 check against the fixed lab: it must verdict Pass.
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_sqli_from_vantage(&target, &request_path, SQLI_WITNESS)
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely exploits the vulnerable lab"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                benign.value,
+                "positive control: the fixed /lookup still serves a legitimate row, so the fix is a working query and not a broken endpoint"
+            );
+            assert_eq!(
+                benign.confidence,
+                Confidence::High,
+                "the benign lookup is a confident read, not an abnormal probe"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #50 check passes against the fixed lab"
+            );
+        });
     }
 
     /// Guard: a vantage probe recorded against the MVP lab replays from its
