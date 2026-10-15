@@ -2777,6 +2777,25 @@ mod tests {
                 "web:8080",
                 serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": "5000" }),
             ),
+            // Blank (whitespace-only) string params are rejected too, not just
+            // missing ones: the non-blank filter is the guard, and dropping it
+            // would let a blank param through (a blank marker, for one, would make
+            // the probe's body.contains vacuously true).
+            (
+                "blank request_path",
+                "web:8080",
+                serde_json::json!({ "request_path": "   ", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "blank marker",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "  ", "vantage_segment": "lab", "timeout_ms": 5_000 }),
+            ),
+            (
+                "blank vantage_segment",
+                "web:8080",
+                serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": " ", "timeout_ms": 5_000 }),
+            ),
         ];
         for (label, target, params) in rejected {
             let witness = Reproduction {
