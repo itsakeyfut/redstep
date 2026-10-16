@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
-use crate::orchestrator::{LabNetwork, sqli_exploit_from, tcp_reachable_from};
+use crate::orchestrator::{LabNetwork, http_witness_exploit_from, tcp_reachable_from};
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
 
@@ -296,7 +296,7 @@ impl TestContext {
     ///
     /// The lab-wired counterpart of [`run`](Self::run) for the SQLi check, parallel
     /// to [`connect_from_vantage`](Self::connect_from_vantage): it runs an injected
-    /// request from a container on the vantage network (`sqli_exploit_from`) and
+    /// request from a container on the vantage network (`http_witness_exploit_from`) and
     /// captures the response body, so the observation and its evidence are what the
     /// attacker's vantage would see, not a host-run request. `request_path` carries
     /// the payload (URL-encoded), and `marker` is the DB-only value whose presence
@@ -323,10 +323,11 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_sqli_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
-        let (observation, draft) = sqli_exploit_from(
+        let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
             target,
+            "http_sqli_vantage",
             request_path,
             marker,
             DEFAULT_CONNECT_TIMEOUT,
