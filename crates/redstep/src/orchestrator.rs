@@ -2030,7 +2030,9 @@ mod tests {
     /// offline anchor for the refusal-to-pull safety rule, which `ensure_image`'s
     /// Docker-gated test only wires up (RK-014). Mutation: `starts_with(..)` ->
     /// `false` makes the `redstep/*` cases fail; -> `true` makes the
-    /// busybox/postgres cases fail.
+    /// busybox/postgres cases fail; drop the `/` from `LOCAL_IMAGE_PREFIX`
+    /// (`"redstep/"` -> `"redstep"`) and the `redstepper/x` case fails, because
+    /// the boundary is the `redstep/` namespace, not a bare `redstep` prefix.
     #[test]
     fn is_local_only_image_is_true_only_for_the_project_prefix() {
         assert!(is_local_only_image("redstep/db:mvp"));
@@ -2041,6 +2043,10 @@ mod tests {
         assert!(
             !is_local_only_image("docker.io/redstep/x:1"),
             "a registry-qualified name is not the project's unqualified fixture form"
+        );
+        assert!(
+            !is_local_only_image("redstepper/x:1"),
+            "the boundary is the redstep/ namespace, not a bare redstep prefix"
         );
     }
 
