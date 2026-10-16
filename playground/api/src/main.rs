@@ -24,6 +24,12 @@ use std::io::{Read, Write};
 /// network; the credential matches `playground/db`'s baked dev constant.
 const DB_CONN: &str = "host=db port=5432 user=redstep password=redstep dbname=redstep";
 
+/// The directory `/file` serves from. The Dockerfile bakes a benign `welcome.txt`
+/// inside it and a `secret.txt` sentinel one level ABOVE it (outside this root),
+/// so `?path=../secret.txt` escapes the root on the vulnerable build and reads the
+/// sentinel, whose body is the path-traversal witness the attacker observes.
+const WEB_ROOT: &str = "/srv/public";
+
 fn main() {
     // `/app healthcheck` backs the image HEALTHCHECK (the distroless runtime has
     // no shell), so the readiness gate (bring_up, #47) waits on a real end-to-end
@@ -59,6 +65,13 @@ fn handle(url: &str) -> (u16, String) {
                 Err(e) => (500, format!("query error: {e}")),
             }
         }
+        "/file" => {
+            let p = percent_decode(&query_param(query, "path").unwrap_or_default());
+            match serve_file(&p) {
+                Ok(body) => (200, body),
+                Err(code) => (code, "not found".to_owned()),
+            }
+        }
         _ => (404, "not found".to_owned()),
     }
 }
@@ -89,6 +102,35 @@ fn lookup(name: &str) -> Result<String, postgres::Error> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// The `/file` handler, by build. The default (mvp image) is THE SECOND
+/// VULNERABILITY: the caller's `path` is concatenated straight onto `WEB_ROOT`
+/// with no canonicalization, so `../secret.txt` walks out of the web root and the
+/// OS resolves `/srv/public/../secret.txt` to `/srv/secret.txt`, the sentinel. A
+/// read error (a path that does not resolve) is a 404, not a panic. Returns the
+/// file body on success, or an HTTP status to send on failure.
+#[cfg(not(feature = "fixed"))]
+fn serve_file(path: &str) -> Result<String, u16> {
+    std::fs::read_to_string(format!("{WEB_ROOT}/{path}")).map_err(|_| 404)
+}
+
+/// THE FIX (`redstep/api:fixed`): canonicalize the resolved path and serve it only
+/// when it stays inside the canonical web root, so `../secret.txt` resolves to a
+/// path outside the root and is refused. A refused or unresolvable path answers
+/// `200` with a safe body that never contains the sentinel, rather than an error
+/// status: the probe then reads a confident clean negative (the witness is simply
+/// absent) instead of a non-zero exit it would have to treat as inconclusive. The
+/// invariant the fix enforces is that the sentinel's body never leaves the root,
+/// not the HTTP status of a refusal.
+#[cfg(feature = "fixed")]
+fn serve_file(path: &str) -> Result<String, u16> {
+    let base = std::path::Path::new(WEB_ROOT);
+    let root = base.canonicalize().map_err(|_| 500u16)?;
+    match base.join(path).canonicalize() {
+        Ok(full) if full.starts_with(&root) => std::fs::read_to_string(full).map_err(|_| 404),
+        _ => Ok("refused: the path escapes the web root\n".to_owned()),
+    }
 }
 
 /// Run a simple (unprepared) query and return its rows as `|`-joined columns,

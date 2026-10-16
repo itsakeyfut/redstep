@@ -344,12 +344,61 @@ impl TestContext {
         })
     }
 
+    /// Attempt a path traversal against `target` from the attacker's vantage and
+    /// return its [`Recorded`] result, carrying an ADR-0009 remediation diagnostic
+    /// that [`to_be`](ExpectationBuilder::to_be) attaches if the expectation fails.
+    ///
+    /// The second native app-security check, parallel to
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
+    /// the same HTTP witness seam (`http_witness_exploit_from`), differing only in
+    /// the capability name and the diagnostic. `request_path` carries the traversal
+    /// payload (an escaping `?path=`, URL-encoded), and `marker` is the body of a
+    /// file seeded outside the web root, present in the response only if the
+    /// traversal escaped the root and read it. An exploit is observed at `High`, a
+    /// clean non-exploit at `High`, and an abnormal probe at `Low` (Inconclusive
+    /// under the default gate), so a probe that could not reach the endpoint never
+    /// reads as a confident "secure" (ADR-0010, RK-002). The diagnostic is carried
+    /// only when the traversal actually read the sentinel (`observation.value`),
+    /// like the SQLi check. Errors with [`Error::LabUnavailable`] on a context with
+    /// no lab bound.
+    pub async fn exploit_path_traversal_from_vantage(
+        &self,
+        target: &ScopedTarget,
+        request_path: &str,
+        marker: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_path_traversal_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = http_witness_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            "http_path_traversal_vantage",
+            request_path,
+            marker,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only a traversal that read the sentinel earns the domain diagnostic; its
+        // text asserts a file outside the web root was read, true iff observed.
+        let diagnostic = observation.value.then(|| path_traversal_diagnostic(marker));
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
+        })
+    }
+
     /// Push one evidence draft into the sink and return its per-test reference.
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
     /// base id to resolve the run-scoped `EvidenceId` (issue #14). Shared by
-    /// [`run`](Self::run), [`connect_from_vantage`](Self::connect_from_vantage) and
-    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage).
+    /// [`run`](Self::run), [`connect_from_vantage`](Self::connect_from_vantage),
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and
+    /// [`exploit_path_traversal_from_vantage`](Self::exploit_path_traversal_from_vantage).
     fn record_draft(&self, draft: EvidenceDraft) -> DraftRef {
         let mut drafts = self.evidence_drafts.borrow_mut();
         let index = drafts.len();
@@ -371,6 +420,24 @@ fn sqli_diagnostic(marker: &str) -> Diagnostic {
         ),
         remediation: "use a parameterized query (a prepared statement with bound parameters) \
              so request input cannot alter the SQL"
+            .to_owned(),
+    }
+}
+
+/// The ADR-0009 domain diagnostic for a successful path traversal: the cause names
+/// the sentinel `marker` that was read from outside the web root, and the
+/// remediation is to canonicalize the resolved path and reject one that escapes the
+/// root. Framework-emitted, not author-written (ADR-0009). Pure, so the text is
+/// guarded without Docker (`path_traversal_diagnostic_names_the_marker_and_the_fix`).
+fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the request returned {marker:?}, the body of a file seeded outside the web root, \
+             so the endpoint resolved a caller-supplied path without confining it and served a \
+             file the path traversed to"
+        ),
+        remediation: "canonicalize the resolved path and reject any path that resolves outside \
+             the web root, so a caller cannot traverse to a file beyond it"
             .to_owned(),
     }
 }
@@ -885,6 +952,55 @@ mod tests {
         assert!(
             d.remediation.contains("parameterized"),
             "the remediation names a parameterized query: {:?}",
+            d.remediation
+        );
+    }
+
+    /// Guard: `exploit_path_traversal_from_vantage` on a context with no lab bound
+    /// fails closed with `LabUnavailable`, like `exploit_sqli_from_vantage`: a host
+    /// run has no vantage to probe from, so it must error before any Docker call
+    /// (this needs no daemon). Mutation: unwrap `self.lab` instead of the
+    /// `ok_or_else` -> the `None` case panics -> this (expecting an `Err`) fails.
+    #[test]
+    fn exploit_path_traversal_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("api:8081")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("api:8081").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.exploit_path_traversal_from_vantage(
+            &target,
+            "/file?path=../secret.txt",
+            "SENTINEL",
+        ));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_path_traversal_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the path-traversal domain diagnostic names the sentinel marker read
+    /// from outside the web root in its cause, and canonicalizing / rejecting an
+    /// escaping path in its remediation, so a reader gets ADR-0009 actionable
+    /// guidance rather than generic text. Pure, no Docker. Mutation: drop the marker
+    /// from the cause, or change "canonicalize" in the remediation -> the matching
+    /// assertion fails.
+    #[test]
+    fn path_traversal_diagnostic_names_the_marker_and_the_fix() {
+        let d = path_traversal_diagnostic("SENTINEL42");
+        assert!(
+            d.probable_cause.contains("SENTINEL42") && d.probable_cause.contains("web root"),
+            "the cause names the sentinel marker and the web root: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("canonicalize"),
+            "the remediation names canonicalizing the resolved path: {:?}",
             d.remediation
         );
     }

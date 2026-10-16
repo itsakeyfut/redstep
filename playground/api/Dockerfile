@@ -13,6 +13,11 @@ RUN cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/app /app
+# The `/file` web root and, one level above it (outside the root), the sentinel
+# `secret.txt` whose body is the path-traversal witness. `?path=../secret.txt`
+# escapes `/srv/public` on the vulnerable build and reads it.
+COPY public /srv/public
+COPY secret.txt /srv/secret.txt
 EXPOSE 8081
 HEALTHCHECK --interval=2s --timeout=3s --start-period=2s --retries=30 \
   CMD ["/app", "healthcheck"]

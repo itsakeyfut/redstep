@@ -2506,6 +2506,42 @@ mod tests {
         );
     }
 
+    /// Guard: the seam writes the caller's `capability` into both the draft and its
+    /// reproduction, so a second technique's evidence is tagged as itself and a
+    /// replay reconstructs the right technique (not the SQLi one). The summary stays
+    /// capability-neutral across techniques. Pure, no Docker. Mutation: hard-code
+    /// either `capability` field back to "http_sqli_vantage" in `http_witness_draft`
+    /// -> the path-traversal capability assertions fail.
+    #[test]
+    fn http_witness_draft_carries_the_given_capability() {
+        let exploited = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = http_witness_draft(
+            "http_path_traversal_vantage",
+            "lab",
+            "api:8081".to_owned(),
+            "/file?path=..%2fsecret.txt",
+            "SENTINEL42",
+            &exploited,
+            Duration::from_secs(5),
+        );
+        assert_eq!(draft.capability, "http_path_traversal_vantage");
+        assert_eq!(draft.reproduction.capability, "http_path_traversal_vantage");
+        // The summary is the shared neutral wording, not a SQLi-specific one.
+        assert!(
+            draft.summary.contains("the attack succeeded") && draft.summary.contains("SENTINEL42"),
+            "the summary is capability-neutral and names the witness: {:?}",
+            draft.summary
+        );
+        assert!(
+            !draft.summary.contains("injection"),
+            "the neutral summary does not name a specific technique: {:?}",
+            draft.summary
+        );
+    }
+
     /// The vantage executor is Linux containers (egress-less bridge networks,
     /// busybox `nc`), so its integration test needs a daemon in Linux-container
     /// mode, not merely a reachable one: a Windows-container daemon reports
@@ -2765,6 +2801,41 @@ mod tests {
     /// A URL-encoded UNION injection for the `name` parameter that reads the flag
     /// from the `secrets` table (two columns, matching the `notes` lookup's two).
     const SQLI_INJECTION: &str = "%27%20UNION%20SELECT%20flag%2C%27x%27%20FROM%20secrets--%20";
+
+    /// The body of the sentinel file seeded OUTSIDE the api's web root
+    /// (`playground/api/secret.txt`, baked to `/srv/secret.txt`); its presence in a
+    /// `/file` response witnesses that a path traversal escaped the web root and
+    /// read a file beyond it. Kept in sync with that file, which
+    /// `path_traversal_witness_matches_the_sentinel` checks offline on every gate.
+    const PATH_TRAVERSAL_WITNESS: &str = "REDSTEP_TRAVERSAL_WITNESS_4B19";
+
+    /// A URL-encoded traversal payload for the `path` parameter: `../secret.txt`,
+    /// which walks one level out of `/srv/public` to the `/srv/secret.txt` sentinel.
+    const PATH_TRAVERSAL_PAYLOAD: &str = "..%2fsecret.txt";
+
+    /// A benign in-root file the fixed api still serves, and its body, used as the
+    /// positive control (RK-016): a working `/file` returns it, a "fix" that served
+    /// nothing would not. Matches `playground/api/public/welcome.txt`.
+    const BENIGN_FILE_PATH: &str = "welcome.txt";
+    const BENIGN_FILE_BODY: &str = "public welcome file";
+
+    /// Guard: the sentinel body the traversal check witnesses is the one the api
+    /// image actually bakes. Runs offline on every gate, unlike the Docker-gated
+    /// traversal tests which self-skip without Docker or the built images, so a
+    /// drift between the two copies of the witness cannot hide behind that self-skip
+    /// and silently disarm the check (RK-014, CLAUDE.md row 6). `include_str!`
+    /// resolves the path across the workspace `exclude` boundary at compile time.
+    /// Mutation: change `PATH_TRAVERSAL_WITNESS` or the sentinel file so the two
+    /// differ -> this fails.
+    #[test]
+    fn path_traversal_witness_matches_the_sentinel() {
+        let sentinel = include_str!("../../../playground/api/secret.txt");
+        assert!(
+            sentinel.contains(PATH_TRAVERSAL_WITNESS),
+            "PATH_TRAVERSAL_WITNESS {PATH_TRAVERSAL_WITNESS:?} is not the body of \
+             playground/api/secret.txt; the check and the fixture have drifted"
+        );
+    }
 
     /// A one-shot busybox probe: fetch web's `/lookup?name=<name>` and succeed
     /// (exit 0) only if the response carries the witness flag, so the existing
@@ -3488,6 +3559,279 @@ mod tests {
                 verdict,
                 crate::Verdict::Pass,
                 "the #50 check passes against the fixed lab"
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native path-traversal check verdicts `Fail` against the vulnerable playground
+    /// api and the `Fail` carries the ADR-0009 traversal diagnostic (#63 AC 1). It
+    /// drives the oracle directly against a flat `api + db` lab (the traversal is on
+    /// the api; the vantage reaches `api:8081` by name). An escaping `?path=`
+    /// witnesses the sentinel seeded outside the web root; a benign in-root path
+    /// does not, so the differential is real rather than a constant-true probe.
+    /// Mutation: have the api `serve_file` canonicalize and refuse the escape (the
+    /// fix) -> the probe no longer reads the sentinel -> the verdict assertion
+    /// fails; drop the diagnostic plumbing -> the generic text appears -> the
+    /// remediation assertion fails. The draft-mirrors-observation check is RK-011.
+    #[test]
+    fn path_traversal_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping path_traversal_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping path_traversal_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat api+db environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let exploit_path = format!("/file?path={PATH_TRAVERSAL_PAYLOAD}");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_path_traversal_from_vantage(&target, &exploit_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the vantage traversal probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // A benign in-root path does not carry the sentinel: the differential is
+            // real, not a probe that reads anything as a hit.
+            let benign_path = format!("/file?path={BENIGN_FILE_PATH}");
+            let control = ctx
+                .exploit_path_traversal_from_vantage(&target, &benign_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the benign traversal control ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the traversal read the sentinel outside the web root"
+            );
+            assert!(
+                !control.observation.value,
+                "a benign in-root path never carries the sentinel: the differential is real"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(PATH_TRAVERSAL_WITNESS)
+                    && diagnostic.probable_cause.contains("web root"),
+                "the domain cause names the sentinel and the web root, not generic text: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("canonicalize"),
+                "the domain remediation names canonicalizing the path: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation, and is tagged as
+            // the traversal capability, so the record is not a faithful-looking
+            // projection of a constant nor mislabelled as the SQLi check.
+            assert_eq!(drafts[0].capability, "http_path_traversal_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/api:fixed`): the path-traversal attack-to-defense loop
+    /// closes (#63 AC 2), parallel to `sqli_fix_and_replay_closes_the_loop`. A
+    /// genuine traversal is recorded against the vulnerable api, and its own success
+    /// witness (the reproduction the seam emits) is replayed against two fresh labs:
+    /// it reproduces the read against the vulnerable image and is not-exploitable,
+    /// and confidently so (a clean negative, not an abnormal `Low`), against the
+    /// canonicalizing `redstep/api:fixed`. The #63 check then verdicts `Pass`
+    /// against that fixed lab. The vulnerable and fixed labs differ only in the api
+    /// image, so the difference is the fix.
+    ///
+    /// A positive control probes a benign in-root file on the fixed lab and requires
+    /// its body back; it is what distinguishes a working `/file` from a "fix" that
+    /// served nothing for every path, which would satisfy "the traversal is closed"
+    /// just as well (RK-016). Taking the witness from the recorder round-trips it
+    /// through `parse_http_witness`, so a replay that rejected what the seam writes
+    /// would `Err`.
+    ///
+    /// Mutation: revert the api `serve_file` to the raw join -> the replay observes
+    /// `true` and the fixed-lab check `Fail`s -> this fails. Make the `fixed`
+    /// `serve_file` return an empty body for every path -> `benign.value` is `false`
+    /// -> this fails (the gap the positive control closes).
+    #[test]
+    fn path_traversal_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping path_traversal_fix_and_replay_closes_the_loop: no Linux Docker daemon"
+            );
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/api:fixed", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping path_traversal_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat api+db environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let exploit_path = format!("/file?path={PATH_TRAVERSAL_PAYLOAD}");
+
+            // Record a genuine traversal against the vulnerable lab and take ITS
+            // witness (the reproduction the seam emits), so replaying round-trips the
+            // recorder's own output through `parse_http_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_path_traversal_vantage",
+                &exploit_path,
+                PATH_TRAVERSAL_WITNESS,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording traversal ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for two checks on one bring-up: a positive
+            // control, then the #63 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+
+            // Positive control: a benign in-root file still serves its body, so the
+            // fix is a working `/file` and not an endpoint that serves nothing (which
+            // would also show the traversal closed). The benign body is the marker.
+            let benign_path = format!("/file?path={BENIGN_FILE_PATH}");
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_path_traversal_vantage",
+                &benign_path,
+                BENIGN_FILE_BODY,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the benign file read ran");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_path_traversal_from_vantage(&target, &exploit_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely traverses the vulnerable lab"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                benign.value,
+                "positive control: the fixed /file still serves a legitimate in-root file, so the fix is a working endpoint and not one that serves nothing"
+            );
+            assert_eq!(
+                benign.confidence,
+                Confidence::High,
+                "the benign read is a confident read, not an abnormal probe"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #63 check passes against the fixed lab"
             );
         });
     }
