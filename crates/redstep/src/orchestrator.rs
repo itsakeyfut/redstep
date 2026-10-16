@@ -675,10 +675,11 @@ async fn run_probe_cmd(
 /// Like [`run_probe_cmd`], but capture the container's stdout and stderr (for an
 /// HTTP probe, the response body and, with `wget -S`, the response headers) before
 /// removing it. `run_probe_cmd` removes the container as it returns, so it can only
-/// yield an exit code; the SQLi check needs the body to witness the exfiltrated
-/// flag and the headers to see a followed redirect (#55). Returns
-/// `(state, stdout, stderr)`. The logs are read after the probe exits and before
-/// removal. This is the narrow log-capturing path #50 needs; the generalized
+/// yield an exit code; the HTTP witness checks need the body to witness the marker
+/// (the SQLi flag, the traversal sentinel) and the headers to see a followed
+/// redirect (#55). Returns `(state, stdout, stderr)`. The logs are read after the
+/// probe exits and before removal. This is the narrow log-capturing path #50 needs;
+/// the generalized
 /// in-container seam is M3 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
@@ -947,39 +948,64 @@ fn vantage_draft(
     }
 }
 
-/// Observe whether an injected request to `target` from the attacker's vantage
-/// returns the DB-only `marker`, i.e. whether a SQL injection executed. It runs a
-/// busybox `wget` of `http://<target><request_path>` from a container on the
-/// `vantage` network and inspects the captured response body for `marker`.
-/// `request_path` is the full path and query carrying the payload (e.g.
-/// `/lookup?name=<url-encoded UNION>`), already URL-encoded by the caller; it is
-/// validated by [`validate_sqli_request`] before it runs.
+/// The capability names of the HTTP witness techniques, as they appear in the
+/// evidence `capability` field and the canonical JSON (a published contract, so
+/// the string values are fixed). Shared by the context callers that run each check
+/// and by [`parse_http_witness`], which maps a recorded name back to one of these,
+/// so the name lives in one place rather than being retyped at each site.
+pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
+pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
+
+/// Observe whether an HTTP request to `target` from the attacker's vantage returns
+/// the `marker` that witnesses the technique succeeded. It is the shared seam under
+/// the native HTTP app-security checks whose witness is a `marker` that appears in
+/// the probe's OWN response body: a SQL injection whose `marker` is a DB-only
+/// value, and a path traversal whose `marker` is a file-outside-the-web-root
+/// sentinel.
+///
+/// A technique whose witness is out-of-band does NOT belong on this seam. An SSRF
+/// (#65) is confirmed by a canary callback that a separate listener observes; its
+/// token never appears in this request's response body, so `classify_http_witness`
+/// (which tests `body.contains(marker)`) would read a genuinely vulnerable SSRF
+/// target as a confident "not exploitable". Such a technique needs its own witness
+/// channel and its own classifier, not this one.
+///
+/// It runs a busybox `wget` of
+/// `http://<target><request_path>` from a container on the `vantage` network and
+/// inspects the captured response body for `marker`. `request_path` is the full
+/// path and query carrying the payload, already URL-encoded by the caller; it is
+/// validated by [`validate_http_request`] before it runs. `capability` is the
+/// technique's capability name; it is written into the draft so a replay selects
+/// the same technique, while the per-technique cause and remediation stay in the
+/// caller's diagnostic (context.rs), not here, so this summary never names one
+/// technique.
 ///
 /// Like [`tcp_reachable_from`], the types are the gate: a [`LabNetwork`] is only
 /// from `bring_up`, a [`ScopedTarget`] only from the resolver. Because
 /// `request_path` must start with `/` (the validation), the authority wget
 /// connects to is the `ScopedTarget`'s `host:port`, not something `request_path`
-/// smuggled in with an `@`. The draft is a first-class vantage record (distinct
+/// smuggled in with an `@` (RK-015). The draft is a first-class vantage record (the
 /// capability name, the vantage segment as its `source`) and records the stable
 /// segment so a replay can reconstruct it (ADR-0022, #54). The confidence is
-/// [`classify_sqli`]'s: an abnormal probe is `Low`, never a confident "not
+/// [`classify_http_witness`]'s: an abnormal probe is `Low`, never a confident "not
 /// exploitable".
 ///
 /// busybox `wget` follows HTTP redirects and offers no flag to disable them, so a
 /// `target` that answers with a 3xx would have its body read from the redirect's
 /// host. `wget -S` prints the response headers to stderr, so
-/// [`response_was_redirected`] sees the 3xx status line and [`classify_sqli`]
+/// [`response_was_redirected`] sees the 3xx status line and [`classify_http_witness`]
 /// downgrades the observation to `Low` (Inconclusive): a redirected body is never
 /// read as the scoped target's confident answer (#55).
-pub(crate) async fn sqli_exploit_from(
+pub(crate) async fn http_witness_exploit_from(
     docker: &Docker,
     vantage: &LabNetwork,
     target: &ScopedTarget,
+    capability: &'static str,
     request_path: &str,
     marker: &str,
     timeout: Duration,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
-    validate_sqli_request(request_path, marker)?;
+    validate_http_request(request_path, marker)?;
     let secs = timeout.as_secs().max(1);
     let applied = Duration::from_secs(secs);
     let url = format!("http://{}:{}{}", target.host(), target.port(), request_path);
@@ -991,9 +1017,11 @@ pub(crate) async fn sqli_exploit_from(
         applied + Duration::from_secs(5),
     )
     .await?;
-    let observation = classify_sqli(&state, &body, marker, response_was_redirected(&headers));
+    let observation =
+        classify_http_witness(&state, &body, marker, response_was_redirected(&headers));
     let spec = format!("{}:{}", target.host(), target.port());
-    let draft = sqli_draft(
+    let draft = http_witness_draft(
+        capability,
         vantage.segment(),
         spec,
         request_path,
@@ -1004,7 +1032,7 @@ pub(crate) async fn sqli_exploit_from(
     Ok((observation, draft))
 }
 
-/// Validate a SQLi probe's inputs before it runs, fail-closed. A crafted
+/// Validate an HTTP witness probe's inputs before it runs, fail-closed. A crafted
 /// `request_path` must not be able to change the authority the request hits: the
 /// scope gate is the `ScopedTarget`'s `host:port`, but `request_path` is appended
 /// after it, so a value not starting with `/` could carry an `@authority` that
@@ -1015,13 +1043,20 @@ pub(crate) async fn sqli_exploit_from(
 /// appear in `request_path` (else a server that reflects the path could forge the
 /// witness). CR/LF are refused so the path cannot inject a request line. Pure, so
 /// the guard runs without Docker, and it fronts every caller including a replay.
-fn validate_sqli_request(request_path: &str, marker: &str) -> Result<()> {
+fn validate_http_request(request_path: &str, marker: &str) -> Result<()> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: request_path.to_owned(),
         reason: reason.to_owned(),
     };
-    if marker.is_empty() {
-        return Err(invalid("the SQLi marker must be non-empty"));
+    // `trim().is_empty()` not `is_empty()`: a whitespace-only marker (" ", "\n")
+    // is as dangerous as an empty one, since `body.contains(" ")` matches almost
+    // any response and would read a benign 200 as exploited. This matches
+    // `parse_http_witness`, which already rejects a blank-after-trim marker, so the
+    // live and replay entry points agree.
+    if marker.trim().is_empty() {
+        return Err(invalid(
+            "the witness marker must be non-empty and not only whitespace",
+        ));
     }
     if !request_path.starts_with('/') {
         return Err(invalid(
@@ -1081,7 +1116,7 @@ fn response_was_redirected(headers: &str) -> bool {
     })
 }
 
-/// Classify a captured SQLi probe (see [`sqli_exploit_from`] for why a followed
+/// Classify a captured HTTP witness probe (see [`http_witness_exploit_from`] for why a followed
 /// redirect is untrustworthy). A redirect forces `Low` (value `false`), checked
 /// before the exit code because a witnessed marker with a clean exit would
 /// otherwise read `High`. Else a clean exit (0) whose body contains the `marker`
@@ -1097,7 +1132,7 @@ fn response_was_redirected(headers: &str) -> bool {
 /// under the default-`High` gate, not an `Error`. Taking the state (not a bare
 /// code) folds the exited-cleanly check in via [`finished_exit_code`], so the
 /// whole fail-closed mapping is unit-tested without Docker.
-fn classify_sqli(
+fn classify_http_witness(
     state: &ContainerState,
     body: &str,
     marker: &str,
@@ -1125,21 +1160,30 @@ fn classify_sqli(
     }
 }
 
-/// Compose the evidence draft for a SQLi vantage probe (parallel to
-/// [`vantage_draft`]). Pure, so the first-class `source` and the replay witness
-/// (the request path, the marker, and the stable segment) are testable without
-/// Docker. The request path and marker in the reproduction are what a replay
-/// re-runs (ADR-0022, #54); the segment appears in both `source` and the params
-/// for the same self-contained-reproduction reason as `vantage_draft`.
+/// Compose the evidence draft for an HTTP witness vantage probe (parallel to
+/// [`vantage_draft`]), for the technique named by `capability`. Pure, so the
+/// first-class `source` and the replay witness (the request path, the marker, and
+/// the stable segment) are testable without Docker. The request path and marker in
+/// the reproduction are what a replay re-runs (ADR-0022, #54); the segment appears
+/// in both `source` and the params for the same self-contained-reproduction reason
+/// as `vantage_draft`. The `capability` is written into both the draft and its
+/// reproduction so a replay reconstructs the right technique.
 ///
-/// The intensity is `Controlled`, not `Safe`: a SQL injection is a Level 2
-/// controlled attack simulation (docs/specs/levels-safety-and-principles.md), not
-/// a Level 1 safe check like the `tcp_connect_vantage` reconnaissance probe. The
-/// vantage seam runs it without an intensity gate today (it mints no
-/// `IntensityCleared`, like `connect_from_vantage`); isolation and scope confine
-/// it to the lab regardless, and gating this seam is the deferred M3 work
-/// (ADR-0006, context.rs). The honest label is what that future gate will read.
-fn sqli_draft(
+/// The `summary` is capability-neutral on purpose: it states only whether the
+/// witness `marker` was present, absent, or the probe was inconclusive. The
+/// technique-specific wording (that it was a SQL injection, a path traversal, ...)
+/// lives in the per-technique ADR-0009 diagnostic (context.rs), so this seam does
+/// not have to name every technique and a new one adds no summary branch here.
+///
+/// The intensity is `Controlled`, not `Safe`: these are Level 2 controlled attack
+/// simulations (docs/specs/levels-safety-and-principles.md), not a Level 1 safe
+/// check like the `tcp_connect_vantage` reconnaissance probe. The vantage seam runs
+/// them without an intensity gate today (it mints no `IntensityCleared`, like
+/// `connect_from_vantage`); isolation and scope confine them to the lab regardless,
+/// and gating this seam is the deferred M3 work (ADR-0006, context.rs). The honest
+/// label is what that future gate will read.
+fn http_witness_draft(
+    capability: &'static str,
     segment: &str,
     target_spec: String,
     request_path: &str,
@@ -1147,15 +1191,21 @@ fn sqli_draft(
     observation: &Observation<bool>,
     applied: Duration,
 ) -> EvidenceDraft {
-    let summary = if observation.value {
-        format!("the response carried the DB-only marker {marker:?}; the injection executed")
-    } else if observation.confidence == Confidence::High {
-        "the response did not carry the marker; not exploitable".to_owned()
+    // Confidence first, so a `true` value can never pair with a sub-`High`
+    // "succeeded" summary (the `true` => `High` invariant lives in
+    // `classify_http_witness`; keying off confidence here means the draft cannot
+    // contradict it even if a future technique's classifier changes). The negative
+    // is scoped to this request: one payload not carrying the marker is not proof
+    // the endpoint is universally safe, only that this probe did not exploit it.
+    let summary = if observation.confidence != Confidence::High {
+        "the probe did not complete cleanly; the result is inconclusive".to_owned()
+    } else if observation.value {
+        format!("the response carried the marker {marker:?}; the attack succeeded")
     } else {
-        "the probe did not complete cleanly; exploitation is inconclusive".to_owned()
+        format!("the response did not carry the marker {marker:?}; this request did not exploit it")
     };
     EvidenceDraft {
-        capability: "http_sqli_vantage",
+        capability,
         target: target_spec.clone(),
         intensity: Intensity::Controlled,
         observed: serde_json::Value::Bool(observation.value),
@@ -1165,7 +1215,7 @@ fn sqli_draft(
             segment: segment.to_owned(),
         }),
         reproduction: Reproduction {
-            capability: "http_sqli_vantage".to_owned(),
+            capability: capability.to_owned(),
             target: target_spec,
             params: serde_json::json!({
                 "request_path": request_path,
@@ -1268,15 +1318,20 @@ pub(crate) async fn replay_vantage_probe(
     probed
 }
 
-/// The env-independent replay inputs parsed from a SQLi witness: the segment, the
-/// target, the request path, the marker, and the applied timeout. Pure and
-/// Docker-free (parallel to [`parse_vantage_witness`]), so "a witness missing a
-/// field cannot replay" is a guard that runs offline before [`replay_sqli_probe`]
-/// stands a lab up. A missing or ill-typed field is `Error::InvalidTarget`,
-/// fail-closed (ADR-0022).
-fn parse_sqli_witness(
+/// The env-independent replay inputs parsed from an HTTP witness: the capability,
+/// the segment, the target, the request path, the marker, and the applied timeout.
+/// Pure and Docker-free (parallel to [`parse_vantage_witness`]), so "a witness
+/// missing a field cannot replay" is a guard that runs offline before
+/// [`replay_http_witness_probe`] stands a lab up. A missing or ill-typed field is
+/// `Error::InvalidTarget`, fail-closed (ADR-0022).
+///
+/// The witness records its `capability` as a `String`, but the seam takes a
+/// `&'static str`; matching the recorded name to a known technique both yields that
+/// `&'static str` and fails closed on an unknown one, so a witness naming a
+/// capability this build does not have cannot be replayed into the wrong technique.
+fn parse_http_witness(
     witness: &Reproduction,
-) -> Result<(String, String, String, String, Duration)> {
+) -> Result<(&'static str, String, String, String, String, Duration)> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: witness.target.clone(),
         reason: reason.to_owned(),
@@ -1284,6 +1339,15 @@ fn parse_sqli_witness(
     if witness.target.is_empty() {
         return Err(invalid("replay witness has an empty target"));
     }
+    let capability: &'static str = match witness.capability.as_str() {
+        HTTP_SQLI_VANTAGE => HTTP_SQLI_VANTAGE,
+        HTTP_PATH_TRAVERSAL_VANTAGE => HTTP_PATH_TRAVERSAL_VANTAGE,
+        other => {
+            return Err(invalid(&format!(
+                "replay witness names an unknown capability {other:?}"
+            )));
+        }
+    };
     let str_param = |key: &str, reason: &'static str| {
         witness
             .params
@@ -1302,6 +1366,7 @@ fn parse_sqli_witness(
         .and_then(|v| v.as_u64())
         .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
     Ok((
+        capability,
         segment,
         witness.target.clone(),
         request_path,
@@ -1310,12 +1375,15 @@ fn parse_sqli_witness(
     ))
 }
 
-/// Replay a SQLi probe from its witness against `env` (ADR-0022, #54), parallel
-/// to [`replay_vantage_probe`]: reconstruct the probe the witness records, bring
-/// `env` up fresh, re-run it from the recorded vantage segment, and return the raw
-/// `Observation` so a caller can check it reproduces the original. Running the
-/// same witness against an `env` whose api is `redstep/api:mvp` reproduces the
-/// exploit (`true`); against `redstep/api:fixed` it observes not-exploitable
+/// Replay an HTTP witness probe from its witness against `env` (ADR-0022, #54, any
+/// technique on this seam, not only SQLi), parallel to [`replay_vantage_probe`]:
+/// reconstruct the probe the witness records, bring `env` up fresh, re-run it from
+/// the recorded vantage segment, and return the raw `Observation` so a caller can
+/// check it reproduces the original. The technique is taken from the witness:
+/// [`parse_http_witness`] resolves the recorded `capability` to a known one and
+/// fails closed on an unknown, so a witness cannot replay into the wrong technique.
+/// Running a SQLi witness against an `env` whose api is `redstep/api:mvp` reproduces
+/// the exploit (`true`); against `redstep/api:fixed` it observes not-exploitable
 /// (`false`), which is the attack-to-defense loop's "the fix holds".
 ///
 /// It shares `replay_vantage_probe`'s shape exactly, and that function carries
@@ -1323,8 +1391,8 @@ fn parse_sqli_witness(
 /// any Docker work, the target is re-resolved through
 /// `Scope::from_environment(env)` so a replay cannot aim outside scope, the lab
 /// is always torn down, and it runs no [`boundary_self_check`] and issues no
-/// verdict. What is specific here is that `parse_sqli_witness` then
-/// `validate_sqli_request` re-check the witnessed `request_path` and `marker`, so
+/// verdict. What is specific here is that `parse_http_witness` then
+/// `validate_http_request` re-check the witnessed `request_path` and `marker`, so
 /// an untrusted witness cannot smuggle an authority through the appended request
 /// component (RK-015), which a vantage witness has no equivalent of. The
 /// guarantee is the same observation against the same `Environment`, not
@@ -1334,19 +1402,27 @@ fn parse_sqli_witness(
 // codify step that calls it in a generated regression (ADR-0022, ADR-0015) is
 // deferred; the loop guard exercises it under `cfg(test)`.
 #[allow(dead_code)]
-pub(crate) async fn replay_sqli_probe(
+pub(crate) async fn replay_http_witness_probe(
     docker: &Docker,
     env: &Environment,
     witness: &Reproduction,
 ) -> Result<Observation<bool>> {
-    let (segment, target, request_path, marker, timeout) = parse_sqli_witness(witness)?;
+    let (capability, segment, target, request_path, marker, timeout) = parse_http_witness(witness)?;
     let scoped = Scope::from_environment(env).resolve(&target)?;
 
     let lab = bring_up(docker, env).await?;
     let probed = match vantage_network(&lab, &segment) {
-        Ok(net) => sqli_exploit_from(docker, net, &scoped, &request_path, &marker, timeout)
-            .await
-            .map(|(observation, _draft)| observation),
+        Ok(net) => http_witness_exploit_from(
+            docker,
+            net,
+            &scoped,
+            capability,
+            &request_path,
+            &marker,
+            timeout,
+        )
+        .await
+        .map(|(observation, _draft)| observation),
         Err(e) => Err(e),
     };
     if let Err(e) = lab.teardown().await {
@@ -1928,7 +2004,7 @@ mod tests {
         }
     }
 
-    /// Guard: `classify_sqli` reads a captured SQLi probe. A followed redirect is
+    /// Guard: `classify_http_witness` reads a captured HTTP witness probe. A followed redirect is
     /// `Low` even with the witness in the body, because the body may be from the
     /// redirect's host, not the target (#55). Else a clean exit (0) whose body
     /// carries the witness is exploited at `High`; a clean exit whose body lacks it
@@ -1945,7 +2021,7 @@ mod tests {
     /// beta) can never reach a confident Pass -> that assertion fails; drop the
     /// `body.contains` guard -> a clean 200 with no flag reads as exploited -> fails.
     #[test]
-    fn classify_sqli_reads_the_body_and_fails_closed() {
+    fn classify_http_witness_reads_the_body_and_fails_closed() {
         use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
         let state = |status, code| ContainerState {
             status,
@@ -1954,7 +2030,7 @@ mod tests {
         };
         let witness = "REDSTEP_SQLI_WITNESS_7F3A";
 
-        let exploited = classify_sqli(
+        let exploited = classify_http_witness(
             &state(Some(EXITED), Some(0)),
             "label|REDSTEP_SQLI_WITNESS_7F3A\n",
             witness,
@@ -1963,7 +2039,7 @@ mod tests {
         assert!(exploited.value);
         assert_eq!(exploited.confidence, Confidence::High);
 
-        let clean = classify_sqli(
+        let clean = classify_http_witness(
             &state(Some(EXITED), Some(0)),
             "welcome|hello\n",
             witness,
@@ -1974,7 +2050,7 @@ mod tests {
 
         // A followed redirect is Inconclusive even with the witness present and a
         // clean exit: the body is not provably the scoped target's (#55).
-        let redirected = classify_sqli(
+        let redirected = classify_http_witness(
             &state(Some(EXITED), Some(0)),
             "label|REDSTEP_SQLI_WITNESS_7F3A\n",
             witness,
@@ -1986,7 +2062,7 @@ mod tests {
         // And without the witness: a redirected clean 200 must not read as a
         // confident "not exploitable" (that would be a confident verdict on another
         // host's page, row 6). The downgrade is unconditional on the body.
-        let redirected_no_witness = classify_sqli(
+        let redirected_no_witness = classify_http_witness(
             &state(Some(EXITED), Some(0)),
             "welcome|hello\n",
             witness,
@@ -2003,7 +2079,7 @@ mod tests {
             state(Some(EXITED), None),      // no code
             state(Some(CREATED), Some(0)),  // never ran
         ] {
-            let obs = classify_sqli(&abnormal, "", witness, false);
+            let obs = classify_http_witness(&abnormal, "", witness, false);
             assert!(!obs.value, "abnormal: {:?}", abnormal.status);
             assert_eq!(
                 obs.confidence,
@@ -2060,12 +2136,12 @@ mod tests {
     /// exploit attributed to the scoped target, even though the redirected body
     /// carries the marker (#55). `redir` 302s to `t2`, which serves a body
     /// containing the marker; the same busybox `wget -S` the probe uses follows
-    /// the redirect, so `response_was_redirected` sees the 3xx and `classify_sqli`
+    /// the redirect, so `response_was_redirected` sees the 3xx and `classify_http_witness`
     /// downgrades. The services carry no healthcheck (ready at once), so a bounded
     /// readiness loop waits for the whole chain (clean exit + marker fetched +
     /// redirect seen) before the measured probe, so a connect race cannot
-    /// masquerade as the downgrade. Mutation: make `classify_sqli` ignore
-    /// `redirected` -> `sqli_exploit_from` reads `true`/`High` attributed to
+    /// masquerade as the downgrade. Mutation: make `classify_http_witness` ignore
+    /// `redirected` -> `http_witness_exploit_from` reads `true`/`High` attributed to
     /// `redir` -> this fails.
     #[test]
     fn a_redirecting_target_is_inconclusive_not_a_confident_exploit() {
@@ -2138,10 +2214,17 @@ mod tests {
             }
             assert!(ready, "the redirect chain (redir 302 -> t2 body) came up");
 
-            let (observation, _draft) =
-                sqli_exploit_from(&docker, net, &target, "/", MARKER, Duration::from_secs(5))
-                    .await
-                    .expect("the probe ran");
+            let (observation, _draft) = http_witness_exploit_from(
+                &docker,
+                net,
+                &target,
+                "http_sqli_vantage",
+                "/",
+                MARKER,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the probe ran");
             let _ = lab.teardown().await;
 
             assert!(
@@ -2156,7 +2239,7 @@ mod tests {
         });
     }
 
-    /// Guard: `validate_sqli_request` fails closed on inputs that could change the
+    /// Guard: `validate_http_request` fails closed on inputs that could change the
     /// request authority or forge the witness. A `request_path` not starting with
     /// `/` is refused (it could carry an `@authority` wget would connect to instead
     /// of the `ScopedTarget`); CR/LF in the path is refused; an empty marker is
@@ -2165,15 +2248,17 @@ mod tests {
     /// valid request passes. Pure, no Docker. Mutation: drop the `starts_with('/')`
     /// check -> `@evil/x` passes -> the authority-hijack case fails; drop the empty
     /// check -> `""` passes -> the empty-marker case fails; drop the contains(marker)
-    /// check -> the reflected case fails.
+    /// check -> the reflected case fails. Mutation: weaken the marker check back to
+    /// `marker.is_empty()` -> the whitespace-only `" "` marker passes -> that case
+    /// fails (a `" "` marker reads almost any 200 as exploited).
     #[test]
-    fn validate_sqli_request_fails_closed() {
+    fn validate_http_request_fails_closed() {
         // Valid: a leading-slash path with a marker not in it.
-        assert!(validate_sqli_request("/lookup?name=' UNION SELECT flag--", "FLAG123").is_ok());
+        assert!(validate_http_request("/lookup?name=' UNION SELECT flag--", "FLAG123").is_ok());
 
         let rejected = |path: &str, marker: &str| {
             matches!(
-                validate_sqli_request(path, marker),
+                validate_http_request(path, marker),
                 Err(Error::InvalidTarget { .. })
             )
         };
@@ -2192,6 +2277,10 @@ mod tests {
             "CRLF in the path is refused"
         );
         assert!(rejected("/lookup", ""), "an empty marker is refused");
+        assert!(
+            rejected("/lookup", "   "),
+            "a whitespace-only marker is refused (body.contains(\" \") would match almost any 200)"
+        );
         assert!(
             rejected("/lookup?name=FLAG123", "FLAG123"),
             "a marker appearing in the path is refused"
@@ -2351,7 +2440,7 @@ mod tests {
         });
     }
 
-    /// Guard: `sqli_draft` mirrors the observation into the record (RK-011) and
+    /// Guard: `http_witness_draft` mirrors the observation into the record (RK-011) and
     /// carries a replay-sufficient, self-contained reproduction (capability,
     /// target, request path, marker, stable segment, timeout), with an honest
     /// `Controlled` intensity and a summary that never overclaims. Pure, no Docker.
@@ -2360,12 +2449,13 @@ mod tests {
     /// capability, intensity, or the Low summary -> the matching assertion fails;
     /// set `source: None` -> the source assertion fails.
     #[test]
-    fn sqli_draft_mirrors_the_observation_and_carries_the_witness() {
+    fn http_witness_draft_mirrors_the_observation_and_carries_the_witness() {
         let exploited = Observation {
             value: true,
             confidence: Confidence::High,
         };
-        let draft = sqli_draft(
+        let draft = http_witness_draft(
+            "http_sqli_vantage",
             "lab",
             "web:8080".to_owned(),
             "/lookup?name=payload",
@@ -2403,10 +2493,9 @@ mod tests {
             Some(5000),
             "the applied timeout is recorded for a faithful replay"
         );
-        assert!(
-            draft.summary.contains("injection"),
-            "the exploited summary names the injection: {:?}",
-            draft.summary
+        assert_eq!(
+            draft.summary, "the response carried the marker \"FLAG123\"; the attack succeeded",
+            "the exploited summary is pinned exact, capability-neutral, and names the marker"
         );
 
         // The not-exploitable observation is mirrored too (the decisive case a
@@ -2415,7 +2504,8 @@ mod tests {
             value: false,
             confidence: Confidence::High,
         };
-        let draft = sqli_draft(
+        let draft = http_witness_draft(
+            "http_sqli_vantage",
             "lab",
             "web:8080".to_owned(),
             "/lookup?name=welcome",
@@ -2425,21 +2515,27 @@ mod tests {
         );
         assert_eq!(draft.observed, serde_json::Value::Bool(false));
         assert_eq!(draft.confidence, Confidence::High);
+        assert_eq!(
+            draft.summary,
+            "the response did not carry the marker \"FLAG123\"; this request did not exploit it",
+            "the clean summary is pinned exact and scoped to this request, not a universal claim"
+        );
         assert!(
-            draft.summary.contains("not exploitable"),
-            "the clean summary says not exploitable: {:?}",
+            !draft.summary.contains("succeeded"),
+            "a non-exploit summary never claims success: {:?}",
             draft.summary
         );
 
         // An inconclusive (abnormal) probe: value false at Low, and the summary
-        // must say inconclusive, not "not exploitable" (an abnormal probe is not a
-        // clean negative, RK-002). Mutation: mirror `confidence` as a constant
-        // High, or give the Low branch the "not exploitable" summary -> these fail.
+        // must say inconclusive, not a clean negative (an abnormal probe did not
+        // establish the endpoint's state, RK-002). Mutation: mirror `confidence` as
+        // a constant High, or give the Low branch the clean-negative summary -> fail.
         let inconclusive = Observation {
             value: false,
             confidence: Confidence::Low,
         };
-        let draft = sqli_draft(
+        let draft = http_witness_draft(
+            "http_sqli_vantage",
             "lab",
             "web:8080".to_owned(),
             "/lookup?name=welcome",
@@ -2448,9 +2544,49 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(
+            draft.summary, "the probe did not complete cleanly; the result is inconclusive",
+            "the Low summary is inconclusive, pinned exact, not a clean negative (RK-002)"
+        );
         assert!(
-            draft.summary.contains("inconclusive") && !draft.summary.contains("not exploitable"),
-            "the Low summary is inconclusive, not a clean negative: {:?}",
+            !draft.summary.contains("succeeded"),
+            "an inconclusive summary never claims success: {:?}",
+            draft.summary
+        );
+    }
+
+    /// Guard: the seam writes the caller's `capability` into both the draft and its
+    /// reproduction, so a second technique's evidence is tagged as itself and a
+    /// replay reconstructs the right technique (not the SQLi one). The summary stays
+    /// capability-neutral across techniques. Pure, no Docker. Mutation: hard-code
+    /// either `capability` field back to "http_sqli_vantage" in `http_witness_draft`
+    /// -> the path-traversal capability assertions fail.
+    #[test]
+    fn http_witness_draft_carries_the_given_capability() {
+        let exploited = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = http_witness_draft(
+            "http_path_traversal_vantage",
+            "lab",
+            "api:8081".to_owned(),
+            "/file?path=..%2fsecret.txt",
+            "SENTINEL42",
+            &exploited,
+            Duration::from_secs(5),
+        );
+        assert_eq!(draft.capability, "http_path_traversal_vantage");
+        assert_eq!(draft.reproduction.capability, "http_path_traversal_vantage");
+        // The summary is the shared neutral wording, not a SQLi-specific one.
+        assert!(
+            draft.summary.contains("the attack succeeded") && draft.summary.contains("SENTINEL42"),
+            "the summary is capability-neutral and names the witness: {:?}",
+            draft.summary
+        );
+        assert!(
+            !draft.summary.contains("injection"),
+            "the neutral summary does not name a specific technique: {:?}",
             draft.summary
         );
     }
@@ -2715,6 +2851,41 @@ mod tests {
     /// from the `secrets` table (two columns, matching the `notes` lookup's two).
     const SQLI_INJECTION: &str = "%27%20UNION%20SELECT%20flag%2C%27x%27%20FROM%20secrets--%20";
 
+    /// The body of the sentinel file seeded OUTSIDE the api's web root
+    /// (`playground/api/secret.txt`, baked to `/srv/secret.txt`); its presence in a
+    /// `/file` response witnesses that a path traversal escaped the web root and
+    /// read a file beyond it. Kept in sync with that file, which
+    /// `path_traversal_witness_matches_the_sentinel` checks offline on every gate.
+    const PATH_TRAVERSAL_WITNESS: &str = "REDSTEP_TRAVERSAL_WITNESS_4B19";
+
+    /// A URL-encoded traversal payload for the `path` parameter: `../secret.txt`,
+    /// which walks one level out of `/srv/public` to the `/srv/secret.txt` sentinel.
+    const PATH_TRAVERSAL_PAYLOAD: &str = "..%2fsecret.txt";
+
+    /// A benign in-root file the fixed api still serves, and its body, used as the
+    /// positive control (RK-016): a working `/file` returns it, a "fix" that served
+    /// nothing would not. Matches `playground/api/public/welcome.txt`.
+    const BENIGN_FILE_PATH: &str = "welcome.txt";
+    const BENIGN_FILE_BODY: &str = "public welcome file";
+
+    /// Guard: the sentinel body the traversal check witnesses is the one the api
+    /// image actually bakes. Runs offline on every gate, unlike the Docker-gated
+    /// traversal tests which self-skip without Docker or the built images, so a
+    /// drift between the two copies of the witness cannot hide behind that self-skip
+    /// and silently disarm the check (RK-014, CLAUDE.md row 6). `include_str!`
+    /// resolves the path across the workspace `exclude` boundary at compile time.
+    /// Mutation: change `PATH_TRAVERSAL_WITNESS` or the sentinel file so the two
+    /// differ -> this fails.
+    #[test]
+    fn path_traversal_witness_matches_the_sentinel() {
+        let sentinel = include_str!("../../../playground/api/secret.txt");
+        assert!(
+            sentinel.contains(PATH_TRAVERSAL_WITNESS),
+            "PATH_TRAVERSAL_WITNESS {PATH_TRAVERSAL_WITNESS:?} is not the body of \
+             playground/api/secret.txt; the check and the fixture have drifted"
+        );
+    }
+
     /// A one-shot busybox probe: fetch web's `/lookup?name=<name>` and succeed
     /// (exit 0) only if the response carries the witness flag, so the existing
     /// exit-code seam (`classify_probe`) reads the result. `name` is interpolated
@@ -2843,7 +3014,7 @@ mod tests {
     /// through a registered `#[security_test]`: `run_in_lab` runs every registered
     /// test against one lab, but the boundary demo needs the segmented standin
     /// topology and this needs the flat playground, which cannot be the same lab
-    /// (the AC amendment). Mutation: `classify_sqli` returns `false` on a witnessed
+    /// (the AC amendment). Mutation: `classify_http_witness` returns `false` on a witnessed
     /// body -> no Fail -> the verdict assertion fails; drop the diagnostic plumbing
     /// in `to_be`/`exploit_sqli_from_vantage` -> the generic text appears -> the
     /// remediation assertion fails. The draft-mirrors-observation check is RK-011.
@@ -2934,9 +3105,9 @@ mod tests {
             assert_eq!(drafts[0].confidence, confidence);
             // The witness records the STABLE segment "lab", not the run-scoped
             // Docker network name, so a replay can reconstruct it (ADR-0022). This
-            // is the call-site guard the pure `sqli_draft` test cannot give (it is
+            // is the call-site guard the pure `http_witness_draft` test cannot give (it is
             // handed a literal segment): mutating `vantage.segment()` to
-            // `vantage.name()` in `sqli_exploit_from` makes these fail.
+            // `vantage.name()` in `http_witness_exploit_from` makes these fail.
             assert_eq!(
                 drafts[0].source,
                 Some(NodeRef::Vantage {
@@ -3141,14 +3312,18 @@ mod tests {
         );
     }
 
-    /// Guard: `parse_sqli_witness` reads back every field a SQLi replay needs
-    /// (segment, target, request_path, marker, timeout) and fails closed on a
-    /// missing or ill-typed one, so an incomplete witness cannot replay by
+    /// Guard: `parse_http_witness` reads back every field an HTTP witness replay
+    /// needs (capability, segment, target, request_path, marker, timeout) and fails
+    /// closed on a missing or ill-typed one, including a capability this build does
+    /// not know, so an incomplete or unknown-technique witness cannot replay by
     /// defaulting (ADR-0022, parallel to `parse_vantage_witness`). Pure, no Docker.
     /// Mutation: drop any one field's check -> the witness missing it parses -> the
-    /// matching `rejected` case fails.
+    /// matching `rejected` case fails; drop the unknown-capability arm -> the
+    /// unknown-capability case parses -> that assertion fails; map the traversal arm
+    /// to `HTTP_SQLI_VANTAGE` -> the traversal round-trip returns the wrong
+    /// capability -> that assertion fails.
     #[test]
-    fn parse_sqli_witness_rejects_an_incomplete_witness() {
+    fn parse_http_witness_rejects_an_incomplete_witness() {
         let params = serde_json::json!({
             "request_path": "/lookup?name=x",
             "marker": "FLAG123",
@@ -3160,13 +3335,33 @@ mod tests {
             target: "web:8080".to_owned(),
             params: params.clone(),
         };
-        let (segment, target, request_path, marker, timeout) =
-            parse_sqli_witness(&complete).expect("a complete witness parses");
+        let (capability, segment, target, request_path, marker, timeout) =
+            parse_http_witness(&complete).expect("a complete witness parses");
+        assert_eq!(capability, "http_sqli_vantage");
         assert_eq!(segment, "lab");
         assert_eq!(target, "web:8080");
         assert_eq!(request_path, "/lookup?name=x");
         assert_eq!(marker, "FLAG123");
         assert_eq!(timeout, Duration::from_millis(5_000));
+
+        // The traversal arm round-trips to its own capability, not SQLi's: a
+        // path-traversal witness parses and returns "http_path_traversal_vantage".
+        let traversal = Reproduction {
+            capability: HTTP_PATH_TRAVERSAL_VANTAGE.to_owned(),
+            target: "api:8081".to_owned(),
+            params: serde_json::json!({
+                "request_path": "/file?path=..%2fsecret.txt",
+                "marker": "SENTINEL",
+                "vantage_segment": "lab",
+                "timeout_ms": 5_000,
+            }),
+        };
+        let (traversal_cap, ..) =
+            parse_http_witness(&traversal).expect("a complete traversal witness parses");
+        assert_eq!(
+            traversal_cap, "http_path_traversal_vantage",
+            "the traversal witness resolves to its own capability, not SQLi's"
+        );
 
         let rejected = [
             ("empty target", "", params.clone()),
@@ -3217,20 +3412,33 @@ mod tests {
                 params,
             };
             assert!(
-                parse_sqli_witness(&witness).is_err(),
+                parse_http_witness(&witness).is_err(),
                 "a witness with {label} cannot be replayed"
             );
         }
+
+        // A witness naming a capability this build does not have is rejected, so it
+        // cannot be replayed into the wrong technique (the seam takes a &'static
+        // str; the match both resolves the name and fail-closes an unknown one).
+        let unknown = Reproduction {
+            capability: "http_unknown_vantage".to_owned(),
+            target: "web:8080".to_owned(),
+            params,
+        };
+        assert!(
+            parse_http_witness(&unknown).is_err(),
+            "a witness with an unknown capability cannot be replayed"
+        );
     }
 
-    /// Guard: `replay_sqli_probe` re-resolves the witness target through the env
+    /// Guard: `replay_http_witness_probe` re-resolves the witness target through the env
     /// scope before standing a lab up, so a crafted witness naming a host outside
     /// the environment's scope fails closed (`Error::OutOfScope`) with no Docker
     /// work (ADR-0006, parallel to the vantage replay's guard). Mutation: resolve
     /// against a witness-trusting scope instead of `Scope::from_environment(env)`
     /// -> `evil:1234` resolves -> replay reaches `bring_up` -> this fails.
     #[test]
-    fn replay_sqli_re_resolves_the_witness_target_through_scope() {
+    fn replay_http_witness_re_resolves_the_witness_target_through_scope() {
         let env = mvp_env();
         let witness = Reproduction {
             capability: "http_sqli_vantage".to_owned(),
@@ -3243,7 +3451,7 @@ mod tests {
             }),
         };
         let docker = Docker::connect_with_local_defaults().expect("lazy connect");
-        let result = block_on(replay_sqli_probe(&docker, &env, &witness));
+        let result = block_on(replay_http_witness_probe(&docker, &env, &witness));
         assert!(
             matches!(result, Err(Error::OutOfScope { .. })),
             "a witness target outside the env scope is refused before bring-up, got {result:?}"
@@ -3263,7 +3471,7 @@ mod tests {
     /// api image, so the difference is the fix.
     ///
     /// Taking the witness from the recorder makes the round-trip a real guard on
-    /// `parse_sqli_witness`: if parse rejected what `sqli_draft` writes, the
+    /// `parse_http_witness`: if parse rejected what `http_witness_draft` writes, the
     /// replay below would `Err`. A positive control probes a benign label on the
     /// fixed lab and requires its row back; it is what distinguishes a working
     /// parameterized query from a "fix" that served an empty body for every
@@ -3274,7 +3482,7 @@ mod tests {
     /// load-bearing) -> this fails. Make the `fixed` `lookup` serve an empty body
     /// for every request -> `benign.value` is `false` -> this fails (the gap the
     /// positive control exists to close). Break
-    /// `replay_sqli_probe`/`parse_sqli_witness` -> the replay `Err`s and the
+    /// `replay_http_witness_probe`/`parse_http_witness` -> the replay `Err`s and the
     /// `expect` panics.
     #[test]
     fn sqli_fix_and_replay_closes_the_loop() {
@@ -3312,20 +3520,21 @@ mod tests {
             let request_path = format!("/lookup?name={SQLI_INJECTION}");
 
             // Record a genuine exploit against the vulnerable lab, and take ITS
-            // witness: the reproduction `sqli_exploit_from` actually emits, not a
+            // witness: the reproduction `http_witness_exploit_from` actually emits, not a
             // hand-assembled one (the vantage replay guard records its witness the
             // same way). Replaying this round-trips the recorder's own output
-            // through `parse_sqli_witness`.
+            // through `parse_http_witness`.
             let vuln_lab = bring_up(&docker, &vuln_env)
                 .await
                 .expect("bring up the vulnerable playground");
             let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
             let vuln_scope = Scope::from_environment(&vuln_env);
             let vuln_target = vuln_scope.resolve("web:8080").expect("web is in scope");
-            let (recorded_vuln, draft) = sqli_exploit_from(
+            let (recorded_vuln, draft) = http_witness_exploit_from(
                 &docker,
                 vuln_net,
                 &vuln_target,
+                "http_sqli_vantage",
                 &request_path,
                 SQLI_WITNESS,
                 Duration::from_millis(5_000),
@@ -3342,10 +3551,10 @@ mod tests {
             // reproduces the exploit against the vulnerable one and is
             // not-exploitable, confidently so, against the fixed one. Same witness
             // and same environment shape, so the difference is the fix.
-            let on_vuln = replay_sqli_probe(&docker, &vuln_env, &witness)
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
                 .await
                 .expect("replay against the vulnerable lab ran");
-            let on_fixed = replay_sqli_probe(&docker, &fixed_env, &witness)
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
                 .await
                 .expect("replay against the fixed lab ran");
 
@@ -3369,10 +3578,11 @@ mod tests {
             // api whose `/lookup` returned an empty body for every request would
             // also show the injection closed, and the loop would vouch for a
             // broken endpoint as a fix.
-            let (benign, _) = sqli_exploit_from(
+            let (benign, _) = http_witness_exploit_from(
                 &docker,
                 &net,
                 &target,
+                "http_sqli_vantage",
                 "/lookup?name=welcome",
                 "hello from the api",
                 Duration::from_millis(5_000),
@@ -3419,6 +3629,286 @@ mod tests {
                 verdict,
                 crate::Verdict::Pass,
                 "the #50 check passes against the fixed lab"
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native path-traversal check verdicts `Fail` against the vulnerable playground
+    /// api and the `Fail` carries the ADR-0009 traversal diagnostic (#63 AC 1). It
+    /// drives the oracle directly against a flat `api + db` lab (the traversal is on
+    /// the api; the vantage reaches `api:8081` by name). An escaping `?path=`
+    /// witnesses the sentinel seeded outside the web root; a benign in-root path
+    /// does not, so the differential is real rather than a constant-true probe.
+    /// Mutation: have the api `serve_file` canonicalize and refuse the escape (the
+    /// fix) -> the probe no longer reads the sentinel -> the verdict assertion
+    /// fails; drop the diagnostic plumbing -> the generic text appears -> the
+    /// remediation assertion fails; change the diagnostic gate from
+    /// `observation.value.then(..)` to `Some(..)` in `exploit_path_traversal_from_vantage`
+    /// -> the benign control carries a diagnostic -> the `control.diagnostic.is_none()`
+    /// assertion fails. The draft-mirrors-observation check is RK-011.
+    #[test]
+    fn path_traversal_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping path_traversal_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping path_traversal_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat api+db environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let exploit_path = format!("/file?path={PATH_TRAVERSAL_PAYLOAD}");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_path_traversal_from_vantage(&target, &exploit_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the vantage traversal probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // A benign in-root path does not carry the sentinel: the differential is
+            // real, not a probe that reads anything as a hit.
+            let benign_path = format!("/file?path={BENIGN_FILE_PATH}");
+            let control = ctx
+                .exploit_path_traversal_from_vantage(&target, &benign_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the benign traversal control ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the traversal read the sentinel outside the web root"
+            );
+            assert!(
+                !control.observation.value,
+                "a benign in-root path never carries the sentinel: the differential is real"
+            );
+            assert!(
+                control.diagnostic.is_none(),
+                "a non-exploit (the benign control) carries no diagnostic: the ADR-0009 cause is attached only to a real traversal, not a clean result"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(PATH_TRAVERSAL_WITNESS)
+                    && diagnostic.probable_cause.contains("intended directory"),
+                "the domain cause names the sentinel and the intended directory, not generic text: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("canonicalize"),
+                "the domain remediation names canonicalizing the path: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation, and is tagged as
+            // the traversal capability, so the record is not a faithful-looking
+            // projection of a constant nor mislabelled as the SQLi check.
+            assert_eq!(drafts[0].capability, "http_path_traversal_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/api:fixed`): the path-traversal attack-to-defense loop
+    /// closes (#63 AC 2), parallel to `sqli_fix_and_replay_closes_the_loop`. A
+    /// genuine traversal is recorded against the vulnerable api, and its own success
+    /// witness (the reproduction the seam emits) is replayed against two fresh labs:
+    /// it reproduces the read against the vulnerable image and is not-exploitable,
+    /// and confidently so (a clean negative, not an abnormal `Low`), against the
+    /// canonicalizing `redstep/api:fixed`. The #63 check then verdicts `Pass`
+    /// against that fixed lab. The vulnerable and fixed labs differ only in the api
+    /// image, so the difference is the fix.
+    ///
+    /// A positive control probes a benign in-root file on the fixed lab and requires
+    /// its body back; it is what distinguishes a working `/file` from a "fix" that
+    /// served nothing for every path, which would satisfy "the traversal is closed"
+    /// just as well (RK-016). Taking the witness from the recorder round-trips it
+    /// through `parse_http_witness`, so a replay that rejected what the seam writes
+    /// would `Err`.
+    ///
+    /// Mutation: revert the api `serve_file` to the raw join -> the replay observes
+    /// `true` and the fixed-lab check `Fail`s -> this fails. Make the `fixed`
+    /// `serve_file` return an empty body for every path -> `benign.value` is `false`
+    /// -> this fails (the gap the positive control closes).
+    #[test]
+    fn path_traversal_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping path_traversal_fix_and_replay_closes_the_loop: no Linux Docker daemon"
+            );
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/api:fixed", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping path_traversal_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat api+db environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let exploit_path = format!("/file?path={PATH_TRAVERSAL_PAYLOAD}");
+
+            // Record a genuine traversal against the vulnerable lab and take ITS
+            // witness (the reproduction the seam emits), so replaying round-trips the
+            // recorder's own output through `parse_http_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_path_traversal_vantage",
+                &exploit_path,
+                PATH_TRAVERSAL_WITNESS,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording traversal ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for two checks on one bring-up: a positive
+            // control, then the #63 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+
+            // Positive control: a benign in-root file still serves its body, so the
+            // fix is a working `/file` and not an endpoint that serves nothing (which
+            // would also show the traversal closed). The benign body is the marker.
+            let benign_path = format!("/file?path={BENIGN_FILE_PATH}");
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_path_traversal_vantage",
+                &benign_path,
+                BENIGN_FILE_BODY,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the benign file read ran");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_path_traversal_from_vantage(&target, &exploit_path, PATH_TRAVERSAL_WITNESS)
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely traverses the vulnerable lab"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                benign.value,
+                "positive control: the fixed /file still serves a legitimate in-root file, so the fix is a working endpoint and not one that serves nothing"
+            );
+            assert_eq!(
+                benign.confidence,
+                Confidence::High,
+                "the benign read is a confident read, not an abnormal probe"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #63 check passes against the fixed lab"
             );
         });
     }
