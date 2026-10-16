@@ -120,6 +120,32 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   # --------------------------------------------------------------------------
+  # Playground lab (Linux). Builds the deliberately-vulnerable playground images
+  # (#47) so the Docker-gated lab tests actually run here instead of self-skipping
+  # on `image_present` (#52); without this leg the SQLi demo runs only locally.
+  # On its own leg so the image build does not slow the fmt/clippy/unit legs, and
+  # `--test-threads=1` because the lab tests each create `redstep-*` networks and
+  # running them in parallel exhausts Docker's predefined address pools. ADR-0014
+  # keeps the report and evidence primary; this leg only catches a demo regression
+  # where a Linux daemon exists.
+  # --------------------------------------------------------------------------
+  playground:
+    name: Playground (Linux lab)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the playground images
+        run: bash playground/build.sh
+      - name: Lab tests (serialized; parallel labs exhaust the address pool)
+        run: cargo test --workspace -- --test-threads=1
+
+  # --------------------------------------------------------------------------
   # Aggregation gate: the single required check for branch protection. It
   # fails closed: any required job that failed, was cancelled, or was skipped
   # fails the gate, so a job that silently stops running cannot turn the gate
@@ -138,6 +164,7 @@ jobs:
       - clippy
       - test
       - docs
+      - playground
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every required job succeeded
