@@ -675,10 +675,11 @@ async fn run_probe_cmd(
 /// Like [`run_probe_cmd`], but capture the container's stdout and stderr (for an
 /// HTTP probe, the response body and, with `wget -S`, the response headers) before
 /// removing it. `run_probe_cmd` removes the container as it returns, so it can only
-/// yield an exit code; the SQLi check needs the body to witness the exfiltrated
-/// flag and the headers to see a followed redirect (#55). Returns
-/// `(state, stdout, stderr)`. The logs are read after the probe exits and before
-/// removal. This is the narrow log-capturing path #50 needs; the generalized
+/// yield an exit code; the HTTP witness checks need the body to witness the marker
+/// (the SQLi flag, the traversal sentinel) and the headers to see a followed
+/// redirect (#55). Returns `(state, stdout, stderr)`. The logs are read after the
+/// probe exits and before removal. This is the narrow log-capturing path #50 needs;
+/// the generalized
 /// in-container seam is M3 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
@@ -957,9 +958,19 @@ pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantag
 
 /// Observe whether an HTTP request to `target` from the attacker's vantage returns
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
-/// the native HTTP app-security checks: a SQL injection whose `marker` is a DB-only
-/// value, a path traversal whose `marker` is a file-outside-the-web-root sentinel,
-/// and the techniques the M2 subs add. It runs a busybox `wget` of
+/// the native HTTP app-security checks whose witness is a `marker` that appears in
+/// the probe's OWN response body: a SQL injection whose `marker` is a DB-only
+/// value, and a path traversal whose `marker` is a file-outside-the-web-root
+/// sentinel.
+///
+/// A technique whose witness is out-of-band does NOT belong on this seam. An SSRF
+/// (#65) is confirmed by a canary callback that a separate listener observes; its
+/// token never appears in this request's response body, so `classify_http_witness`
+/// (which tests `body.contains(marker)`) would read a genuinely vulnerable SSRF
+/// target as a confident "not exploitable". Such a technique needs its own witness
+/// channel and its own classifier, not this one.
+///
+/// It runs a busybox `wget` of
 /// `http://<target><request_path>` from a container on the `vantage` network and
 /// inspects the captured response body for `marker`. `request_path` is the full
 /// path and query carrying the payload, already URL-encoded by the caller; it is
@@ -1364,12 +1375,15 @@ fn parse_http_witness(
     ))
 }
 
-/// Replay a SQLi probe from its witness against `env` (ADR-0022, #54), parallel
-/// to [`replay_vantage_probe`]: reconstruct the probe the witness records, bring
-/// `env` up fresh, re-run it from the recorded vantage segment, and return the raw
-/// `Observation` so a caller can check it reproduces the original. Running the
-/// same witness against an `env` whose api is `redstep/api:mvp` reproduces the
-/// exploit (`true`); against `redstep/api:fixed` it observes not-exploitable
+/// Replay an HTTP witness probe from its witness against `env` (ADR-0022, #54, any
+/// technique on this seam, not only SQLi), parallel to [`replay_vantage_probe`]:
+/// reconstruct the probe the witness records, bring `env` up fresh, re-run it from
+/// the recorded vantage segment, and return the raw `Observation` so a caller can
+/// check it reproduces the original. The technique is taken from the witness:
+/// [`parse_http_witness`] resolves the recorded `capability` to a known one and
+/// fails closed on an unknown, so a witness cannot replay into the wrong technique.
+/// Running a SQLi witness against an `env` whose api is `redstep/api:mvp` reproduces
+/// the exploit (`true`); against `redstep/api:fixed` it observes not-exploitable
 /// (`false`), which is the attack-to-defense loop's "the fix holds".
 ///
 /// It shares `replay_vantage_probe`'s shape exactly, and that function carries
@@ -1990,7 +2004,7 @@ mod tests {
         }
     }
 
-    /// Guard: `classify_http_witness` reads a captured SQLi probe. A followed redirect is
+    /// Guard: `classify_http_witness` reads a captured HTTP witness probe. A followed redirect is
     /// `Low` even with the witness in the body, because the body may be from the
     /// redirect's host, not the target (#55). Else a clean exit (0) whose body
     /// carries the witness is exploited at `High`; a clean exit whose body lacks it
@@ -3424,7 +3438,7 @@ mod tests {
     /// against a witness-trusting scope instead of `Scope::from_environment(env)`
     /// -> `evil:1234` resolves -> replay reaches `bring_up` -> this fails.
     #[test]
-    fn replay_sqli_re_resolves_the_witness_target_through_scope() {
+    fn replay_http_witness_re_resolves_the_witness_target_through_scope() {
         let env = mvp_env();
         let witness = Reproduction {
             capability: "http_sqli_vantage".to_owned(),

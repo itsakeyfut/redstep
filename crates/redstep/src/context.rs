@@ -444,8 +444,9 @@ fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
     }
 }
 
-/// What [`TestContext::run`], [`TestContext::connect_from_vantage`] and
-/// [`TestContext::exploit_sqli_from_vantage`] return:
+/// What [`TestContext::run`], [`TestContext::connect_from_vantage`],
+/// [`TestContext::exploit_sqli_from_vantage`] and
+/// [`TestContext::exploit_path_traversal_from_vantage`] return:
 /// the capability's [`Observation`] and a per-test reference to the evidence it
 /// produced. Passing it to [`expect`](TestContext::expect) links the judgement to
 /// that evidence automatically.
@@ -455,8 +456,9 @@ fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
 /// `Observation` a `Capability` returns to all carry a link they cannot fill, and
 /// would make `execute`'s observation meaningless until `run` rewrote it. So the
 /// observation stays a plain signal and only a capability's result carries a link
-/// (ADR-0010, issue #14). Only `run`, `connect_from_vantage` and
-/// `exploit_sqli_from_vantage` construct one.
+/// (ADR-0010, issue #14). Only `run`, `connect_from_vantage`,
+/// `exploit_sqli_from_vantage` and `exploit_path_traversal_from_vantage` construct
+/// one.
 ///
 /// The reference is a per-test index (see [`DraftRef`]), so a
 /// `Recorded` is only meaningful to the context that produced it. Judging one on
