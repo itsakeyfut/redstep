@@ -26,8 +26,8 @@ what succeeded, and proves that a fix closes it.
   ADR-0021).
 - Intensity ladder: a capability defaults to `Safe`; `Controlled` and `Aggressive`
   require an explicit, unforgeable opt-in (ADR-0002).
-- Native capabilities behind one intensity-gated trait: TCP reachability and an HTTP
-  vantage point.
+- A native TCP reachability capability behind one intensity-gated trait, and an HTTP
+  vantage point used by the SQL-injection check.
 - A native SQL-injection check with a full exploit -> capture -> fix -> replay loop
   against the playground target, including the redirect and request-authority guards
   that keep the probe inside its scope.

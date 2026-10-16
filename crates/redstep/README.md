@@ -17,10 +17,10 @@ attack is now blocked.
 ## Status
 
 v0.1.0 is the first vertical slice (milestone M1): an isolated Docker lab, a
-scope gate and intensity ladder, native TCP and HTTP capabilities, a native
-SQL-injection exploit -> fix -> replay loop, a Pass / Fail / Inconclusive verdict
-oracle, and append-only evidence rendered as canonical JSON and a rustc-style
-diagnostic. The public API is not yet stable (pre-1.0).
+scope gate and intensity ladder, a native TCP reachability capability, a native
+SQL-injection exploit -> fix -> replay loop over an HTTP vantage, a Pass / Fail /
+Inconclusive verdict oracle, and append-only evidence rendered as canonical JSON
+and a rustc-style diagnostic. The public API is not yet stable (pre-1.0).
 
 Docker is required: the lab is built as Docker containers.
 

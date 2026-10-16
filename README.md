@@ -27,9 +27,10 @@ with the machinery the rest of the project builds on. It ships:
 - an isolated Docker lab (egress-less networks, a boundary self-check before any
   attack, automatic teardown);
 - a scope gate and an intensity ladder (default-deny, default-safe);
-- native capabilities: TCP reachability and an HTTP vantage point;
-- a native SQL-injection check with a full exploit -> capture -> fix -> replay
-  loop against a deliberately-vulnerable playground target;
+- a native TCP reachability capability, behind the intensity-gated trait;
+- a native SQL-injection check over an HTTP vantage, with a full exploit ->
+  capture -> fix -> replay loop against a deliberately-vulnerable playground
+  target;
 - a Pass / Fail / Inconclusive verdict oracle that keeps a weak signal out of a
   confident answer;
 - append-only evidence, one canonical JSON every report projects from, and a
