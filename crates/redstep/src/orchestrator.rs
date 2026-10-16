@@ -187,22 +187,51 @@ pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> 
     }
 }
 
+/// Split an image reference into the `(from_image, tag)` pair `create_image`
+/// wants, as borrows of `image` (or the literal `"latest"`).
+///
+/// Three reference shapes matter, and splitting on the last `:` over the whole
+/// string (as this once did) mis-reads two of them:
+///
+/// - a digest pin, `repo@sha256:...`: everything after the `@` is the digest,
+///   which goes in the tag field. The Docker Engine API documents `tag` as "Tag
+///   or digest", and both a digest in `tag` and a digest embedded in `fromImage`
+///   pull by digest (verified against a live daemon, #48); the tag field is used
+///   so `from_image` stays a pure name.
+/// - a registry with a port, `localhost:5000/app`: the `:` belongs to the host,
+///   not a tag. A tag colon is therefore the last `:` that falls *after* the
+///   last `/`, so a `host:port` before the path is never read as a tag.
+/// - a bare name, `redis`: no tag and no digest, so the `latest` default stands.
+///
+/// Pure, so every shape is unit-tested without Docker (`#48` made real-image
+/// `.service(..)` references, which carry these shapes, the normal case).
+fn parse_image_ref(image: &str) -> (&str, &str) {
+    if let Some((name, digest)) = image.split_once('@') {
+        return (name, digest);
+    }
+    let path_start = image.rfind('/').map_or(0, |i| i + 1);
+    match image[path_start..].rfind(':') {
+        Some(rel) => {
+            let at = path_start + rel;
+            (&image[..at], &image[at + 1..])
+        }
+        None => (image, "latest"),
+    }
+}
+
 /// Pull `image` so `create_container` finds it. The Docker API's
 /// `create_container` does not pull and returns 404 for an absent image, so the
 /// orchestrator pulls first. Idempotent: a present image streams quickly and
-/// succeeds. The image reference is split on its last `:` into name and tag
-/// (the MVP's `busybox:1.37`, `postgres:16`); a registry-with-port reference is
-/// not an MVP shape.
+/// succeeds. [`parse_image_ref`] derives the name and tag (or digest), handling
+/// the MVP's `busybox:1.37`/`postgres:16`, a registry `host:port`, and a
+/// `@sha256:...` digest alike.
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     use futures_util::StreamExt;
 
-    let (from_image, tag) = match image.rsplit_once(':') {
-        Some((name, tag)) => (name.to_owned(), tag.to_owned()),
-        None => (image.to_owned(), "latest".to_owned()),
-    };
+    let (from_image, tag) = parse_image_ref(image);
     let options = bollard::query_parameters::CreateImageOptionsBuilder::default()
-        .from_image(&from_image)
-        .tag(&tag)
+        .from_image(from_image)
+        .tag(tag)
         .build();
     let mut stream = docker.create_image(Some(options), None, None);
     while let Some(item) = stream.next().await {
@@ -1938,6 +1967,35 @@ mod tests {
         assert!(
             !cmd.iter().any(|a| a == "sh" || a == "-c"),
             "no shell wrapper, got {cmd:?}"
+        );
+    }
+
+    /// Guard: `parse_image_ref` reads a tag, a bare name, a registry `host:port`,
+    /// and an `@sha256:...` digest into the right `(from_image, tag)` pair (#48).
+    /// Pure, no Docker, so it runs on every gate. Mutation: revert the body to
+    /// `image.rsplit_once(':')` over the whole reference -> `localhost:5000/app`
+    /// parses to `("localhost", "5000/app")` and `repo@sha256:abcd` to
+    /// `("repo@sha256", "abcd")` -> the registry-port and digest cases fail.
+    #[test]
+    fn parse_image_ref_reads_a_tag_registry_port_and_digest() {
+        assert_eq!(parse_image_ref("postgres:16"), ("postgres", "16"));
+        assert_eq!(parse_image_ref("busybox:1.37"), ("busybox", "1.37"));
+        assert_eq!(parse_image_ref("redis"), ("redis", "latest"));
+        assert_eq!(parse_image_ref("redstep/api:mvp"), ("redstep/api", "mvp"));
+        assert_eq!(
+            parse_image_ref("localhost:5000/app"),
+            ("localhost:5000/app", "latest"),
+            "a registry host:port before the path is not a tag"
+        );
+        assert_eq!(
+            parse_image_ref("localhost:5000/app:v1"),
+            ("localhost:5000/app", "v1"),
+            "a tag after a registry host:port is still read"
+        );
+        assert_eq!(
+            parse_image_ref("repo@sha256:abcd"),
+            ("repo", "sha256:abcd"),
+            "a digest goes to the tag field whole, name is what precedes the @"
         );
     }
 
