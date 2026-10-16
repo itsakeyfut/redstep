@@ -676,9 +676,10 @@ async fn run_probe_cmd(
 /// HTTP probe, the response body and, with `wget -S`, the response headers) before
 /// removing it. `run_probe_cmd` removes the container as it returns, so it can only
 /// yield an exit code; the SQLi check needs the body to witness the exfiltrated
-/// flag and the headers to see a followed redirect (#55). The logs are read after
-/// the probe exits and before removal. This is the narrow log-capturing path #50
-/// needs; the generalized in-container seam is M3 (mvp.md).
+/// flag and the headers to see a followed redirect (#55). Returns
+/// `(state, stdout, stderr)`. The logs are read after the probe exits and before
+/// removal. This is the narrow log-capturing path #50 needs; the generalized
+/// in-container seam is M3 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
     network: &str,
@@ -1042,7 +1043,8 @@ fn validate_sqli_request(request_path: &str, marker: &str) -> Result<()> {
 /// (`-O -`), quiet (`-q`), print the response headers to stderr (`-S`, so a
 /// followed redirect is visible to [`response_was_redirected`], #55), with a
 /// `secs` per-read network timeout (`-T`; the total run is bounded by the caller's
-/// `max_wait`, not this). `-q` does not suppress `-S` (verified). Passing argv
+/// `max_wait`, not this). `-q` does not suppress `-S` (the Docker-gated redirect
+/// test exercises this on real busybox). Passing argv
 /// directly rather than through `sh -c` means the url is one argument, not text a
 /// shell could interpret, so it cannot inject a command into the probe container.
 /// Pure, so the argv shape is unit-tested without Docker.
@@ -1059,12 +1061,17 @@ fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
     ]
 }
 
-/// Whether the `wget -S` response headers show a followed redirect (#55). busybox
-/// `wget` prints one status line per response it makes, so a 3xx status line
-/// (ahead of the final 200) means it followed a redirect and the body on stdout
-/// may be from another host, not the scoped target. Pure, so it is unit-tested
-/// offline against a captured header block; the status line is matched by its
-/// code, so header order and the `Location` wording do not matter.
+/// Whether the `wget -S` response headers carry a 3xx status line (#55). busybox
+/// `wget` prints one status line per response it makes, so a 3xx ahead of the
+/// final 200 means it followed a redirect and the body on stdout may be from
+/// another host, not the scoped target. Deliberately broad: ANY 3xx counts,
+/// including an unfollowed 300 or a same-host redirect whose body is in fact the
+/// target's. That over-downgrades such a probe to Inconclusive, which is the safe
+/// side (it never reads an unattributable body as a confident answer); narrowing
+/// it to a cross-host `Location` comparison, to recover reach against apps that
+/// legitimately redirect to themselves, is a deferred refinement. Pure, so it is
+/// unit-tested offline against a captured header block; the status line is matched
+/// by its code, so header order and the `Location` wording do not matter.
 fn response_was_redirected(headers: &str) -> bool {
     headers.lines().any(|line| {
         line.trim_start()
@@ -1074,22 +1081,22 @@ fn response_was_redirected(headers: &str) -> bool {
     })
 }
 
-/// Classify a captured SQLi probe (see [`sqli_exploit_from`]). A followed redirect
-/// is `Low` first of all (value `false`): the body may have come from the
-/// redirect's host, so it cannot be read as the scoped target's answer (#55). Else
-/// a clean exit (0) whose body contains the `marker` is an exploit (`true`,
-/// `High`); a clean exit whose body lacks it is not-exploitable (`false`, `High`);
-/// any other exit code, or an unclean exit, is `Low` (value `false`), because the
-/// probe did not establish the endpoint's state and must not read as a confident
-/// "not exploitable" (a connect failure or an HTTP error is not a clean negative;
-/// RK-002, CLAUDE.md row 6). A redirect joins that same Inconclusive bucket: it
-/// downgrades to `Low` rather than erroring like `nc_result`/`classify_probe`
-/// (those back the boundary self-check, where an abnormal probe is a lab fault
-/// that must refuse the run); here it is a per-test observation that could not
-/// conclude, which belongs in Inconclusive under the default-`High` gate, not an
-/// `Error`. Taking the state (not a bare code) folds the exited-cleanly check in
-/// via [`finished_exit_code`], so the whole fail-closed mapping is unit-tested
-/// without Docker.
+/// Classify a captured SQLi probe (see [`sqli_exploit_from`] for why a followed
+/// redirect is untrustworthy). A redirect forces `Low` (value `false`), checked
+/// before the exit code because a witnessed marker with a clean exit would
+/// otherwise read `High`. Else a clean exit (0) whose body contains the `marker`
+/// is an exploit (`true`, `High`); a clean exit whose body lacks it is
+/// not-exploitable (`false`, `High`); any other exit code, or an unclean exit, is
+/// `Low` (value `false`), because the probe did not establish the endpoint's
+/// state and must not read as a confident "not exploitable" (RK-002, CLAUDE.md
+/// row 6, under ADR-0010's confidence gate). A redirect and an abnormal probe
+/// share that Inconclusive bucket: both downgrade to `Low` rather than erroring
+/// like `nc_result`/`classify_probe` (which back the boundary self-check, where
+/// an abnormal probe is a lab fault that must refuse the run); here it is a
+/// per-test observation that could not conclude, which belongs in Inconclusive
+/// under the default-`High` gate, not an `Error`. Taking the state (not a bare
+/// code) folds the exited-cleanly check in via [`finished_exit_code`], so the
+/// whole fail-closed mapping is unit-tested without Docker.
 fn classify_sqli(
     state: &ContainerState,
     body: &str,
@@ -1929,12 +1936,14 @@ mod tests {
     /// (value `false`) so it lands Inconclusive under the default gate, never a
     /// confident "not exploitable" (RK-002, CLAUDE.md row 6). Mutation: ignore the
     /// `redirected` argument -> a redirected witness body reads as a confident
-    /// exploit attributed to the target -> the redirect assertion fails; give the
-    /// abnormal arm `High` -> a connect failure reads as a confident clean -> the
-    /// Low assertions fail (the row-6 guard); give clean-no-witness `Low` -> the
-    /// fixed-target PASS path (#50 beta) can never reach a confident Pass -> that
-    /// assertion fails; drop the `body.contains` guard -> a clean 200 with no flag
-    /// reads as exploited -> fails.
+    /// exploit -> the with-witness redirect assertion fails; restrict the downgrade
+    /// to `redirected && body.contains(marker)` -> a redirected marker-less 200
+    /// reads as a confident "not exploitable" from another host's page (row 6) ->
+    /// the no-witness redirect assertion fails; give the abnormal arm `High` -> a
+    /// connect failure reads as a confident clean -> the Low assertions fail (the
+    /// row-6 guard); give clean-no-witness `Low` -> the fixed-target PASS path (#50
+    /// beta) can never reach a confident Pass -> that assertion fails; drop the
+    /// `body.contains` guard -> a clean 200 with no flag reads as exploited -> fails.
     #[test]
     fn classify_sqli_reads_the_body_and_fails_closed() {
         use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
@@ -1974,6 +1983,18 @@ mod tests {
         assert!(!redirected.value);
         assert_eq!(redirected.confidence, Confidence::Low);
 
+        // And without the witness: a redirected clean 200 must not read as a
+        // confident "not exploitable" (that would be a confident verdict on another
+        // host's page, row 6). The downgrade is unconditional on the body.
+        let redirected_no_witness = classify_sqli(
+            &state(Some(EXITED), Some(0)),
+            "welcome|hello\n",
+            witness,
+            true,
+        );
+        assert!(!redirected_no_witness.value);
+        assert_eq!(redirected_no_witness.confidence, Confidence::Low);
+
         // A non-zero clean exit (HTTP error / connect failure) and an unclean exit
         // are both inconclusive, whatever the (empty) body: value false at Low.
         for abnormal in [
@@ -1993,19 +2014,45 @@ mod tests {
         }
     }
 
-    /// Guard: `response_was_redirected` reads a followed redirect out of the
-    /// `wget -S` headers by a 3xx status line (#55). The first block below is a
-    /// real busybox `-S` stderr from a 302-then-200 chain; a direct 200-only block
-    /// is not redirected, and empty headers are not. Pure, no Docker. Mutation:
-    /// drop the `starts_with('3')` test (match any status) -> the 200-only block
-    /// reads as redirected -> the direct assertion fails.
+    /// Guard: `response_was_redirected` fires on a 3xx *status line* anywhere in
+    /// the `wget -S` headers, and on nothing else (#55). Every followed-redirect
+    /// code (301/302/303/307/308) is a hit; a 2xx/4xx/5xx status, a 3xx that
+    /// appears only in a header value, and an empty block are misses. The first
+    /// block is a real busybox `-S` stderr. Pure, no Docker. Mutations, each caught
+    /// by a row: `starts_with('3')` -> `contains('3')` (a 203 hits) or
+    /// `!starts_with('2')` (a 404 hits) or `== "302"` (301/307/308 miss); drop
+    /// .strip_prefix("HTTP/")` (the `Content-Length: 300` header value hits);
+    /// `lines()` -> `lines().take(1)` (the status line not on the first line is
+    /// missed).
     #[test]
     fn response_was_redirected_detects_a_3xx_status_line() {
-        let redirected = "  HTTP/1.0 302 Found\n  Location: http://other/\n  HTTP/1.1 200 OK\n  Content-Length: 14\n";
-        let direct = "  HTTP/1.1 200 OK\n  Content-Length: 14\n";
-        assert!(response_was_redirected(redirected));
-        assert!(!response_was_redirected(direct));
-        assert!(!response_was_redirected(""));
+        let redirected: &[&str] = &[
+            "  HTTP/1.0 302 Found\n  Location: http://other/\n  HTTP/1.1 200 OK\n  Content-Length: 14\n",
+            "  HTTP/1.1 301 Moved Permanently\n  HTTP/1.1 200 OK\n",
+            "  HTTP/1.1 307 Temporary Redirect\n  HTTP/1.1 200 OK\n",
+            "  HTTP/1.1 308 Permanent Redirect\n  HTTP/1.1 200 OK\n",
+            // busybox prints a "Connecting to ..." line before the status line, so
+            // the 3xx is not always the first line: every line must be scanned.
+            "Connecting to redir (10.0.0.2:80)\n  HTTP/1.1 302 Found\n  HTTP/1.1 200 OK\n",
+        ];
+        let direct: &[&str] = &[
+            "  HTTP/1.1 200 OK\n  Content-Length: 14\n",
+            "  HTTP/1.1 203 Non-Authoritative Information\n",
+            "  HTTP/1.1 404 Not Found\n",
+            "  HTTP/1.1 500 Internal Server Error\n",
+            // a 3xx only in a header value, never a status line, is not a redirect.
+            "  HTTP/1.1 200 OK\n  Content-Length: 300\n",
+            "",
+        ];
+        for h in redirected {
+            assert!(
+                response_was_redirected(h),
+                "should detect a redirect: {h:?}"
+            );
+        }
+        for h in direct {
+            assert!(!response_was_redirected(h), "should not flag: {h:?}");
+        }
     }
 
     /// Guard (Docker; self-skips without a Linux daemon): a target that answers
