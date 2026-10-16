@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# crates.io requires a description; this crate is the framework's macro support,
+# not a standalone tool, so the description points back at redstep.
+description = "Procedural macros for the redstep security-testing framework."
+keywords = ["security", "testing", "macros", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+readme = "README.md"
 
 [lints]
 workspace = true

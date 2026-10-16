@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# crates.io requires a description; keep it to what the framework is, not a pitch.
+description = "A security-testing framework: drive real attacks against your own apps, networks, containers and cloud inside an isolated lab, from an attacker's point of view."
+keywords = ["security", "pentest", "security-testing", "attack", "docker"]
+categories = ["development-tools::testing", "command-line-utilities"]
+readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-redstep-macros = { path = "../redstep-macros" }
+# Pinned to a version in [workspace.dependencies] so `redstep` can publish; see there.
+redstep-macros = { workspace = true }
 # Test discovery: the attribute macro registers each test into a distributed
 # collection that `run` iterates. See docs/adr/ ADR-0001.
 inventory = "0.3.25"
