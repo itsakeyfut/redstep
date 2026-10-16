@@ -240,19 +240,47 @@ async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure `image` is present locally, pulling it only if it is not. A locally
-/// built image (the playground's `redstep/*:mvp`, #47) is in no registry, so an
-/// unconditional [`pull_image`] would 404 on it; a registry image that is absent
-/// locally is pulled as before. An image that is neither present nor pullable
-/// still surfaces the pull's 404 as [`Error::LabUnavailable`].
+/// The prefix of the project's own fixture images (the playground's
+/// `redstep/{db,api,web}:mvp` and `redstep/api:fixed`, #47/#54), built locally by
+/// `playground/build.sh` and never pushed to a registry (`playground/README`).
+/// See [`is_local_only_image`] for what refusing to pull them protects against.
+const LOCAL_IMAGE_PREFIX: &str = "redstep/";
+
+/// Whether `image` is one of the project's own local-only fixtures, matched by
+/// the `redstep/` namespace. They must be present locally and never pulled: the
+/// unqualified `redstep/...` form resolves against the default registry as
+/// `docker.io/redstep/*`, so pulling an absent one would fetch and run whatever a
+/// squatter published there as the "target" (#53); refusing the pull closes that.
+/// A *qualified* `docker.io/redstep/...` a developer writes is not matched and
+/// still pulls: that is the user naming a registry image on purpose, not the
+/// framework reaching for one. Layer-1 isolation (ADR-0006) bounds the blast
+/// radius regardless. Pure, so the rule is unit-tested offline (RK-014: a safety
+/// rule should not be guarded only by a self-skipping Docker test).
+fn is_local_only_image(image: &str) -> bool {
+    image.starts_with(LOCAL_IMAGE_PREFIX)
+}
+
+/// Ensure `image` is present locally, pulling it only if it is not. A present
+/// image is accepted at the inspect check; an absent [`is_local_only_image`]
+/// fixture is refused with a `playground/build.sh` hint rather than pulled (see
+/// that function for why, #53); any other absent image is pulled, surfacing a
+/// pull failure as [`Error::LabUnavailable`].
 ///
-/// A present image is therefore never re-pulled, so a mutable registry tag is not
-/// refreshed once it is local. That is acceptable here: the MVP's tags are pinned
-/// (`busybox:1.37`, `postgres:16`) and the playground tags are local-only, and it
-/// is the whole point, since a local-only image cannot be pulled at all.
+/// A present image is never re-pulled, so a mutable registry tag is not refreshed
+/// once it is local. That is acceptable here: the MVP's tags are pinned
+/// (`busybox:1.37`, `postgres:16`) and the fixtures are local-only.
 async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
+    }
+    if is_local_only_image(image) {
+        return Err(Error::LabUnavailable {
+            reason: format!(
+                "{image} is a local-only playground image and is not present; \
+                 build it with playground/build.sh (local-only images are never \
+                 pulled from a registry)"
+            ),
+        });
     }
     pull_image(docker, image).await
 }
@@ -1997,6 +2025,100 @@ mod tests {
             ("repo", "sha256:abcd"),
             "a digest goes to the tag field whole, name is what precedes the @"
         );
+    }
+
+    /// Guard: `is_local_only_image` is true for exactly the project's own
+    /// `redstep/*` fixtures and false for a registry image (#53). This is the
+    /// offline anchor for the refusal-to-pull safety rule, which `ensure_image`'s
+    /// Docker-gated test only wires up (RK-014). Mutation: `starts_with(..)` ->
+    /// `false` makes the `redstep/*` cases fail; -> `true` makes the
+    /// busybox/postgres cases fail; drop the `/` from `LOCAL_IMAGE_PREFIX`
+    /// (`"redstep/"` -> `"redstep"`) and the `redstepper/x` case fails, because
+    /// the boundary is the `redstep/` namespace, not a bare `redstep` prefix.
+    #[test]
+    fn is_local_only_image_is_true_only_for_the_project_prefix() {
+        assert!(is_local_only_image("redstep/db:mvp"));
+        assert!(is_local_only_image("redstep/api:fixed"));
+        assert!(is_local_only_image("redstep/web:mvp"));
+        assert!(!is_local_only_image("busybox:1.37"));
+        assert!(!is_local_only_image("postgres:16"));
+        assert!(
+            !is_local_only_image("docker.io/redstep/x:1"),
+            "a registry-qualified name is not the project's unqualified fixture form"
+        );
+        assert!(
+            !is_local_only_image("redstepper/x:1"),
+            "the boundary is the redstep/ namespace, not a bare redstep prefix"
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon): `ensure_image` refuses
+    /// an absent local-only fixture with a `playground/build.sh` hint that names
+    /// the fixture, rather than reaching a registry (#53). Needs no built image:
+    /// it names a fixture that is deliberately never built. Mutation: remove the
+    /// `is_local_only_image` branch in `ensure_image` -> it falls to `pull_image`
+    /// and the error is a registry pull failure, not the build hint -> this
+    /// fails; drop `{image}` from the hint -> the fixture-name assertion fails.
+    /// The rule itself is pinned offline by
+    /// `is_local_only_image_is_true_only_for_the_project_prefix`.
+    #[test]
+    fn ensure_image_refuses_to_pull_an_absent_local_only_image() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping ensure_image_refuses_to_pull_an_absent_local_only_image: no Linux Docker daemon"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let err = ensure_image(&docker, "redstep/absent-fixture:test")
+                .await
+                .expect_err("an absent local-only image must not resolve to a pull");
+            match err {
+                Error::LabUnavailable { reason } => {
+                    assert!(
+                        reason.contains("playground/build.sh"),
+                        "the refusal points at the build script, got: {reason:?}"
+                    );
+                    assert!(
+                        reason.contains("redstep/absent-fixture:test"),
+                        "the refusal names which fixture to build, got: {reason:?}"
+                    );
+                }
+                other => panic!("expected LabUnavailable with a build hint, got {other:?}"),
+            }
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon): an absent image that is
+    /// NOT a local-only fixture reaches `pull_image` rather than the refusal (the
+    /// else arm, #53 AC 2: a registry image still pulls). The name uses the
+    /// reserved `.invalid` TLD, so the pull fails fast on an unresolvable host
+    /// with no real egress (verified: ~0.3s, "no such host"), and the error is a
+    /// pull failure, not the `playground/build.sh` hint. Mutation: replace the
+    /// final `pull_image(...).await` in `ensure_image` with `Ok(())` -> this image
+    /// resolves to `Ok` and the `expect_err` panics -> this fails.
+    #[test]
+    fn ensure_image_pulls_an_absent_non_local_image() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping ensure_image_pulls_an_absent_non_local_image: no Linux Docker daemon"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let err = ensure_image(&docker, "redstep-nonexistent.invalid/x:1")
+                .await
+                .expect_err("an unresolvable registry image must fail the pull");
+            match err {
+                Error::LabUnavailable { reason } => assert!(
+                    !reason.contains("playground/build.sh"),
+                    "a non-local image must hit the pull, not the build hint, got: {reason:?}"
+                ),
+                other => panic!("expected a pull failure as LabUnavailable, got {other:?}"),
+            }
+        });
     }
 
     /// Guard: `sqli_draft` mirrors the observation into the record (RK-011) and
