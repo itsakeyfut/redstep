@@ -8,6 +8,7 @@ repository.workspace = true
 description = "A security-testing framework: drive real attacks against your own apps, networks, containers and cloud inside an isolated lab, from an attacker's point of view."
 keywords = ["security", "pentest", "security-testing", "attack", "docker"]
 categories = ["development-tools::testing", "command-line-utilities"]
+readme = "README.md"
 
 [lints]
 workspace = true
