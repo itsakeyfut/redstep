@@ -672,18 +672,19 @@ async fn run_probe_cmd(
     result
 }
 
-/// Like [`run_probe_cmd`], but capture the container's stdout (for an HTTP probe,
-/// the response body) before removing it. `run_probe_cmd` removes the container as
-/// it returns, so it can only yield an exit code; the SQLi check needs the body to
-/// witness the exfiltrated flag. The logs are read after the probe exits and
-/// before removal. This is the narrow log-capturing path #50 needs; the
-/// generalized in-container seam is M3 (mvp.md).
+/// Like [`run_probe_cmd`], but capture the container's stdout and stderr (for an
+/// HTTP probe, the response body and, with `wget -S`, the response headers) before
+/// removing it. `run_probe_cmd` removes the container as it returns, so it can only
+/// yield an exit code; the SQLi check needs the body to witness the exfiltrated
+/// flag and the headers to see a followed redirect (#55). The logs are read after
+/// the probe exits and before removal. This is the narrow log-capturing path #50
+/// needs; the generalized in-container seam is M3 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
     network: &str,
     cmd: Vec<String>,
     max_wait: Duration,
-) -> Result<(ContainerState, String)> {
+) -> Result<(ContainerState, String, String)> {
     use futures_util::StreamExt;
 
     let name = format!("{}-probe", run_id());
@@ -691,17 +692,26 @@ async fn run_probe_capturing(
         let state = run_probe_to_exit(docker, &name, network, cmd, max_wait).await?;
         let options = bollard::query_parameters::LogsOptionsBuilder::default()
             .stdout(true)
+            .stderr(true)
             .build();
         let mut stream = docker.logs(&name, Some(options));
-        let mut stdout = Vec::new();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         while let Some(frame) = stream.next().await {
-            if let bollard::container::LogOutput::StdOut { message } =
-                frame.map_err(lab_unavailable)?
-            {
-                stdout.extend_from_slice(&message);
+            match frame.map_err(lab_unavailable)? {
+                bollard::container::LogOutput::StdOut { message } => {
+                    stdout.extend_from_slice(&message)
+                }
+                bollard::container::LogOutput::StdErr { message } => {
+                    stderr.extend_from_slice(&message)
+                }
+                _ => {}
             }
         }
-        Ok((state, String::from_utf8_lossy(&stdout).into_owned()))
+        Ok((
+            state,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        ))
     }
     .await;
     let _ = docker
@@ -954,10 +964,12 @@ fn vantage_draft(
 /// [`classify_sqli`]'s: an abnormal probe is `Low`, never a confident "not
 /// exploitable".
 ///
-/// Known limit: busybox `wget` follows HTTP redirects and offers no flag to
-/// disable them, so a `target` that answers with a 3xx would have its response
-/// read from the redirect's host, which the record still attributes to `target`.
-/// The playground target does not redirect; a redirect-aware probe is #55.
+/// busybox `wget` follows HTTP redirects and offers no flag to disable them, so a
+/// `target` that answers with a 3xx would have its body read from the redirect's
+/// host. `wget -S` prints the response headers to stderr, so
+/// [`response_was_redirected`] sees the 3xx status line and [`classify_sqli`]
+/// downgrades the observation to `Low` (Inconclusive): a redirected body is never
+/// read as the scoped target's confident answer (#55).
 pub(crate) async fn sqli_exploit_from(
     docker: &Docker,
     vantage: &LabNetwork,
@@ -971,14 +983,14 @@ pub(crate) async fn sqli_exploit_from(
     let applied = Duration::from_secs(secs);
     let url = format!("http://{}:{}{}", target.host(), target.port(), request_path);
     let cmd = wget_cmd(&url, secs);
-    let (state, body) = run_probe_capturing(
+    let (state, body, headers) = run_probe_capturing(
         docker,
         vantage.name(),
         cmd,
         applied + Duration::from_secs(5),
     )
     .await?;
-    let observation = classify_sqli(&state, &body, marker);
+    let observation = classify_sqli(&state, &body, marker, response_was_redirected(&headers));
     let spec = format!("{}:{}", target.host(), target.port());
     let draft = sqli_draft(
         vantage.segment(),
@@ -1027,15 +1039,18 @@ fn validate_sqli_request(request_path: &str, marker: &str) -> Result<()> {
 }
 
 /// The busybox `wget` probe as argv (never a shell line): fetch `url` to stdout
-/// (`-O -`), quiet (`-q`), with a `secs` per-read network timeout (`-T`; the total
-/// run is bounded by the caller's `max_wait`, not this). Passing argv directly
-/// rather than through `sh -c` means the url is one argument, not text a shell
-/// could interpret, so it cannot inject a command into the probe container. Pure,
-/// so the argv shape is unit-tested without Docker.
+/// (`-O -`), quiet (`-q`), print the response headers to stderr (`-S`, so a
+/// followed redirect is visible to [`response_was_redirected`], #55), with a
+/// `secs` per-read network timeout (`-T`; the total run is bounded by the caller's
+/// `max_wait`, not this). `-q` does not suppress `-S` (verified). Passing argv
+/// directly rather than through `sh -c` means the url is one argument, not text a
+/// shell could interpret, so it cannot inject a command into the probe container.
+/// Pure, so the argv shape is unit-tested without Docker.
 fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
     vec![
         "wget".to_owned(),
         "-q".to_owned(),
+        "-S".to_owned(),
         "-T".to_owned(),
         secs.to_string(),
         "-O".to_owned(),
@@ -1044,20 +1059,49 @@ fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
     ]
 }
 
-/// Classify a captured SQLi probe (see [`sqli_exploit_from`]). A clean exit (0)
-/// whose body contains the `marker` is an exploit (`true`, `High`); a clean exit
-/// whose body lacks it is not-exploitable (`false`, `High`); any other exit code,
-/// or an unclean exit, is `Low` (value `false`), because the probe did not
-/// establish the endpoint's state and must not read as a confident "not
-/// exploitable" (a connect failure or an HTTP error is not a clean negative;
-/// RK-002, CLAUDE.md row 6). This downgrades to `Low` rather than erroring like
-/// `nc_result`/`classify_probe`: those back the boundary self-check, where an
-/// abnormal probe is a lab fault that must refuse the run; here it is a per-test
-/// observation that could not conclude, which belongs in Inconclusive under the
-/// default-`High` gate, not an `Error`. Taking the state (not a bare code) folds
-/// the exited-cleanly check in via [`finished_exit_code`], so the whole
-/// fail-closed mapping is unit-tested without Docker.
-fn classify_sqli(state: &ContainerState, body: &str, marker: &str) -> Observation<bool> {
+/// Whether the `wget -S` response headers show a followed redirect (#55). busybox
+/// `wget` prints one status line per response it makes, so a 3xx status line
+/// (ahead of the final 200) means it followed a redirect and the body on stdout
+/// may be from another host, not the scoped target. Pure, so it is unit-tested
+/// offline against a captured header block; the status line is matched by its
+/// code, so header order and the `Location` wording do not matter.
+fn response_was_redirected(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("HTTP/")
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .is_some_and(|code| code.starts_with('3'))
+    })
+}
+
+/// Classify a captured SQLi probe (see [`sqli_exploit_from`]). A followed redirect
+/// is `Low` first of all (value `false`): the body may have come from the
+/// redirect's host, so it cannot be read as the scoped target's answer (#55). Else
+/// a clean exit (0) whose body contains the `marker` is an exploit (`true`,
+/// `High`); a clean exit whose body lacks it is not-exploitable (`false`, `High`);
+/// any other exit code, or an unclean exit, is `Low` (value `false`), because the
+/// probe did not establish the endpoint's state and must not read as a confident
+/// "not exploitable" (a connect failure or an HTTP error is not a clean negative;
+/// RK-002, CLAUDE.md row 6). A redirect joins that same Inconclusive bucket: it
+/// downgrades to `Low` rather than erroring like `nc_result`/`classify_probe`
+/// (those back the boundary self-check, where an abnormal probe is a lab fault
+/// that must refuse the run); here it is a per-test observation that could not
+/// conclude, which belongs in Inconclusive under the default-`High` gate, not an
+/// `Error`. Taking the state (not a bare code) folds the exited-cleanly check in
+/// via [`finished_exit_code`], so the whole fail-closed mapping is unit-tested
+/// without Docker.
+fn classify_sqli(
+    state: &ContainerState,
+    body: &str,
+    marker: &str,
+    redirected: bool,
+) -> Observation<bool> {
+    if redirected {
+        return Observation {
+            value: false,
+            confidence: Confidence::Low,
+        };
+    }
     match finished_exit_code(state) {
         Ok(0) if body.contains(marker) => Observation {
             value: true,
@@ -1877,16 +1921,20 @@ mod tests {
         }
     }
 
-    /// Guard: `classify_sqli` reads a captured SQLi probe. A clean exit (0) whose
-    /// body carries the witness is exploited at `High`; a clean exit whose body
-    /// lacks it is not-exploitable at `High`; any other code, or an unclean exit,
-    /// is `Low` (value `false`) so it lands Inconclusive under the default gate,
-    /// never a confident "not exploitable" (RK-002, CLAUDE.md row 6). Mutation:
-    /// give the abnormal arm `High` -> a connect failure reads as a confident clean
-    /// -> the Low assertions fail (the row-6 guard); give clean-no-witness `Low` ->
-    /// the fixed-target PASS path (#50 beta) can never reach a confident Pass ->
-    /// that assertion fails; drop the `body.contains` guard -> a clean 200 with no
-    /// flag reads as exploited -> fails.
+    /// Guard: `classify_sqli` reads a captured SQLi probe. A followed redirect is
+    /// `Low` even with the witness in the body, because the body may be from the
+    /// redirect's host, not the target (#55). Else a clean exit (0) whose body
+    /// carries the witness is exploited at `High`; a clean exit whose body lacks it
+    /// is not-exploitable at `High`; any other code, or an unclean exit, is `Low`
+    /// (value `false`) so it lands Inconclusive under the default gate, never a
+    /// confident "not exploitable" (RK-002, CLAUDE.md row 6). Mutation: ignore the
+    /// `redirected` argument -> a redirected witness body reads as a confident
+    /// exploit attributed to the target -> the redirect assertion fails; give the
+    /// abnormal arm `High` -> a connect failure reads as a confident clean -> the
+    /// Low assertions fail (the row-6 guard); give clean-no-witness `Low` -> the
+    /// fixed-target PASS path (#50 beta) can never reach a confident Pass -> that
+    /// assertion fails; drop the `body.contains` guard -> a clean 200 with no flag
+    /// reads as exploited -> fails.
     #[test]
     fn classify_sqli_reads_the_body_and_fails_closed() {
         use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
@@ -1901,13 +1949,30 @@ mod tests {
             &state(Some(EXITED), Some(0)),
             "label|REDSTEP_SQLI_WITNESS_7F3A\n",
             witness,
+            false,
         );
         assert!(exploited.value);
         assert_eq!(exploited.confidence, Confidence::High);
 
-        let clean = classify_sqli(&state(Some(EXITED), Some(0)), "welcome|hello\n", witness);
+        let clean = classify_sqli(
+            &state(Some(EXITED), Some(0)),
+            "welcome|hello\n",
+            witness,
+            false,
+        );
         assert!(!clean.value);
         assert_eq!(clean.confidence, Confidence::High);
+
+        // A followed redirect is Inconclusive even with the witness present and a
+        // clean exit: the body is not provably the scoped target's (#55).
+        let redirected = classify_sqli(
+            &state(Some(EXITED), Some(0)),
+            "label|REDSTEP_SQLI_WITNESS_7F3A\n",
+            witness,
+            true,
+        );
+        assert!(!redirected.value);
+        assert_eq!(redirected.confidence, Confidence::Low);
 
         // A non-zero clean exit (HTTP error / connect failure) and an unclean exit
         // are both inconclusive, whatever the (empty) body: value false at Low.
@@ -1917,7 +1982,7 @@ mod tests {
             state(Some(EXITED), None),      // no code
             state(Some(CREATED), Some(0)),  // never ran
         ] {
-            let obs = classify_sqli(&abnormal, "", witness);
+            let obs = classify_sqli(&abnormal, "", witness, false);
             assert!(!obs.value, "abnormal: {:?}", abnormal.status);
             assert_eq!(
                 obs.confidence,
@@ -1926,6 +1991,122 @@ mod tests {
                 abnormal.status
             );
         }
+    }
+
+    /// Guard: `response_was_redirected` reads a followed redirect out of the
+    /// `wget -S` headers by a 3xx status line (#55). The first block below is a
+    /// real busybox `-S` stderr from a 302-then-200 chain; a direct 200-only block
+    /// is not redirected, and empty headers are not. Pure, no Docker. Mutation:
+    /// drop the `starts_with('3')` test (match any status) -> the 200-only block
+    /// reads as redirected -> the direct assertion fails.
+    #[test]
+    fn response_was_redirected_detects_a_3xx_status_line() {
+        let redirected = "  HTTP/1.0 302 Found\n  Location: http://other/\n  HTTP/1.1 200 OK\n  Content-Length: 14\n";
+        let direct = "  HTTP/1.1 200 OK\n  Content-Length: 14\n";
+        assert!(response_was_redirected(redirected));
+        assert!(!response_was_redirected(direct));
+        assert!(!response_was_redirected(""));
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon): a target that answers
+    /// with a redirect yields an Inconclusive (`Low`) observation, not a confident
+    /// exploit attributed to the scoped target, even though the redirected body
+    /// carries the marker (#55). `redir` 302s to `t2`, which serves a body
+    /// containing the marker; the same busybox `wget -S` the probe uses follows
+    /// the redirect, so `response_was_redirected` sees the 3xx and `classify_sqli`
+    /// downgrades. The services carry no healthcheck (ready at once), so a bounded
+    /// readiness loop waits for the whole chain (clean exit + marker fetched +
+    /// redirect seen) before the measured probe, so a connect race cannot
+    /// masquerade as the downgrade. Mutation: make `classify_sqli` ignore
+    /// `redirected` -> `sqli_exploit_from` reads `true`/`High` attributed to
+    /// `redir` -> this fails.
+    #[test]
+    fn a_redirecting_target_is_inconclusive_not_a_confident_exploit() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping a_redirecting_target_is_inconclusive_not_a_confident_exploit: no Linux Docker daemon"
+            );
+            return;
+        }
+        const MARKER: &str = "REDIRECTEDBODYMARKER55";
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            pull_image(&docker, PROBE_IMAGE)
+                .await
+                .expect("pull the probe image");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service_cmd(
+                    "redir",
+                    PROBE_IMAGE,
+                    "lab",
+                    &[
+                        "sh",
+                        "-c",
+                        "while true; do printf 'HTTP/1.0 302 Found\\r\\nLocation: http://t2/\\r\\nContent-Length: 0\\r\\n\\r\\n' | nc -l -p 80; done",
+                    ],
+                )
+                .service_cmd(
+                    "t2",
+                    PROBE_IMAGE,
+                    "lab",
+                    &[
+                        "sh",
+                        "-c",
+                        "mkdir -p /www && printf '%s\\n' REDIRECTEDBODYMARKER55 > /www/index.html && httpd -f -h /www -p 80",
+                    ],
+                )
+                .build()
+                .expect("the redirector environment is valid");
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the redirector lab");
+            let net = vantage_network(&lab, "lab").expect("the lab network");
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("redir:80").expect("redir is in scope");
+            let url = format!("http://{}:{}/", target.host(), target.port());
+
+            // The services are healthcheck-less, so bring_up returns before nc/httpd
+            // bind. Wait for the whole chain: a clean fetch of t2's body through the
+            // redirect, so the measured probe below cannot pass via a connect race.
+            let mut ready = false;
+            for _ in 0..20 {
+                let chain_up = run_probe_capturing(
+                    &docker,
+                    net.name(),
+                    wget_cmd(&url, 3),
+                    Duration::from_secs(8),
+                )
+                .await
+                .is_ok_and(|(state, body, headers)| {
+                    matches!(finished_exit_code(&state), Ok(0))
+                        && body.contains(MARKER)
+                        && response_was_redirected(&headers)
+                });
+                if chain_up {
+                    ready = true;
+                    break;
+                }
+            }
+            assert!(ready, "the redirect chain (redir 302 -> t2 body) came up");
+
+            let (observation, _draft) =
+                sqli_exploit_from(&docker, net, &target, "/", MARKER, Duration::from_secs(5))
+                    .await
+                    .expect("the probe ran");
+            let _ = lab.teardown().await;
+
+            assert!(
+                !observation.value,
+                "a redirected body must not read as an exploit, got {observation:?}"
+            );
+            assert_eq!(
+                observation.confidence,
+                Confidence::Low,
+                "a redirecting target is Inconclusive, not a confident answer, got {observation:?}"
+            );
+        });
     }
 
     /// Guard: `validate_sqli_request` fails closed on inputs that could change the
@@ -1970,10 +2151,11 @@ mod tests {
         );
     }
 
-    /// Guard: the SQLi probe command is the exact argv `wget -q -T <secs> -O - <url>`,
-    /// run directly (never a shell line), so a crafted URL cannot inject a command
-    /// and the quiet/timeout/stdout flags are what the capture path relies on.
-    /// Mutation: build it as `["sh", "-c", ...]`, drop `-q`, change the `-T` value,
+    /// Guard: the SQLi probe command is the exact argv
+    /// `wget -q -S -T <secs> -O - <url>`, run directly (never a shell line), so a
+    /// crafted URL cannot inject a command and the quiet/headers/timeout/stdout
+    /// flags are what the capture and redirect-detection paths rely on. Mutation:
+    /// build it as `["sh", "-c", ...]`, drop `-q` or `-S`, change the `-T` value,
     /// or change `-O -` to a file -> the whole-argv assertion fails.
     #[test]
     fn wget_cmd_is_argv_not_a_shell_line() {
@@ -1984,13 +2166,14 @@ mod tests {
             vec![
                 "wget".to_owned(),
                 "-q".to_owned(),
+                "-S".to_owned(),
                 "-T".to_owned(),
                 "5".to_owned(),
                 "-O".to_owned(),
                 "-".to_owned(),
                 url.to_owned(),
             ],
-            "the probe is wget argv with the quiet/timeout/stdout flags and the url as one argument"
+            "the probe is wget argv with the quiet/headers/timeout/stdout flags and the url as one argument"
         );
         assert!(
             !cmd.iter().any(|a| a == "sh" || a == "-c"),
