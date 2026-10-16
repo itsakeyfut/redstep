@@ -1,0 +1,24 @@
+# release-plz configuration: https://release-plz.dev/docs/config
+#
+# Lockstep versioning: both crates share `[workspace.package].version`. release-plz
+# is used ONLY to publish to crates.io (in dependency order, via Trusted Publishing);
+# it publishes any crate whose version is not yet on crates.io. The single `v<version>`
+# tag and the single GitHub Release (with the CHANGELOG.md section) are created by
+# `.github/workflows/release.yml`, NOT by release-plz.
+
+[workspace]
+# release-plz publishes only; the workflow owns the single tag + GitHub Release.
+# Disabling these prevents per-crate `<crate>-v<version>` tags and per-crate Releases.
+git_tag_enable = false
+git_release_enable = false
+
+# Give the crates.io sparse index time to propagate between the two dependent
+# publishes (redstep-macros before redstep) so redstep does not fail because its
+# dependency is not yet visible on the index.
+publish_timeout = "10m"
+
+# No `[[package]]` block is needed: both `redstep` and `redstep-macros` publish, and
+# the deliberately-vulnerable `playground` is `exclude`d from the workspace (root
+# Cargo.toml), so it is outside release-plz's set already. `semver_check` and the
+# release-pr job are not configured because release.yml runs only the `release`
+# command (publish), never the PR command, so neither ever runs.
