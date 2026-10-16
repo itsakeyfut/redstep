@@ -28,7 +28,10 @@ use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
-use crate::orchestrator::{LabNetwork, http_witness_exploit_from, tcp_reachable_from};
+use crate::orchestrator::{
+    HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, LabNetwork, http_witness_exploit_from,
+    tcp_reachable_from,
+};
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
 
@@ -327,7 +330,7 @@ impl TestContext {
             &binding.docker,
             &binding.vantage_network,
             target,
-            "http_sqli_vantage",
+            HTTP_SQLI_VANTAGE,
             request_path,
             marker,
             DEFAULT_CONNECT_TIMEOUT,
@@ -375,7 +378,7 @@ impl TestContext {
             &binding.docker,
             &binding.vantage_network,
             target,
-            "http_path_traversal_vantage",
+            HTTP_PATH_TRAVERSAL_VANTAGE,
             request_path,
             marker,
             DEFAULT_CONNECT_TIMEOUT,
@@ -425,19 +428,18 @@ fn sqli_diagnostic(marker: &str) -> Diagnostic {
 }
 
 /// The ADR-0009 domain diagnostic for a successful path traversal: the cause names
-/// the sentinel `marker` that was read from outside the web root, and the
-/// remediation is to canonicalize the resolved path and reject one that escapes the
-/// root. Framework-emitted, not author-written (ADR-0009). Pure, so the text is
+/// the `marker` that was read from outside the intended directory, and the
+/// remediation is to canonicalize the resolved path and reject one that escapes
+/// that directory. Framework-emitted, not author-written (ADR-0009). Pure, so the text is
 /// guarded without Docker (`path_traversal_diagnostic_names_the_marker_and_the_fix`).
 fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
-            "the request returned {marker:?}, the body of a file seeded outside the web root, \
-             so the endpoint resolved a caller-supplied path without confining it and served a \
-             file the path traversed to"
+            "the request returned {marker:?}, the body of a file outside the intended directory, \
+             so the endpoint resolved a caller-supplied path without confining it to that directory"
         ),
         remediation: "canonicalize the resolved path and reject any path that resolves outside \
-             the web root, so a caller cannot traverse to a file beyond it"
+             the intended directory, so a caller cannot traverse to a file beyond it"
             .to_owned(),
     }
 }
@@ -470,8 +472,11 @@ pub struct Recorded<T> {
     /// [`to_be`](ExpectationBuilder::to_be) attaches on a `Fail`, replacing
     /// `judge`'s generic text. `None` for `run`/`connect_from_vantage`, whose
     /// expectations get the generic diagnostic; `Some` for a domain check like
-    /// `exploit_sqli_from_vantage`.
-    diagnostic: Option<Diagnostic>,
+    /// `exploit_sqli_from_vantage`. `pub(crate)` so an in-crate test can assert a
+    /// non-exploit result carries no diagnostic (the `observation.value` gate),
+    /// which only surfaces on a `Fail` and so cannot be checked through a judged
+    /// Pass.
+    pub(crate) diagnostic: Option<Diagnostic>,
 }
 
 /// The input [`expect`](TestContext::expect) accepts: a [`Recorded`] result,
@@ -985,17 +990,18 @@ mod tests {
     }
 
     /// Guard: the path-traversal domain diagnostic names the sentinel marker read
-    /// from outside the web root in its cause, and canonicalizing / rejecting an
-    /// escaping path in its remediation, so a reader gets ADR-0009 actionable
-    /// guidance rather than generic text. Pure, no Docker. Mutation: drop the marker
-    /// from the cause, or change "canonicalize" in the remediation -> the matching
-    /// assertion fails.
+    /// from outside the intended directory in its cause, and canonicalizing /
+    /// rejecting an escaping path in its remediation, so a reader gets ADR-0009
+    /// actionable guidance rather than generic text. Pure, no Docker. Mutation: drop
+    /// the marker from the cause, or change "canonicalize" in the remediation -> the
+    /// matching assertion fails.
     #[test]
     fn path_traversal_diagnostic_names_the_marker_and_the_fix() {
         let d = path_traversal_diagnostic("SENTINEL42");
         assert!(
-            d.probable_cause.contains("SENTINEL42") && d.probable_cause.contains("web root"),
-            "the cause names the sentinel marker and the web root: {:?}",
+            d.probable_cause.contains("SENTINEL42")
+                && d.probable_cause.contains("intended directory"),
+            "the cause names the sentinel marker and the intended directory: {:?}",
             d.probable_cause
         );
         assert!(

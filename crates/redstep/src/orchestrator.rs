@@ -947,6 +947,14 @@ fn vantage_draft(
     }
 }
 
+/// The capability names of the HTTP witness techniques, as they appear in the
+/// evidence `capability` field and the canonical JSON (a published contract, so
+/// the string values are fixed). Shared by the context callers that run each check
+/// and by [`parse_http_witness`], which maps a recorded name back to one of these,
+/// so the name lives in one place rather than being retyped at each site.
+pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
+pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
+
 /// Observe whether an HTTP request to `target` from the attacker's vantage returns
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
 /// the native HTTP app-security checks: a SQL injection whose `marker` is a DB-only
@@ -1029,8 +1037,15 @@ fn validate_http_request(request_path: &str, marker: &str) -> Result<()> {
         spec: request_path.to_owned(),
         reason: reason.to_owned(),
     };
-    if marker.is_empty() {
-        return Err(invalid("the witness marker must be non-empty"));
+    // `trim().is_empty()` not `is_empty()`: a whitespace-only marker (" ", "\n")
+    // is as dangerous as an empty one, since `body.contains(" ")` matches almost
+    // any response and would read a benign 200 as exploited. This matches
+    // `parse_http_witness`, which already rejects a blank-after-trim marker, so the
+    // live and replay entry points agree.
+    if marker.trim().is_empty() {
+        return Err(invalid(
+            "the witness marker must be non-empty and not only whitespace",
+        ));
     }
     if !request_path.starts_with('/') {
         return Err(invalid(
@@ -1165,12 +1180,18 @@ fn http_witness_draft(
     observation: &Observation<bool>,
     applied: Duration,
 ) -> EvidenceDraft {
-    let summary = if observation.value {
-        format!("the response carried the witness {marker:?}; the attack succeeded")
-    } else if observation.confidence == Confidence::High {
-        "the response did not carry the witness; not exploitable".to_owned()
-    } else {
+    // Confidence first, so a `true` value can never pair with a sub-`High`
+    // "succeeded" summary (the `true` => `High` invariant lives in
+    // `classify_http_witness`; keying off confidence here means the draft cannot
+    // contradict it even if a future technique's classifier changes). The negative
+    // is scoped to this request: one payload not carrying the marker is not proof
+    // the endpoint is universally safe, only that this probe did not exploit it.
+    let summary = if observation.confidence != Confidence::High {
         "the probe did not complete cleanly; the result is inconclusive".to_owned()
+    } else if observation.value {
+        format!("the response carried the marker {marker:?}; the attack succeeded")
+    } else {
+        format!("the response did not carry the marker {marker:?}; this request did not exploit it")
     };
     EvidenceDraft {
         capability,
@@ -1308,8 +1329,8 @@ fn parse_http_witness(
         return Err(invalid("replay witness has an empty target"));
     }
     let capability: &'static str = match witness.capability.as_str() {
-        "http_sqli_vantage" => "http_sqli_vantage",
-        "http_path_traversal_vantage" => "http_path_traversal_vantage",
+        HTTP_SQLI_VANTAGE => HTTP_SQLI_VANTAGE,
+        HTTP_PATH_TRAVERSAL_VANTAGE => HTTP_PATH_TRAVERSAL_VANTAGE,
         other => {
             return Err(invalid(&format!(
                 "replay witness names an unknown capability {other:?}"
@@ -2213,7 +2234,9 @@ mod tests {
     /// valid request passes. Pure, no Docker. Mutation: drop the `starts_with('/')`
     /// check -> `@evil/x` passes -> the authority-hijack case fails; drop the empty
     /// check -> `""` passes -> the empty-marker case fails; drop the contains(marker)
-    /// check -> the reflected case fails.
+    /// check -> the reflected case fails. Mutation: weaken the marker check back to
+    /// `marker.is_empty()` -> the whitespace-only `" "` marker passes -> that case
+    /// fails (a `" "` marker reads almost any 200 as exploited).
     #[test]
     fn validate_http_request_fails_closed() {
         // Valid: a leading-slash path with a marker not in it.
@@ -2240,6 +2263,10 @@ mod tests {
             "CRLF in the path is refused"
         );
         assert!(rejected("/lookup", ""), "an empty marker is refused");
+        assert!(
+            rejected("/lookup", "   "),
+            "a whitespace-only marker is refused (body.contains(\" \") would match almost any 200)"
+        );
         assert!(
             rejected("/lookup?name=FLAG123", "FLAG123"),
             "a marker appearing in the path is refused"
@@ -2452,10 +2479,9 @@ mod tests {
             Some(5000),
             "the applied timeout is recorded for a faithful replay"
         );
-        assert!(
-            draft.summary.contains("the attack succeeded") && draft.summary.contains("FLAG123"),
-            "the exploited summary is capability-neutral and names the witness: {:?}",
-            draft.summary
+        assert_eq!(
+            draft.summary, "the response carried the marker \"FLAG123\"; the attack succeeded",
+            "the exploited summary is pinned exact, capability-neutral, and names the marker"
         );
 
         // The not-exploitable observation is mirrored too (the decisive case a
@@ -2475,16 +2501,21 @@ mod tests {
         );
         assert_eq!(draft.observed, serde_json::Value::Bool(false));
         assert_eq!(draft.confidence, Confidence::High);
+        assert_eq!(
+            draft.summary,
+            "the response did not carry the marker \"FLAG123\"; this request did not exploit it",
+            "the clean summary is pinned exact and scoped to this request, not a universal claim"
+        );
         assert!(
-            draft.summary.contains("not exploitable"),
-            "the clean summary says not exploitable: {:?}",
+            !draft.summary.contains("succeeded"),
+            "a non-exploit summary never claims success: {:?}",
             draft.summary
         );
 
         // An inconclusive (abnormal) probe: value false at Low, and the summary
-        // must say inconclusive, not "not exploitable" (an abnormal probe is not a
-        // clean negative, RK-002). Mutation: mirror `confidence` as a constant
-        // High, or give the Low branch the "not exploitable" summary -> these fail.
+        // must say inconclusive, not a clean negative (an abnormal probe did not
+        // establish the endpoint's state, RK-002). Mutation: mirror `confidence` as
+        // a constant High, or give the Low branch the clean-negative summary -> fail.
         let inconclusive = Observation {
             value: false,
             confidence: Confidence::Low,
@@ -2499,9 +2530,13 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(
+            draft.summary, "the probe did not complete cleanly; the result is inconclusive",
+            "the Low summary is inconclusive, pinned exact, not a clean negative (RK-002)"
+        );
         assert!(
-            draft.summary.contains("inconclusive") && !draft.summary.contains("not exploitable"),
-            "the Low summary is inconclusive, not a clean negative: {:?}",
+            !draft.summary.contains("succeeded"),
+            "an inconclusive summary never claims success: {:?}",
             draft.summary
         );
     }
@@ -3270,7 +3305,9 @@ mod tests {
     /// defaulting (ADR-0022, parallel to `parse_vantage_witness`). Pure, no Docker.
     /// Mutation: drop any one field's check -> the witness missing it parses -> the
     /// matching `rejected` case fails; drop the unknown-capability arm -> the
-    /// unknown-capability case parses -> that assertion fails.
+    /// unknown-capability case parses -> that assertion fails; map the traversal arm
+    /// to `HTTP_SQLI_VANTAGE` -> the traversal round-trip returns the wrong
+    /// capability -> that assertion fails.
     #[test]
     fn parse_http_witness_rejects_an_incomplete_witness() {
         let params = serde_json::json!({
@@ -3292,6 +3329,25 @@ mod tests {
         assert_eq!(request_path, "/lookup?name=x");
         assert_eq!(marker, "FLAG123");
         assert_eq!(timeout, Duration::from_millis(5_000));
+
+        // The traversal arm round-trips to its own capability, not SQLi's: a
+        // path-traversal witness parses and returns "http_path_traversal_vantage".
+        let traversal = Reproduction {
+            capability: HTTP_PATH_TRAVERSAL_VANTAGE.to_owned(),
+            target: "api:8081".to_owned(),
+            params: serde_json::json!({
+                "request_path": "/file?path=..%2fsecret.txt",
+                "marker": "SENTINEL",
+                "vantage_segment": "lab",
+                "timeout_ms": 5_000,
+            }),
+        };
+        let (traversal_cap, ..) =
+            parse_http_witness(&traversal).expect("a complete traversal witness parses");
+        assert_eq!(
+            traversal_cap, "http_path_traversal_vantage",
+            "the traversal witness resolves to its own capability, not SQLi's"
+        );
 
         let rejected = [
             ("empty target", "", params.clone()),
@@ -3573,7 +3629,10 @@ mod tests {
     /// Mutation: have the api `serve_file` canonicalize and refuse the escape (the
     /// fix) -> the probe no longer reads the sentinel -> the verdict assertion
     /// fails; drop the diagnostic plumbing -> the generic text appears -> the
-    /// remediation assertion fails. The draft-mirrors-observation check is RK-011.
+    /// remediation assertion fails; change the diagnostic gate from
+    /// `observation.value.then(..)` to `Some(..)` in `exploit_path_traversal_from_vantage`
+    /// -> the benign control carries a diagnostic -> the `control.diagnostic.is_none()`
+    /// assertion fails. The draft-mirrors-observation check is RK-011.
     #[test]
     fn path_traversal_check_flags_the_playground() {
         if !linux_docker_available() {
@@ -3646,6 +3705,10 @@ mod tests {
                 !control.observation.value,
                 "a benign in-root path never carries the sentinel: the differential is real"
             );
+            assert!(
+                control.diagnostic.is_none(),
+                "a non-exploit (the benign control) carries no diagnostic: the ADR-0009 cause is attached only to a real traversal, not a clean result"
+            );
             let (judgement, _) = &judgements[0];
             assert_eq!(judgement.verdict, crate::Verdict::Fail);
             let diagnostic = judgement
@@ -3654,8 +3717,8 @@ mod tests {
                 .expect("a FAIL carries a diagnostic");
             assert!(
                 diagnostic.probable_cause.contains(PATH_TRAVERSAL_WITNESS)
-                    && diagnostic.probable_cause.contains("web root"),
-                "the domain cause names the sentinel and the web root, not generic text: {:?}",
+                    && diagnostic.probable_cause.contains("intended directory"),
+                "the domain cause names the sentinel and the intended directory, not generic text: {:?}",
                 diagnostic.probable_cause
             );
             assert!(
