@@ -16,3 +16,12 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/itsakeyfut/redstep"
+
+# redstep depends on redstep-macros by path. The `version` is what lets `redstep`
+# be published: `cargo publish` refuses a path-only dependency, because a crate on
+# crates.io cannot resolve a sibling by filesystem path. Lockstep (both crates share
+# `[workspace.package].version`), so this pin tracks that version and a release moves
+# both together. Declared here rather than in the crate so the version lives in one
+# place, the same root manifest the release workflow watches for a version bump.
+[workspace.dependencies]
+redstep-macros = { path = "crates/redstep-macros", version = "0.1.0" }
