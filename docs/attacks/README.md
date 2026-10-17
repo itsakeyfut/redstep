@@ -117,6 +117,10 @@ first.
 - [Web Cache Poisoning](web-cache-poisoning.md)
 - [Mass Assignment](mass-assignment.md)
 - [Business Logic Vulnerabilities](business-logic-vulnerabilities.md)
+- [File Upload Vulnerabilities](file-upload-vulnerabilities.md)
+- [Race Conditions](race-conditions.md)
+- [Information Disclosure](information-disclosure.md)
+- [Prototype Pollution](prototype-pollution.md)
 
 ### API
 
@@ -131,6 +135,8 @@ first.
 - [Unrestricted Resource Consumption](unrestricted-resource-consumption.md)
 - [Business Logic Vulnerabilities](business-logic-vulnerabilities.md)
 - [GraphQL API Vulnerabilities](graphql-api-vulnerabilities.md)
+- [Race Conditions](race-conditions.md)
+- [Information Disclosure](information-disclosure.md)
 
 ### Network
 
@@ -148,16 +154,23 @@ first.
 
 ## Backlog (not yet written)
 
-Known Web and API techniques still to catalogue, drawn from OWASP Top 10 (2021), the
-OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy. A name
-moves up into the genre index above, as a link, when its file is written; this
-section is the coverage gap made visible. Pure categories that are not a single
-technique (security misconfiguration, improper inventory management, unsafe
-consumption of APIs) are deliberately left out.
+This is the coverage gap made visible: known techniques still to catalogue, by genre. A
+name moves up into the genre index above, as a link, when its file is written.
 
-**Other**
+The Web and API genres are complete to the mainstream set drawn from OWASP Top 10
+(2021), the OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy;
+pure categories that are not a single technique (security misconfiguration, improper
+inventory management, unsafe consumption of APIs) were deliberately left out. The next
+frontier is the genres redstep's scope reaches beyond the application layer, none
+catalogued yet:
 
-- File upload vulnerabilities
-- Race conditions
-- Information disclosure
-- Prototype pollution
+- **Network:** the classic on-path and discovery techniques (ARP/DNS spoofing,
+  man-in-the-middle, service discovery to exploitation), from ATT&CK Enterprise.
+- **Cloud:** instance metadata credential theft, IAM misconfiguration and privilege
+  escalation, from the ATT&CK Cloud matrices.
+- **Container:** image and runtime escapes, from the ATT&CK Containers matrix.
+- **Identity:** the credential-access techniques beyond the brute-force family already
+  listed.
+
+Enumerate each genre from its authoritative taxonomy, as the Web and API genres were,
+before writing its files.
