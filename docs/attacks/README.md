@@ -108,12 +108,20 @@ first.
 - [CORS Misconfiguration](cors-misconfiguration.md)
 - [Clickjacking](clickjacking.md)
 - [Open Redirect](open-redirect.md)
+- [Privilege Escalation](privilege-escalation.md)
+- [Brute Force](brute-force/README.md)
+- [JWT Attacks](jwt-attacks.md)
+- [OAuth Vulnerabilities](oauth-vulnerabilities.md)
 
 ### API
 
 - [NoSQL Injection](nosql-injection.md)
 - [Insecure Deserialization](insecure-deserialization.md)
 - [CORS Misconfiguration](cors-misconfiguration.md)
+- [Privilege Escalation](privilege-escalation.md)
+- [Brute Force](brute-force/README.md)
+- [JWT Attacks](jwt-attacks.md)
+- [OAuth Vulnerabilities](oauth-vulnerabilities.md)
 
 ### Network
 
@@ -125,6 +133,10 @@ first.
 
 ### Identity
 
+- [Brute Force](brute-force/README.md)
+- [JWT Attacks](jwt-attacks.md)
+- [OAuth Vulnerabilities](oauth-vulnerabilities.md)
+
 ## Backlog (not yet written)
 
 Known Web and API techniques still to catalogue, drawn from OWASP Top 10 (2021), the
@@ -133,16 +145,6 @@ moves up into the genre index above, as a link, when its file is written; this
 section is the coverage gap made visible. Pure categories that are not a single
 technique (security misconfiguration, improper inventory management, unsafe
 consumption of APIs) are deliberately left out.
-
-**Access control**
-
-- Privilege escalation (broken function-level authorization)
-
-**Authentication and identity**
-
-- Brute force (a directory: password guessing, password spraying, credential stuffing, password cracking)
-- JWT attacks
-- OAuth vulnerabilities
 
 **Request and protocol**
 
