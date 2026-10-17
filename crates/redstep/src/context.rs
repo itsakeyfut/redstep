@@ -489,7 +489,9 @@ impl TestContext {
     /// canary records and that `/fetch` is live (a direct hit on the canary, or an
     /// allowed fetch), else a confident PASS can be vacuous. Enforcing that
     /// corroboration in the capability is deferred under ADR-0010's model.
-    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound.
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound, or
+    /// [`Error::InvalidTarget`] if the canary coordinates would not assemble a safe
+    /// coercion request line (a weak token, or an alias carrying CR/LF).
     pub async fn exploit_ssrf_from_vantage(
         &self,
         app: &ScopedTarget,

@@ -955,8 +955,10 @@ fn vantage_draft(
 /// The capability names of the HTTP witness techniques, as they appear in the
 /// evidence `capability` field and the canonical JSON (a published contract, so
 /// the string values are fixed). Shared by the context callers that run each check
-/// and by [`parse_http_witness`], which maps a recorded name back to one of these,
-/// so the name lives in one place rather than being retyped at each site.
+/// and by [`parse_http_witness`], which maps a recorded name back to one of the
+/// three body-marker techniques above it (the out-of-band `HTTP_SSRF_VANTAGE` below
+/// is on its own path and is parsed by `parse_ssrf_witness`), so the name lives in
+/// one place rather than being retyped at each site.
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
@@ -1624,6 +1626,10 @@ fn classify_ssrf(state: &ContainerState, seen: bool, redirected: bool) -> Observ
 /// summary, like `http_witness_draft`, so a `true` can never read sub-`High`. The
 /// reproduction records the coercion path, the token, and the canary identity so a
 /// replay reconstructs the probe.
+// allow(too_many_arguments): each argument is a distinct draft input (the segment,
+// the target spec, the coercion path, the token, the canary alias and port, the
+// observation, the timing). Parallel to `http_witness_draft`, it is kept flat until
+// the M3 probe-inputs reshape (mvp.md) rather than grouped into a struct now.
 #[allow(clippy::too_many_arguments)]
 fn ssrf_draft(
     segment: &str,
@@ -1671,6 +1677,8 @@ fn ssrf_draft(
 /// target (the app), the coercion request path, the token, the canary alias and
 /// port, and the applied timeout. Pure and Docker-free (parallel to
 /// `parse_http_witness`), fail-closed on a missing/ill-typed field (ADR-0022).
+// allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
+// `parse_http_witness`; a named struct is the same M3 reshape (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_ssrf_witness(
     witness: &Reproduction,
@@ -1720,19 +1728,37 @@ fn parse_ssrf_witness(
     ))
 }
 
+/// The canary-log poll window for an out-of-band SSRF witness. The app's fetch is
+/// synchronous, but stdout -> Docker-log propagation can lag, so a single read
+/// could miss a just-arrived hit and read a confident false-negative (a false PASS,
+/// CLAUDE.md row 6). Ten reads at 200 ms (about 2 s) covers the propagation lag
+/// seen against the playground canary with margin; a token still absent after the
+/// window is a genuine not-reached. This bound is where "absent" becomes a
+/// confident High `false`, so it is named rather than inlined.
+const SSRF_CANARY_POLL_ATTEMPTS: usize = 10;
+const SSRF_CANARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Coerce `app` (the SSRF target) from the attacker vantage to fetch
 /// `http://{canary_alias}:{canary_port}/{token}` server-side, then witness the
 /// request OUT-OF-BAND in the canary's container logs, NOT in the app's own
-/// response (the app returns only the fetched status). `token` is unique per
-/// probe, so this probe's callback is distinguishable; forging the witness would
-/// require writing `token` into the canary's log, which only the coerced in-lab
-/// app can do (layer-1 isolation keeps the app from reaching anything outside the
-/// lab, so the coercion is confined). The marker-in-path forgery guard does NOT
-/// apply here: `token` legitimately appears in the request path (it is the
-/// coercion target), and the witness is at the canary, not the body. The draft's
-/// `target` is `app`, not the canary (#65, ADR-0023). This is a separate path from
-/// `http_witness_exploit_from`: that seam's `classify_http_witness` reads the
-/// probe's own body, and an SSRF witness is not there.
+/// response (the app returns only the fetched status). `token` is minted fresh per
+/// probe and is not known outside this run, and the only request carrying it that
+/// this check issues is the coercion at `app`, so a `token` seen in the canary's
+/// log means `app` reached the canary. Layer-1 isolation (ADR-0006) confines that
+/// fetch to the egress-less lab: nothing outside the lab can reach the canary, and
+/// within the lab the check sends the token to no host but `app`. The token is not
+/// a secret (anything on the lab that learned it could reach the canary too), which
+/// is why a replay re-derives the coercion path rather than trusting the recorded
+/// one. The marker-in-path forgery guard does NOT apply here: `token` legitimately
+/// appears in the request path (it is the coercion target), and the witness is at
+/// the canary, not the body. The draft's `target` is `app`, not the canary (#65,
+/// ADR-0023). This is a separate path from `http_witness_exploit_from`: that seam's
+/// `classify_http_witness` reads the probe's own body, and an SSRF witness is not
+/// there.
+// allow(too_many_arguments): each argument is a distinct probe input (the Docker
+// handle, the vantage network, the scoped target, the canary alias/port/container,
+// the token, the timeout). Parallel to `http_witness_exploit_from`, it is the
+// provisional seam kept flat until the M3 probe-inputs reshape (mvp.md).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ssrf_exploit_from(
     docker: &Docker,
@@ -1750,10 +1776,13 @@ pub(crate) async fn ssrf_exploit_from(
     // the token is untrusted witness input.
     validate_ssrf_token(token)?;
     let request_path = format!("/fetch?url=http://{canary_alias}:{canary_port}/{token}");
-    // Light fail-closed validation of the coercion path (an untrusted replay
-    // witness could carry a crafted one): a leading `/` keeps the authority the
-    // app's scoped host:port, and no CR/LF keeps it one request line. The
-    // marker-in-path check does not apply (the token is in the path by design).
+    // Fail-closed validation of the interpolated path. `canary_alias` is the one
+    // component not already constrained (the token is validated above, the port is
+    // a u16), so reject CR/LF in the assembled path: a crafted alias must not inject
+    // a second request line (RK-015). The leading-`/` test is a cheap invariant on
+    // the literal `/fetch` prefix. The marker-in-path check does not apply (the
+    // token is in the path by design). The replay path separately re-derives and
+    // compares this path in `replay_ssrf_probe`.
     if !request_path.starts_with('/') || request_path.contains('\r') || request_path.contains('\n')
     {
         return Err(Error::InvalidTarget {
@@ -1772,21 +1801,18 @@ pub(crate) async fn ssrf_exploit_from(
         applied + Duration::from_secs(5),
     )
     .await?;
-    // The witness is out-of-band. The app's fetch is synchronous, but the canary's
-    // stdout -> Docker log propagation can lag, so a single read right after the
-    // probe could miss a just-arrived hit and read a confident false-negative (a
-    // false PASS). Poll the canary's logs over a bounded window, returning as soon
-    // as the token appears; a token still absent after the window is a genuine
-    // not-reached.
+    // The witness is out-of-band, so poll the canary's logs over the bounded window
+    // (see SSRF_CANARY_POLL_ATTEMPTS for why a single read would risk a false PASS),
+    // returning as soon as the token appears.
     let mut seen = false;
-    for attempt in 0..10 {
+    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
         let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
         if canary_out.contains(token) || canary_err.contains(token) {
             seen = true;
             break;
         }
-        if attempt + 1 < 10 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
+            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
         }
     }
     let observation = classify_ssrf(&state, seen, response_was_redirected(&headers));
