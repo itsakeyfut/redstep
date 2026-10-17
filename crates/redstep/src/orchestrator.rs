@@ -955,13 +955,15 @@ fn vantage_draft(
 /// so the name lives in one place rather than being retyped at each site.
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
+pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 
 /// Observe whether an HTTP request to `target` from the attacker's vantage returns
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
 /// the native HTTP app-security checks whose witness is a `marker` that appears in
 /// the probe's OWN response body: a SQL injection whose `marker` is a DB-only
-/// value, and a path traversal whose `marker` is a file-outside-the-web-root
-/// sentinel.
+/// value, a path traversal whose `marker` is a file-outside-the-web-root sentinel,
+/// and an IDOR whose `marker` is another user's object body (reached by carrying an
+/// identity in `request_headers`).
 ///
 /// A technique whose witness is out-of-band does NOT belong on this seam. An SSRF
 /// (#65) is confirmed by a canary callback that a separate listener observes; its
@@ -996,6 +998,20 @@ pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantag
 /// [`response_was_redirected`] sees the 3xx status line and [`classify_http_witness`]
 /// downgrades the observation to `Low` (Inconclusive): a redirected body is never
 /// read as the scoped target's confident answer (#55).
+///
+/// `request_headers` are added to the probe request, one `--header` each (#64).
+/// A technique that acts as a particular identity (IDOR) passes a credential or
+/// session header here; SQLi and path traversal pass none. They are validated by
+/// [`validate_http_request`] (an RFC 7230 token name, no control bytes in a value)
+/// with the rest of the request before the probe, and recorded in the reproduction
+/// so a replay re-sends the same identity.
+// allow(too_many_arguments): each argument is a distinct probe input (the lab
+// handle, the scoped target, the capability tag, the request path, the marker, the
+// identity headers, the timeout). This seam is the provisional M1/M2 shape of the
+// generalized in-container capability the roadmap reshapes in M3 (mvp.md); a
+// probe-inputs struct is the clean refactor at that point, so it is kept flat until
+// the M3 shape is known rather than invented now.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn http_witness_exploit_from(
     docker: &Docker,
     vantage: &LabNetwork,
@@ -1003,22 +1019,27 @@ pub(crate) async fn http_witness_exploit_from(
     capability: &'static str,
     request_path: &str,
     marker: &str,
+    request_headers: &[(String, String)],
     timeout: Duration,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
-    validate_http_request(request_path, marker)?;
+    validate_http_request(request_path, marker, request_headers)?;
     let secs = timeout.as_secs().max(1);
     let applied = Duration::from_secs(secs);
     let url = format!("http://{}:{}{}", target.host(), target.port(), request_path);
-    let cmd = wget_cmd(&url, secs);
-    let (state, body, headers) = run_probe_capturing(
+    let cmd = wget_cmd(&url, secs, request_headers);
+    let (state, body, resp_headers) = run_probe_capturing(
         docker,
         vantage.name(),
         cmd,
         applied + Duration::from_secs(5),
     )
     .await?;
-    let observation =
-        classify_http_witness(&state, &body, marker, response_was_redirected(&headers));
+    let observation = classify_http_witness(
+        &state,
+        &body,
+        marker,
+        response_was_redirected(&resp_headers),
+    );
     let spec = format!("{}:{}", target.host(), target.port());
     let draft = http_witness_draft(
         capability,
@@ -1026,6 +1047,7 @@ pub(crate) async fn http_witness_exploit_from(
         spec,
         request_path,
         marker,
+        request_headers,
         &observation,
         applied,
     );
@@ -1043,7 +1065,20 @@ pub(crate) async fn http_witness_exploit_from(
 /// appear in `request_path` (else a server that reflects the path could forge the
 /// witness). CR/LF are refused so the path cannot inject a request line. Pure, so
 /// the guard runs without Docker, and it fronts every caller including a replay.
-fn validate_http_request(request_path: &str, marker: &str) -> Result<()> {
+///
+/// Each of `headers` (the IDOR identity channel, #64) is validated too. The name
+/// must be an RFC 7230 token (non-empty, token characters only): that rejects a
+/// `:` that would split it, a CR/LF or any other control that could inject a second
+/// header or a request line (the RK-015 injection class on the header channel), and
+/// a leading space that a server would read as an obs-fold of the previous header.
+/// A value is refused any control character for the same injection reason. The
+/// marker is refused in a header name and value, so a server that reflects a header
+/// cannot forge the witness.
+fn validate_http_request(
+    request_path: &str,
+    marker: &str,
+    headers: &[(String, String)],
+) -> Result<()> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: request_path.to_owned(),
         reason: reason.to_owned(),
@@ -1071,7 +1106,37 @@ fn validate_http_request(request_path: &str, marker: &str) -> Result<()> {
             "the marker must not appear in request_path (a reflected path could forge the witness)",
         ));
     }
+    for (name, value) in headers {
+        // An RFC 7230 token name (non-empty, token characters only) subsumes the
+        // empty/whitespace name, the ':' that would split it, and any CR/LF or other
+        // control that could smuggle a second header or a request line; a leading
+        // space would be read as an obs-fold of the previous header.
+        if name.is_empty() || !name.bytes().all(is_token_char) {
+            return Err(invalid(
+                "a request header name must be a non-empty RFC 7230 token (letters, digits, and !#$%&'*+-.^_`|~)",
+            ));
+        }
+        // A CR, LF, or any other control byte in a value is the same injection class.
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(invalid(
+                "a request header value must not contain a control character (it could inject another header or a request line)",
+            ));
+        }
+        if name.contains(marker) || value.contains(marker) {
+            return Err(invalid(
+                "the marker must not appear in a request header (a reflected header could forge the witness)",
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether `b` is an RFC 7230 `tchar`, a valid HTTP header-name byte: an ASCII
+/// letter or digit, or one of the token punctuation characters. Used by
+/// [`validate_http_request`] to reject a header name that could be split, folded,
+/// or injected.
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// The busybox `wget` probe as argv (never a shell line): fetch `url` to stdout
@@ -1082,9 +1147,13 @@ fn validate_http_request(request_path: &str, marker: &str) -> Result<()> {
 /// test exercises this on real busybox). Passing argv
 /// directly rather than through `sh -c` means the url is one argument, not text a
 /// shell could interpret, so it cannot inject a command into the probe container.
-/// Pure, so the argv shape is unit-tested without Docker.
-fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
-    vec![
+/// Each of `headers` is added as a `--header` option with its `"name: value"` as a
+/// single argument (busybox `wget --header STR`, #64), before the url as busybox
+/// expects options first; validated by [`validate_http_request`] so a name is a
+/// token and a value carries no control byte. Pure, so the argv shape is
+/// unit-tested without Docker.
+fn wget_cmd(url: &str, secs: u64, headers: &[(String, String)]) -> Vec<String> {
+    let mut cmd = vec![
         "wget".to_owned(),
         "-q".to_owned(),
         "-S".to_owned(),
@@ -1092,8 +1161,13 @@ fn wget_cmd(url: &str, secs: u64) -> Vec<String> {
         secs.to_string(),
         "-O".to_owned(),
         "-".to_owned(),
-        url.to_owned(),
-    ]
+    ];
+    for (name, value) in headers {
+        cmd.push("--header".to_owned());
+        cmd.push(format!("{name}: {value}"));
+    }
+    cmd.push(url.to_owned());
+    cmd
 }
 
 /// Whether the `wget -S` response headers carry a 3xx status line (#55). busybox
@@ -1167,7 +1241,9 @@ fn classify_http_witness(
 /// the reproduction are what a replay re-runs (ADR-0022, #54); the segment appears
 /// in both `source` and the params for the same self-contained-reproduction reason
 /// as `vantage_draft`. The `capability` is written into both the draft and its
-/// reproduction so a replay reconstructs the right technique.
+/// reproduction so a replay reconstructs the right technique. Any
+/// `request_headers` (the IDOR identity, #64) go into the reproduction too, so a
+/// replay re-sends the same identity; the key is omitted when there are none.
 ///
 /// The `summary` is capability-neutral on purpose: it states only whether the
 /// witness `marker` was present, absent, or the probe was inconclusive. The
@@ -1182,12 +1258,16 @@ fn classify_http_witness(
 /// `connect_from_vantage`); isolation and scope confine them to the lab regardless,
 /// and gating this seam is the deferred M3 work (ADR-0006, context.rs). The honest
 /// label is what that future gate will read.
+// allow(too_many_arguments): mirrors `http_witness_exploit_from`'s inputs to build
+// the draft from them; the same reasoning applies.
+#[allow(clippy::too_many_arguments)]
 fn http_witness_draft(
     capability: &'static str,
     segment: &str,
     target_spec: String,
     request_path: &str,
     marker: &str,
+    request_headers: &[(String, String)],
     observation: &Observation<bool>,
     applied: Duration,
 ) -> EvidenceDraft {
@@ -1217,12 +1297,29 @@ fn http_witness_draft(
         reproduction: Reproduction {
             capability: capability.to_owned(),
             target: target_spec,
-            params: serde_json::json!({
-                "request_path": request_path,
-                "marker": marker,
-                "vantage_segment": segment,
-                "timeout_ms": applied.as_millis() as u64,
-            }),
+            // `request_headers` is added only when non-empty, so a SQLi/traversal
+            // witness (which carries none) serializes byte-for-byte as before: the
+            // published canonical-JSON shape of those techniques is unchanged
+            // (RK-003). A replay reads it back with `parse_http_witness`. The key
+            // mirrors the Rust name; a bare `headers` next to `request_path` would
+            // read as the response headers, which the code avoids by naming.
+            params: {
+                let mut params = serde_json::json!({
+                    "request_path": request_path,
+                    "marker": marker,
+                    "vantage_segment": segment,
+                    "timeout_ms": applied.as_millis() as u64,
+                });
+                if !request_headers.is_empty() {
+                    params["request_headers"] = serde_json::Value::Array(
+                        request_headers
+                            .iter()
+                            .map(|(name, value)| serde_json::json!([name, value]))
+                            .collect(),
+                    );
+                }
+                params
+            },
         },
     }
 }
@@ -1319,7 +1416,8 @@ pub(crate) async fn replay_vantage_probe(
 }
 
 /// The env-independent replay inputs parsed from an HTTP witness: the capability,
-/// the segment, the target, the request path, the marker, and the applied timeout.
+/// the segment, the target, the request path, the marker, the request headers (the
+/// IDOR identity channel, #64), and the applied timeout.
 /// Pure and Docker-free (parallel to [`parse_vantage_witness`]), so "a witness
 /// missing a field cannot replay" is a guard that runs offline before
 /// [`replay_http_witness_probe`] stands a lab up. A missing or ill-typed field is
@@ -1329,9 +1427,21 @@ pub(crate) async fn replay_vantage_probe(
 /// `&'static str`; matching the recorded name to a known technique both yields that
 /// `&'static str` and fails closed on an unknown one, so a witness naming a
 /// capability this build does not have cannot be replayed into the wrong technique.
+// allow(type_complexity): the parsed witness is a flat tuple of the probe inputs,
+// read positionally straight back into `http_witness_exploit_from`; a named struct
+// is the clean refactor for when M3 reshapes this seam (mvp.md), not now.
+#[allow(clippy::type_complexity)]
 fn parse_http_witness(
     witness: &Reproduction,
-) -> Result<(&'static str, String, String, String, String, Duration)> {
+) -> Result<(
+    &'static str,
+    String,
+    String,
+    String,
+    String,
+    Vec<(String, String)>,
+    Duration,
+)> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: witness.target.clone(),
         reason: reason.to_owned(),
@@ -1342,6 +1452,7 @@ fn parse_http_witness(
     let capability: &'static str = match witness.capability.as_str() {
         HTTP_SQLI_VANTAGE => HTTP_SQLI_VANTAGE,
         HTTP_PATH_TRAVERSAL_VANTAGE => HTTP_PATH_TRAVERSAL_VANTAGE,
+        HTTP_IDOR_VANTAGE => HTTP_IDOR_VANTAGE,
         other => {
             return Err(invalid(&format!(
                 "replay witness names an unknown capability {other:?}"
@@ -1365,12 +1476,39 @@ fn parse_http_witness(
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
+    // `request_headers` is optional: a SQLi/traversal witness has no such key and
+    // replays with none, so those techniques are unaffected by the identity channel
+    // (#64). When present it must be an array of [name, value] string pairs; a
+    // malformed one is `InvalidTarget`, fail-closed, not silently dropped.
+    let headers = match witness.params.get("request_headers") {
+        None => Vec::new(),
+        Some(value) => {
+            let array = value
+                .as_array()
+                .ok_or_else(|| invalid("replay witness request_headers is not an array"))?;
+            let mut out = Vec::with_capacity(array.len());
+            for entry in array {
+                let pair = entry.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+                    invalid("a replay witness request header is not a [name, value] pair")
+                })?;
+                let name = pair[0].as_str().ok_or_else(|| {
+                    invalid("a replay witness request header name is not a string")
+                })?;
+                let hvalue = pair[1].as_str().ok_or_else(|| {
+                    invalid("a replay witness request header value is not a string")
+                })?;
+                out.push((name.to_owned(), hvalue.to_owned()));
+            }
+            out
+        }
+    };
     Ok((
         capability,
         segment,
         witness.target.clone(),
         request_path,
         marker,
+        headers,
         Duration::from_millis(timeout_ms),
     ))
 }
@@ -1392,9 +1530,10 @@ fn parse_http_witness(
 /// `Scope::from_environment(env)` so a replay cannot aim outside scope, the lab
 /// is always torn down, and it runs no [`boundary_self_check`] and issues no
 /// verdict. What is specific here is that `parse_http_witness` then
-/// `validate_http_request` re-check the witnessed `request_path` and `marker`, so
-/// an untrusted witness cannot smuggle an authority through the appended request
-/// component (RK-015), which a vantage witness has no equivalent of. The
+/// `validate_http_request` re-check the witnessed `request_path`, `marker`, and
+/// request headers, so an untrusted witness cannot smuggle an authority through the
+/// appended request component or an injected header (RK-015), which a vantage
+/// witness has no equivalent of. The
 /// guarantee is the same observation against the same `Environment`, not
 /// byte-reproducibility; image pinning (ADR-0019) is deferred, so the mvp/fixed
 /// distinction is `env`'s choice.
@@ -1407,7 +1546,8 @@ pub(crate) async fn replay_http_witness_probe(
     env: &Environment,
     witness: &Reproduction,
 ) -> Result<Observation<bool>> {
-    let (capability, segment, target, request_path, marker, timeout) = parse_http_witness(witness)?;
+    let (capability, segment, target, request_path, marker, headers, timeout) =
+        parse_http_witness(witness)?;
     let scoped = Scope::from_environment(env).resolve(&target)?;
 
     let lab = bring_up(docker, env).await?;
@@ -1419,6 +1559,7 @@ pub(crate) async fn replay_http_witness_probe(
             capability,
             &request_path,
             &marker,
+            &headers,
             timeout,
         )
         .await
@@ -2198,7 +2339,7 @@ mod tests {
                 let chain_up = run_probe_capturing(
                     &docker,
                     net.name(),
-                    wget_cmd(&url, 3),
+                    wget_cmd(&url, 3, &[]),
                     Duration::from_secs(8),
                 )
                 .await
@@ -2221,6 +2362,7 @@ mod tests {
                 "http_sqli_vantage",
                 "/",
                 MARKER,
+                &[],
                 Duration::from_secs(5),
             )
             .await
@@ -2250,15 +2392,34 @@ mod tests {
     /// check -> `""` passes -> the empty-marker case fails; drop the contains(marker)
     /// check -> the reflected case fails. Mutation: weaken the marker check back to
     /// `marker.is_empty()` -> the whitespace-only `" "` marker passes -> that case
-    /// fails (a `" "` marker reads almost any 200 as exploited).
+    /// fails (a `" "` marker reads almost any 200 as exploited). A header is refused
+    /// unless its name is an RFC 7230 token and its value has no control character,
+    /// and the marker is refused in a header name or value (#64). Mutations: drop
+    /// the per-header loop, or weaken it to `.take(1)`, or drop the token-name check,
+    /// a single CR/LF sub-check, the control-in-value check, or the marker-in-name
+    /// check -> the matching header case passes -> it fails.
     #[test]
     fn validate_http_request_fails_closed() {
-        // Valid: a leading-slash path with a marker not in it.
-        assert!(validate_http_request("/lookup?name=' UNION SELECT flag--", "FLAG123").is_ok());
+        // Valid: a leading-slash path with a marker not in it, and a benign header.
+        assert!(
+            validate_http_request(
+                "/lookup?name=' UNION SELECT flag--",
+                "FLAG123",
+                &[("Authorization".to_owned(), "tok-alice".to_owned())]
+            )
+            .is_ok()
+        );
 
         let rejected = |path: &str, marker: &str| {
             matches!(
-                validate_http_request(path, marker),
+                validate_http_request(path, marker, &[]),
+                Err(Error::InvalidTarget { .. })
+            )
+        };
+        // A header is refused on the same injection/forgery grounds as the path.
+        let rejected_header = |name: &str, value: &str| {
+            matches!(
+                validate_http_request("/lookup", "FLAG123", &[(name.to_owned(), value.to_owned())]),
                 Err(Error::InvalidTarget { .. })
             )
         };
@@ -2285,6 +2446,79 @@ mod tests {
             rejected("/lookup?name=FLAG123", "FLAG123"),
             "a marker appearing in the path is refused"
         );
+        assert!(
+            rejected_header("X-Evil", "a\r\nX-Injected: 1"),
+            "a header value with CRLF is refused (it could inject another header)"
+        );
+        assert!(
+            rejected_header("X-Bad\r\nHost", "evil"),
+            "a header name with CRLF is refused"
+        );
+        assert!(
+            rejected_header("Has:Colon", "v"),
+            "a header name with ':' is refused (it would split the name)"
+        );
+        assert!(
+            rejected_header("   ", "v"),
+            "a whitespace (non-token) header name is refused"
+        );
+        assert!(
+            rejected_header("X-Reflect", "FLAG123"),
+            "the marker in a header value is refused (a reflected header could forge the witness)"
+        );
+        // Each CR and LF, in a name and a value, is refused on its own (the earlier
+        // cases pair them), so bare-CR and bare-LF header injection is caught.
+        assert!(
+            rejected_header("X", "a\rb"),
+            "a bare CR in a header value is refused"
+        );
+        assert!(
+            rejected_header("X", "a\nb"),
+            "a bare LF in a header value is refused"
+        );
+        assert!(
+            rejected_header("X\rY", "v"),
+            "a bare CR in a header name is refused"
+        );
+        assert!(
+            rejected_header("X\nY", "v"),
+            "a bare LF in a header name is refused"
+        );
+        // A non-token name: a leading space (an obs-fold vector) or an internal space.
+        assert!(
+            rejected_header(" X", "v"),
+            "a header name with a leading space is refused"
+        );
+        assert!(
+            rejected_header("X Y", "v"),
+            "a header name with an internal space is refused"
+        );
+        // Any control byte in a value, not only CR/LF.
+        assert!(
+            rejected_header("X", "a\u{0}b"),
+            "a NUL in a header value is refused"
+        );
+        // The marker in a header NAME is refused too, not only in a value.
+        assert!(
+            rejected_header("X-FLAG123", "v"),
+            "the marker in a header name is refused"
+        );
+        // The loop checks every header, not just the first: a hostile SECOND header
+        // (so a `.take(1)` mutation would skip it) is refused.
+        assert!(
+            matches!(
+                validate_http_request(
+                    "/lookup",
+                    "FLAG123",
+                    &[
+                        ("Good".to_owned(), "v".to_owned()),
+                        ("X".to_owned(), "a\r\nInjected: 1".to_owned()),
+                    ],
+                ),
+                Err(Error::InvalidTarget { .. })
+            ),
+            "a hostile second header is refused (the loop checks every header)"
+        );
     }
 
     /// Guard: the SQLi probe command is the exact argv
@@ -2292,11 +2526,14 @@ mod tests {
     /// crafted URL cannot inject a command and the quiet/headers/timeout/stdout
     /// flags are what the capture and redirect-detection paths rely on. Mutation:
     /// build it as `["sh", "-c", ...]`, drop `-q` or `-S`, change the `-T` value,
-    /// or change `-O -` to a file -> the whole-argv assertion fails.
+    /// or change `-O -` to a file -> the whole-argv assertion fails. A header is a
+    /// `--header` option with its `"name: value"` as one argument before the url
+    /// (#64); mutation: fold the header into the url or drop the `--header` -> the
+    /// header-case assertion fails.
     #[test]
     fn wget_cmd_is_argv_not_a_shell_line() {
         let url = "http://web:8080/lookup?name='; rm -rf /";
-        let cmd = wget_cmd(url, 5);
+        let cmd = wget_cmd(url, 5, &[]);
         assert_eq!(
             cmd,
             vec![
@@ -2310,6 +2547,34 @@ mod tests {
                 url.to_owned(),
             ],
             "the probe is wget argv with the quiet/headers/timeout/stdout flags and the url as one argument"
+        );
+        // Two headers each become `--header` + one `name: value` argument, in order,
+        // before the url. Two (not one) so a `.take(1)` over the loop is caught.
+        let with_headers = wget_cmd(
+            "http://api:8081/object?id=2",
+            5,
+            &[
+                ("Authorization".to_owned(), "tok-alice".to_owned()),
+                ("X-Tenant".to_owned(), "acme".to_owned()),
+            ],
+        );
+        assert_eq!(
+            with_headers,
+            vec![
+                "wget".to_owned(),
+                "-q".to_owned(),
+                "-S".to_owned(),
+                "-T".to_owned(),
+                "5".to_owned(),
+                "-O".to_owned(),
+                "-".to_owned(),
+                "--header".to_owned(),
+                "Authorization: tok-alice".to_owned(),
+                "--header".to_owned(),
+                "X-Tenant: acme".to_owned(),
+                "http://api:8081/object?id=2".to_owned(),
+            ],
+            "each header is a --header option with 'name: value' as one argument before the url"
         );
         assert!(
             !cmd.iter().any(|a| a == "sh" || a == "-c"),
@@ -2460,6 +2725,7 @@ mod tests {
             "web:8080".to_owned(),
             "/lookup?name=payload",
             "FLAG123",
+            &[],
             &exploited,
             Duration::from_secs(5),
         );
@@ -2497,6 +2763,10 @@ mod tests {
             draft.summary, "the response carried the marker \"FLAG123\"; the attack succeeded",
             "the exploited summary is pinned exact, capability-neutral, and names the marker"
         );
+        assert!(
+            draft.reproduction.params.get("request_headers").is_none(),
+            "a draft with no request headers omits the key, so the SQLi/traversal canonical-JSON shape is unchanged (RK-003)"
+        );
 
         // The not-exploitable observation is mirrored too (the decisive case a
         // hard-coded `true` would hide), and its summary does not overclaim.
@@ -2510,6 +2780,7 @@ mod tests {
             "web:8080".to_owned(),
             "/lookup?name=welcome",
             "FLAG123",
+            &[],
             &clean,
             Duration::from_secs(5),
         );
@@ -2540,6 +2811,7 @@ mod tests {
             "web:8080".to_owned(),
             "/lookup?name=welcome",
             "FLAG123",
+            &[],
             &inconclusive,
             Duration::from_secs(5),
         );
@@ -2573,6 +2845,7 @@ mod tests {
             "api:8081".to_owned(),
             "/file?path=..%2fsecret.txt",
             "SENTINEL42",
+            &[],
             &exploited,
             Duration::from_secs(5),
         );
@@ -2588,6 +2861,57 @@ mod tests {
             !draft.summary.contains("injection"),
             "the neutral summary does not name a specific technique: {:?}",
             draft.summary
+        );
+    }
+
+    /// Guard: request headers (the IDOR identity, #64) round-trip through the draft's
+    /// reproduction and back out of `parse_http_witness`, so a replay re-sends the
+    /// same identity, and the IDOR witness resolves to its own capability (not the
+    /// SQLi one). Two headers, so a `.take(1)` over either loop is caught. Pure, no
+    /// Docker. Mutations: drop the `if !request_headers.is_empty()` serialization in
+    /// `http_witness_draft` -> no `request_headers` key -> the draft assertion fails;
+    /// drop the headers parse in `parse_http_witness` -> empty -> the round-trip fails;
+    /// `.take(1)` either loop -> the second header is lost -> fails; map the
+    /// `HTTP_IDOR_VANTAGE` parse arm to `HTTP_SQLI_VANTAGE` -> the capability assertion
+    /// fails.
+    #[test]
+    fn http_witness_draft_and_parse_round_trip_request_headers() {
+        let exploited = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let headers = [
+            ("Authorization".to_owned(), "tok-alice".to_owned()),
+            ("X-Tenant".to_owned(), "acme".to_owned()),
+        ];
+        let draft = http_witness_draft(
+            HTTP_IDOR_VANTAGE,
+            "lab",
+            "api:8081".to_owned(),
+            "/object?id=2",
+            "REDSTEP_IDOR",
+            &headers,
+            &exploited,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            draft.reproduction.params["request_headers"],
+            serde_json::json!([["Authorization", "tok-alice"], ["X-Tenant", "acme"]]),
+            "the request headers are recorded in the reproduction, in order, for a faithful replay"
+        );
+        let (cap, _seg, _target, _path, _marker, parsed_headers, _timeout) =
+            parse_http_witness(&draft.reproduction).expect("the IDOR witness parses");
+        assert_eq!(
+            cap, "http_idor_vantage",
+            "the IDOR witness resolves to its own capability, not SQLi's"
+        );
+        assert_eq!(
+            parsed_headers,
+            vec![
+                ("Authorization".to_owned(), "tok-alice".to_owned()),
+                ("X-Tenant".to_owned(), "acme".to_owned()),
+            ],
+            "parse_http_witness reads every identity header back out of the witness"
         );
     }
 
@@ -2883,6 +3207,36 @@ mod tests {
             sentinel.contains(PATH_TRAVERSAL_WITNESS),
             "PATH_TRAVERSAL_WITNESS {PATH_TRAVERSAL_WITNESS:?} is not the body of \
              playground/api/secret.txt; the check and the fixture have drifted"
+        );
+    }
+
+    /// The body of bob's seeded object (`objects` id 2); its presence in a response
+    /// alice made witnesses that she read across the ownership boundary (#64). Kept
+    /// in sync with the db seed, which `idor_witness_matches_the_seed` checks offline.
+    const IDOR_WITNESS: &str = "REDSTEP_IDOR_WITNESS_9C2E";
+
+    /// The attacker alice's seeded token (mapped to user `alice` by the api), sent as
+    /// the `Authorization` header; bob's object is id 2, alice's own is id 1 whose
+    /// body is the positive-control marker.
+    const IDOR_ALICE_TOKEN: &str = "tok-alice";
+    const IDOR_VICTIM_OBJECT: &str = "/object?id=2";
+    const IDOR_OWN_OBJECT: &str = "/object?id=1";
+    const IDOR_OWN_BODY: &str = "alice private note";
+
+    /// Guard: bob's object body the IDOR check witnesses is the one the db image
+    /// actually seeds. Runs offline on every gate, unlike the Docker-gated IDOR
+    /// tests which self-skip without Docker or the built images, so a drift between
+    /// the two copies of the witness cannot hide behind that self-skip and silently
+    /// disarm the check (RK-014, CLAUDE.md row 6). `include_str!` resolves the path
+    /// across the workspace `exclude` boundary at compile time. Mutation: change
+    /// `IDOR_WITNESS` or the seed literal so the two differ -> this fails.
+    #[test]
+    fn idor_witness_matches_the_seed() {
+        let seed = include_str!("../../../playground/db/seed.sql");
+        assert!(
+            seed.contains(IDOR_WITNESS),
+            "IDOR_WITNESS {IDOR_WITNESS:?} is not seeded in playground/db/seed.sql; \
+             the check and the db seed have drifted"
         );
     }
 
@@ -3313,15 +3667,17 @@ mod tests {
     }
 
     /// Guard: `parse_http_witness` reads back every field an HTTP witness replay
-    /// needs (capability, segment, target, request_path, marker, timeout) and fails
-    /// closed on a missing or ill-typed one, including a capability this build does
-    /// not know, so an incomplete or unknown-technique witness cannot replay by
-    /// defaulting (ADR-0022, parallel to `parse_vantage_witness`). Pure, no Docker.
-    /// Mutation: drop any one field's check -> the witness missing it parses -> the
-    /// matching `rejected` case fails; drop the unknown-capability arm -> the
-    /// unknown-capability case parses -> that assertion fails; map the traversal arm
-    /// to `HTTP_SQLI_VANTAGE` -> the traversal round-trip returns the wrong
-    /// capability -> that assertion fails.
+    /// needs (capability, segment, target, request_path, marker, request_headers,
+    /// timeout) and fails closed on a missing or ill-typed one, including a
+    /// capability this build does not know and a malformed `request_headers`, so an
+    /// incomplete or unknown-technique witness cannot replay by defaulting (ADR-0022,
+    /// parallel to `parse_vantage_witness`). Pure, no Docker. Mutation: drop any one
+    /// field's check -> the witness missing it parses -> the matching `rejected` case
+    /// fails; drop the unknown-capability arm -> the unknown-capability case parses
+    /// -> that assertion fails; map the traversal arm to `HTTP_SQLI_VANTAGE` -> the
+    /// traversal round-trip returns the wrong capability -> that assertion fails;
+    /// weaken any `request_headers` fail-closed branch to silent tolerance -> the
+    /// matching malformed case parses -> it fails.
     #[test]
     fn parse_http_witness_rejects_an_incomplete_witness() {
         let params = serde_json::json!({
@@ -3335,7 +3691,7 @@ mod tests {
             target: "web:8080".to_owned(),
             params: params.clone(),
         };
-        let (capability, segment, target, request_path, marker, timeout) =
+        let (capability, segment, target, request_path, marker, headers, timeout) =
             parse_http_witness(&complete).expect("a complete witness parses");
         assert_eq!(capability, "http_sqli_vantage");
         assert_eq!(segment, "lab");
@@ -3343,6 +3699,12 @@ mod tests {
         assert_eq!(request_path, "/lookup?name=x");
         assert_eq!(marker, "FLAG123");
         assert_eq!(timeout, Duration::from_millis(5_000));
+        // A witness with no "request_headers" key (SQLi/traversal) parses as no
+        // headers, so the identity channel leaves those techniques unaffected (#64, AC3).
+        assert!(
+            headers.is_empty(),
+            "a witness without a headers key replays with no identity headers"
+        );
 
         // The traversal arm round-trips to its own capability, not SQLi's: a
         // path-traversal witness parses and returns "http_path_traversal_vantage".
@@ -3403,6 +3765,29 @@ mod tests {
                 "blank vantage_segment",
                 "web:8080",
                 serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": " ", "timeout_ms": 5_000 }),
+            ),
+            // A present-but-malformed `request_headers` is fail-closed, not silently
+            // dropped (which would replay with no identity): not an array, an entry
+            // that is not a 2-pair, and a non-string name or value.
+            (
+                "request_headers not an array",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": 42 }),
+            ),
+            (
+                "request_headers entry not a pair",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [["a"]] }),
+            ),
+            (
+                "request_headers name not a string",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [[1, "v"]] }),
+            ),
+            (
+                "request_headers value not a string",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [["n", 2]] }),
             ),
         ];
         for (label, target, params) in rejected {
@@ -3537,6 +3922,7 @@ mod tests {
                 "http_sqli_vantage",
                 &request_path,
                 SQLI_WITNESS,
+                &[],
                 Duration::from_millis(5_000),
             )
             .await
@@ -3585,6 +3971,7 @@ mod tests {
                 "http_sqli_vantage",
                 "/lookup?name=welcome",
                 "hello from the api",
+                &[],
                 Duration::from_millis(5_000),
             )
             .await
@@ -3824,6 +4211,7 @@ mod tests {
                 "http_path_traversal_vantage",
                 &exploit_path,
                 PATH_TRAVERSAL_WITNESS,
+                &[],
                 Duration::from_millis(5_000),
             )
             .await
@@ -3866,6 +4254,7 @@ mod tests {
                 "http_path_traversal_vantage",
                 &benign_path,
                 BENIGN_FILE_BODY,
+                &[],
                 Duration::from_millis(5_000),
             )
             .await
@@ -3968,6 +4357,279 @@ mod tests {
                 "replaying the witness reproduces the recorded observation"
             );
             assert_eq!(replayed.confidence, recorded.confidence);
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native IDOR check verdicts `Fail` against the vulnerable playground api and
+    /// the `Fail` carries the ADR-0009 IDOR diagnostic (#64 AC 1). alice (her token
+    /// in the `Authorization` header) requesting bob's object id witnesses bob's
+    /// marker; alice requesting her OWN object does not, so the differential is real
+    /// rather than a constant-true probe. Mutation: add the ownership check to the
+    /// api `serve_object` (the fix) -> alice no longer reads bob's object -> the
+    /// verdict assertion fails; change the diagnostic gate from
+    /// `observation.value.then(..)` to `Some(..)` in `exploit_idor_from_vantage` ->
+    /// the control carries a diagnostic -> the `control.diagnostic.is_none()` fails.
+    /// The draft-mirrors-observation check is RK-011.
+    #[test]
+    fn idor_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping idor_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping idor_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat api+db environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let alice_auth = [("Authorization".to_owned(), IDOR_ALICE_TOKEN.to_owned())];
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_idor_from_vantage(&target, IDOR_VICTIM_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the vantage IDOR probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // alice reading her OWN object does not carry bob's marker: the
+            // differential is real, not a probe that reads anything as a hit.
+            let control = ctx
+                .exploit_idor_from_vantage(&target, IDOR_OWN_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the own-object control ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "alice read bob's object across the ownership boundary"
+            );
+            assert!(
+                !control.observation.value,
+                "alice reading her own object never carries bob's marker: the differential is real"
+            );
+            assert!(
+                control.diagnostic.is_none(),
+                "a non-exploit (the own-object control) carries no diagnostic: the ADR-0009 cause is attached only to a real IDOR, not a clean result"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(IDOR_WITNESS)
+                    && diagnostic.probable_cause.contains("another user"),
+                "the domain cause names the marker and that it is another user's data: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("authorization"),
+                "the domain remediation names the authorization check: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation and is tagged as the
+            // IDOR capability, not a faithful-looking projection of a constant nor
+            // mislabelled as another technique.
+            assert_eq!(drafts[0].capability, "http_idor_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a daemon or the built images including
+    /// `redstep/api:fixed`): the IDOR attack-to-defense loop closes (#64 AC 2),
+    /// parallel to the SQLi and traversal loops. alice-reads-bob is recorded against
+    /// the vulnerable api and its own witness (the identity header included) replays
+    /// as exploited on a fresh vulnerable lab and not-exploitable, confidently so,
+    /// against the ownership-checking `redstep/api:fixed`. The #64 check then verdicts
+    /// `Pass` against the fixed lab. The labs differ only in the api image, so the
+    /// difference is the fix.
+    ///
+    /// A positive control probes alice's OWN object on the fixed lab and requires her
+    /// body back; it distinguishes a working endpoint from a "fix" that denied every
+    /// request (which would satisfy "the IDOR is closed" just as well, RK-016).
+    /// Taking the witness from the recorder round-trips it through
+    /// `parse_http_witness`, identity headers included, so a replay that rejected
+    /// what the seam writes would `Err`.
+    ///
+    /// Mutation: revert the api `serve_object` to the no-ownership-check form -> the
+    /// replay observes `true` and the fixed-lab check `Fail`s -> this fails. Make the
+    /// `fixed` `serve_object` deny everyone (serve no body) -> `benign.value` is
+    /// `false` -> this fails (the gap the positive control closes).
+    #[test]
+    fn idor_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!("skipping idor_fix_and_replay_closes_the_loop: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/api:fixed", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping idor_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat api+db environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let alice_auth = [("Authorization".to_owned(), IDOR_ALICE_TOKEN.to_owned())];
+
+            // Record a genuine IDOR against the vulnerable lab and take ITS witness,
+            // so replaying round-trips the recorder's own output (identity headers
+            // included) through `parse_http_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_idor_vantage",
+                IDOR_VICTIM_OBJECT,
+                IDOR_WITNESS,
+                &alice_auth,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording IDOR ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for two checks on one bring-up: a positive
+            // control, then the #64 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+
+            // Positive control: alice reads her OWN object on the fixed lab and gets
+            // her body back, so the fix is a working endpoint and not one that denies
+            // everyone. Her own body is the marker.
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_idor_vantage",
+                IDOR_OWN_OBJECT,
+                IDOR_OWN_BODY,
+                &alice_auth,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the own-object read ran");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_idor_from_vantage(&target, IDOR_VICTIM_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely reads bob's object across the ownership boundary"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                benign.value,
+                "positive control: alice still reads her own object on the fixed lab, so the fix is a working endpoint and not one that denies everyone"
+            );
+            assert_eq!(
+                benign.confidence,
+                Confidence::High,
+                "the own-object read is a confident read, not an abnormal probe"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #64 check passes against the fixed lab"
+            );
         });
     }
 }
