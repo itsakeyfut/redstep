@@ -30,7 +30,7 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, LabNetwork,
-    http_witness_exploit_from, tcp_reachable_from,
+    http_witness_exploit_from, ssrf_exploit_from, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -468,6 +468,62 @@ impl TestContext {
         })
     }
 
+    /// Coerce `app` (the SSRF target) from the attacker vantage to fetch an in-lab
+    /// canary, and witness the request OUT-OF-BAND at the canary, returning the
+    /// [`Recorded`] result with an ADR-0009 diagnostic that
+    /// [`to_be`](ExpectationBuilder::to_be) attaches on a `Fail`.
+    ///
+    /// The fourth native app-security check, and the one not on the body-marker
+    /// seam: its witness is the per-probe `token` appearing in the canary's logs,
+    /// not in the app's own response (`ssrf_exploit_from`, #65). `canary_alias` and
+    /// `canary_port` name the canary on the lab network (the coercion URL), and
+    /// `canary_container` is its container (whose logs are read); the test resolves
+    /// the container name from the running lab. The finding is attributed to `app`,
+    /// not the canary. The diagnostic is carried only when the canary was actually
+    /// reached (`observation.value`), like the siblings.
+    ///
+    /// A confident "not exploitable" means only that THIS coercion did not reach
+    /// the canary, not that the app is safe: a coercion that never fired (the app
+    /// erred before fetching, or ignored the URL) also reaches the canary with
+    /// nothing. So an SSRF check MUST be paired with a positive control that the
+    /// canary records and that `/fetch` is live (a direct hit on the canary, or an
+    /// allowed fetch), else a confident PASS can be vacuous. Enforcing that
+    /// corroboration in the capability is deferred under ADR-0010's model.
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound.
+    pub async fn exploit_ssrf_from_vantage(
+        &self,
+        app: &ScopedTarget,
+        canary_alias: &str,
+        canary_port: u16,
+        canary_container: &str,
+        token: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_ssrf_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = ssrf_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            app,
+            canary_alias,
+            canary_port,
+            canary_container,
+            token,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only a coercion that actually reached the canary earns the diagnostic;
+        // its text asserts the server reached an internal host, true iff observed.
+        let diagnostic = observation.value.then(|| ssrf_diagnostic(canary_alias));
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
+        })
+    }
+
     /// Push one evidence draft into the sink and return its per-test reference.
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
@@ -533,6 +589,23 @@ fn idor_diagnostic(marker: &str) -> Diagnostic {
         ),
         remediation: "enforce an authorization check that the requested object belongs to the \
              requesting identity, so a caller cannot read another user's object by its id"
+            .to_owned(),
+    }
+}
+
+/// The ADR-0009 domain diagnostic for a successful SSRF: the cause names the
+/// internal host the server was coerced to reach, and the remediation is to
+/// allowlist the permitted outbound hosts and refuse an internal/private target.
+/// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
+/// without Docker (`ssrf_diagnostic_names_the_host_and_the_fix`).
+fn ssrf_diagnostic(canary_alias: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the target fetched a caller-supplied URL and reached the internal host \
+             {canary_alias:?}, so request input chose the server's outbound destination (SSRF)"
+        ),
+        remediation: "allowlist the hosts the server may fetch and refuse an internal or private \
+             target, so request input cannot steer the server's outbound requests"
             .to_owned(),
     }
 }
@@ -1149,6 +1222,54 @@ mod tests {
         assert!(
             d.remediation.contains("authorization") && d.remediation.contains("belongs to"),
             "the remediation names the ownership/authorization check: {:?}",
+            d.remediation
+        );
+    }
+
+    /// Guard: `exploit_ssrf_from_vantage` on a context with no lab bound fails
+    /// closed with `LabUnavailable`, like its siblings (this needs no daemon).
+    /// Mutation: unwrap `self.lab` instead of the `ok_or_else` -> the `None` case
+    /// panics -> this (expecting an `Err`) fails.
+    #[test]
+    fn exploit_ssrf_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("api:8081")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("api:8081").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.exploit_ssrf_from_vantage(
+            &target,
+            "canary",
+            8082,
+            "ignored-container",
+            "tok",
+        ));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_ssrf_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the SSRF domain diagnostic names the internal host the server was
+    /// coerced to reach and the allowlist fix, so a reader gets ADR-0009 actionable
+    /// guidance. Pure, no Docker. Mutation: drop the host from the cause, or change
+    /// "allowlist" in the remediation -> the matching assertion fails.
+    #[test]
+    fn ssrf_diagnostic_names_the_host_and_the_fix() {
+        let d = ssrf_diagnostic("canary");
+        assert!(
+            d.probable_cause.contains("canary") && d.probable_cause.contains("SSRF"),
+            "the cause names the internal host and the technique: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("allowlist"),
+            "the remediation names the allowlist fix: {:?}",
             d.remediation
         );
     }

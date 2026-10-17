@@ -672,6 +672,32 @@ async fn run_probe_cmd(
     result
 }
 
+/// Read a container's accumulated stdout and stderr WITHOUT removing it. Unlike
+/// [`run_probe_capturing`], which reads then force-removes its throwaway probe,
+/// this reads a persistent lab workload's logs: the SSRF out-of-band witness is a
+/// per-probe token appearing in the canary's logs (#65), and the canary stays up.
+/// Returns `(stdout, stderr)`, lossy for invalid UTF-8.
+async fn read_container_logs(docker: &Docker, container: &str) -> Result<(String, String)> {
+    use futures_util::StreamExt;
+    let options = bollard::query_parameters::LogsOptionsBuilder::default()
+        .stdout(true)
+        .stderr(true)
+        .build();
+    let mut stream = docker.logs(container, Some(options));
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    while let Some(frame) = stream.next().await {
+        match frame.map_err(lab_unavailable)? {
+            bollard::container::LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
+            bollard::container::LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+            _ => {}
+        }
+    }
+    Ok((
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
 /// Like [`run_probe_cmd`], but capture the container's stdout and stderr (for an
 /// HTTP probe, the response body and, with `wget -S`, the response headers) before
 /// removing it. `run_probe_cmd` removes the container as it returns, so it can only
@@ -687,33 +713,11 @@ async fn run_probe_capturing(
     cmd: Vec<String>,
     max_wait: Duration,
 ) -> Result<(ContainerState, String, String)> {
-    use futures_util::StreamExt;
-
     let name = format!("{}-probe", run_id());
     let result = async {
         let state = run_probe_to_exit(docker, &name, network, cmd, max_wait).await?;
-        let options = bollard::query_parameters::LogsOptionsBuilder::default()
-            .stdout(true)
-            .stderr(true)
-            .build();
-        let mut stream = docker.logs(&name, Some(options));
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        while let Some(frame) = stream.next().await {
-            match frame.map_err(lab_unavailable)? {
-                bollard::container::LogOutput::StdOut { message } => {
-                    stdout.extend_from_slice(&message)
-                }
-                bollard::container::LogOutput::StdErr { message } => {
-                    stderr.extend_from_slice(&message)
-                }
-                _ => {}
-            }
-        }
-        Ok((
-            state,
-            String::from_utf8_lossy(&stdout).into_owned(),
-            String::from_utf8_lossy(&stderr).into_owned(),
-        ))
+        let (stdout, stderr) = read_container_logs(docker, &name).await?;
+        Ok((state, stdout, stderr))
     }
     .await;
     let _ = docker
@@ -956,6 +960,10 @@ fn vantage_draft(
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
+/// SSRF is on its own path, not the body-marker seam: its witness is out-of-band
+/// (observed at the canary, #65), not in the probe's response. The string follows
+/// the `http_<technique>_vantage` family for the canonical JSON.
+pub(crate) const HTTP_SSRF_VANTAGE: &str = "http_ssrf_vantage";
 
 /// Observe whether an HTTP request to `target` from the attacker's vantage returns
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
@@ -1566,6 +1574,251 @@ pub(crate) async fn replay_http_witness_probe(
         .map(|(observation, _draft)| observation),
         Err(e) => Err(e),
     };
+    if let Err(e) = lab.teardown().await {
+        eprintln!("redstep: teardown after a replay also failed: {e}");
+    }
+    probed
+}
+
+/// Classify a captured SSRF probe by whether the coerced target reached the canary.
+/// The witness is OUT-OF-BAND: `seen` is whether the per-probe token appeared in
+/// the canary's logs, not anything in the probe's own response. A clean probe exit
+/// (0) with the token seen is an exploit (`true`/`High`); a clean exit with the
+/// token absent is not-exploitable (`false`/`High`); any other exit code, or an
+/// unclean exit (so the coercion itself did not complete), is `Low` (value
+/// `false`), because the probe did not establish the target's behaviour and must
+/// not read as a confident "not exploitable" (RK-002, ADR-0010). Pure given the
+/// inputs, so the mapping is unit-tested without Docker.
+fn classify_ssrf(state: &ContainerState, seen: bool) -> Observation<bool> {
+    match finished_exit_code(state) {
+        Ok(0) if seen => Observation {
+            value: true,
+            confidence: Confidence::High,
+        },
+        Ok(0) => Observation {
+            value: false,
+            confidence: Confidence::High,
+        },
+        _ => Observation {
+            value: false,
+            confidence: Confidence::Low,
+        },
+    }
+}
+
+/// Compose the evidence draft for an SSRF vantage probe. The `target` is the
+/// coerced app (the scoped target), NOT the canary: the canary is only the
+/// observation point, so the finding is attributed to the app and the canary
+/// lives solely in the reproduction params (#65, ADR-0023). Confidence-first
+/// summary, like `http_witness_draft`, so a `true` can never read sub-`High`. The
+/// reproduction records the coercion path, the token, and the canary identity so a
+/// replay reconstructs the probe.
+#[allow(clippy::too_many_arguments)]
+fn ssrf_draft(
+    segment: &str,
+    target_spec: String,
+    request_path: &str,
+    token: &str,
+    canary_alias: &str,
+    canary_port: u16,
+    observation: &Observation<bool>,
+    applied: Duration,
+) -> EvidenceDraft {
+    let summary = if observation.confidence != Confidence::High {
+        "the probe did not complete cleanly; the result is inconclusive".to_owned()
+    } else if observation.value {
+        format!("the target reached the canary with token {token:?}; the SSRF succeeded")
+    } else {
+        "the target did not reach the canary; this coercion did not exploit it".to_owned()
+    };
+    EvidenceDraft {
+        capability: HTTP_SSRF_VANTAGE,
+        target: target_spec.clone(),
+        intensity: Intensity::Controlled,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary,
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
+        reproduction: Reproduction {
+            capability: HTTP_SSRF_VANTAGE.to_owned(),
+            target: target_spec,
+            params: serde_json::json!({
+                "request_path": request_path,
+                "token": token,
+                "canary_alias": canary_alias,
+                "canary_port": canary_port,
+                "vantage_segment": segment,
+                "timeout_ms": applied.as_millis() as u64,
+            }),
+        },
+    }
+}
+
+/// The env-independent replay inputs parsed from an SSRF witness: the segment, the
+/// target (the app), the coercion request path, the token, the canary alias and
+/// port, and the applied timeout. Pure and Docker-free (parallel to
+/// `parse_http_witness`), fail-closed on a missing/ill-typed field (ADR-0022).
+#[allow(clippy::type_complexity)]
+fn parse_ssrf_witness(
+    witness: &Reproduction,
+) -> Result<(String, String, String, String, String, u16, Duration)> {
+    let invalid = |reason: &str| Error::InvalidTarget {
+        spec: witness.target.clone(),
+        reason: reason.to_owned(),
+    };
+    if witness.target.is_empty() {
+        return Err(invalid("replay witness has an empty target"));
+    }
+    if witness.capability != HTTP_SSRF_VANTAGE {
+        return Err(invalid("replay witness is not an SSRF witness"));
+    }
+    let str_param = |key: &str, reason: &'static str| {
+        witness
+            .params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(reason))
+    };
+    let segment = str_param("vantage_segment", "replay witness has no vantage_segment")?;
+    let request_path = str_param("request_path", "replay witness has no request_path")?;
+    let token = str_param("token", "replay witness has no token")?;
+    let canary_alias = str_param("canary_alias", "replay witness has no canary_alias")?;
+    let canary_port = witness
+        .params
+        .get("canary_port")
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p <= u16::MAX as u64)
+        .ok_or_else(|| invalid("replay witness has no canary_port"))? as u16;
+    let timeout_ms = witness
+        .params
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
+    Ok((
+        segment,
+        witness.target.clone(),
+        request_path,
+        token,
+        canary_alias,
+        canary_port,
+        Duration::from_millis(timeout_ms),
+    ))
+}
+
+/// Coerce `app` (the SSRF target) from the attacker vantage to fetch
+/// `http://{canary_alias}:{canary_port}/{token}` server-side, then witness the
+/// request OUT-OF-BAND in the canary's container logs, NOT in the app's own
+/// response (the app returns only the fetched status). `token` is unique per
+/// probe, so this probe's callback is distinguishable; forging the witness would
+/// require writing `token` into the canary's log, which only the coerced in-lab
+/// app can do (layer-1 isolation keeps the app from reaching anything outside the
+/// lab, so the coercion is confined). The marker-in-path forgery guard does NOT
+/// apply here: `token` legitimately appears in the request path (it is the
+/// coercion target), and the witness is at the canary, not the body. The draft's
+/// `target` is `app`, not the canary (#65, ADR-0023). This is a separate path from
+/// `http_witness_exploit_from`: that seam's `classify_http_witness` reads the
+/// probe's own body, and an SSRF witness is not there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ssrf_exploit_from(
+    docker: &Docker,
+    vantage: &LabNetwork,
+    app: &ScopedTarget,
+    canary_alias: &str,
+    canary_port: u16,
+    canary_container: &str,
+    token: &str,
+    timeout: Duration,
+) -> Result<(Observation<bool>, EvidenceDraft)> {
+    let request_path = format!("/fetch?url=http://{canary_alias}:{canary_port}/{token}");
+    // Light fail-closed validation of the coercion path (an untrusted replay
+    // witness could carry a crafted one): a leading `/` keeps the authority the
+    // app's scoped host:port, and no CR/LF keeps it one request line. The
+    // marker-in-path check does not apply (the token is in the path by design).
+    if !request_path.starts_with('/') || request_path.contains('\r') || request_path.contains('\n')
+    {
+        return Err(Error::InvalidTarget {
+            spec: request_path,
+            reason: "the SSRF coercion path must start with '/' and contain no CR or LF".to_owned(),
+        });
+    }
+    let secs = timeout.as_secs().max(1);
+    let applied = Duration::from_secs(secs);
+    let url = format!("http://{}:{}{}", app.host(), app.port(), request_path);
+    let cmd = wget_cmd(&url, secs, &[]);
+    let (state, _body, _headers) = run_probe_capturing(
+        docker,
+        vantage.name(),
+        cmd,
+        applied + Duration::from_secs(5),
+    )
+    .await?;
+    // The witness is out-of-band: did the token reach the canary's logs?
+    let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
+    let seen = canary_out.contains(token) || canary_err.contains(token);
+    let observation = classify_ssrf(&state, seen);
+    let spec = format!("{}:{}", app.host(), app.port());
+    let draft = ssrf_draft(
+        vantage.segment(),
+        spec,
+        &request_path,
+        token,
+        canary_alias,
+        canary_port,
+        &observation,
+        applied,
+    );
+    Ok((observation, draft))
+}
+
+/// Replay an SSRF witness against `env` (ADR-0022, #65), parallel to
+/// `replay_http_witness_probe`: reconstruct the coercion the witness records, bring
+/// `env` up fresh, re-run it, and return the raw `Observation`. The canary's
+/// container name is resolved from the fresh lab by the witnessed `canary_alias`
+/// (it is not in the witness: the container name is per-run), so a replay reaches
+/// the right canary. The app target is re-resolved through
+/// `Scope::from_environment(env)` so a replay cannot aim outside scope, and the lab
+/// is always torn down.
+// allow(dead_code): no M1 production caller, like the other replays; the loop
+// guard exercises it under cfg(test).
+#[allow(dead_code)]
+pub(crate) async fn replay_ssrf_probe(
+    docker: &Docker,
+    env: &Environment,
+    witness: &Reproduction,
+) -> Result<Observation<bool>> {
+    let (segment, target, _request_path, token, canary_alias, canary_port, timeout) =
+        parse_ssrf_witness(witness)?;
+    let scoped = Scope::from_environment(env).resolve(&target)?;
+
+    let lab = bring_up(docker, env).await?;
+    let probed = async {
+        let net = vantage_network(&lab, &segment)?;
+        let canary_container = lab
+            .containers()
+            .iter()
+            .find(|c| c.workload() == canary_alias)
+            .map(|c| c.name())
+            .ok_or_else(|| Error::LabUnavailable {
+                reason: format!("environment declares no canary workload {canary_alias:?}"),
+            })?;
+        ssrf_exploit_from(
+            docker,
+            net,
+            &scoped,
+            &canary_alias,
+            canary_port,
+            canary_container,
+            &token,
+            timeout,
+        )
+        .await
+        .map(|(observation, _draft)| observation)
+    }
+    .await;
     if let Err(e) = lab.teardown().await {
         eprintln!("redstep: teardown after a replay also failed: {e}");
     }
@@ -4629,6 +4882,467 @@ mod tests {
                 verdict,
                 crate::Verdict::Pass,
                 "the #64 check passes against the fixed lab"
+            );
+        });
+    }
+
+    const SSRF_CANARY_ALIAS: &str = "canary";
+    const SSRF_CANARY_PORT: u16 = 8082;
+    const SSRF_TOKEN: &str = "redstep-ssrf-witness-7e1a";
+    const SSRF_CONTROL_TOKEN: &str = "redstep-ssrf-control-9f2b";
+
+    /// Guard: `classify_ssrf` maps the out-of-band signal fail-closed. A clean probe
+    /// exit with the token seen at the canary is exploited/High; a clean exit with
+    /// it absent is not-exploitable/High; an abnormal exit (the coercion did not
+    /// complete) is Low even if the token was seen, because the probe did not
+    /// establish the target's behaviour (RK-002). Pure, no Docker. Mutation: give
+    /// the abnormal arm `High` -> the abnormal case fails.
+    #[test]
+    fn classify_ssrf_reads_the_canary_and_fails_closed() {
+        use bollard::models::ContainerStateStatusEnum::EXITED;
+        let state = |status, code| ContainerState {
+            status,
+            exit_code: code,
+            ..Default::default()
+        };
+        let seen = classify_ssrf(&state(Some(EXITED), Some(0)), true);
+        assert!(seen.value);
+        assert_eq!(seen.confidence, Confidence::High);
+
+        let clean = classify_ssrf(&state(Some(EXITED), Some(0)), false);
+        assert!(!clean.value);
+        assert_eq!(clean.confidence, Confidence::High);
+
+        let abnormal = classify_ssrf(&state(Some(EXITED), Some(1)), true);
+        assert!(!abnormal.value);
+        assert_eq!(abnormal.confidence, Confidence::Low);
+    }
+
+    /// Guard: the SSRF draft attributes the witness to the coerced app (`target`),
+    /// not the canary (the observation point): the canary lives only in the
+    /// reproduction params (#65, ADR-0023, AC3). Pure, no Docker. Mutation: set the
+    /// draft's `target` to the canary alias -> the `target` assertion fails.
+    #[test]
+    fn ssrf_draft_attributes_the_witness_to_the_target_not_the_canary() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = ssrf_draft(
+            "lab",
+            "api:8081".to_owned(),
+            "/fetch?url=http://canary:8082/tok",
+            "tok",
+            "canary",
+            8082,
+            &observation,
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(
+            draft.target, "api:8081",
+            "the finding is attributed to the app"
+        );
+        assert_eq!(draft.reproduction.target, "api:8081");
+        assert_eq!(
+            draft.source,
+            Some(NodeRef::Vantage {
+                segment: "lab".to_owned()
+            })
+        );
+        // The canary is only a reproduction param, never the target or source.
+        assert_eq!(draft.reproduction.params["canary_alias"], "canary");
+        assert_eq!(draft.reproduction.params["canary_port"], 8082);
+        assert_eq!(draft.capability, "http_ssrf_vantage");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.confidence, Confidence::High);
+        assert!(
+            draft.summary.contains("the SSRF succeeded") && draft.summary.contains("tok"),
+            "the summary names the token and the success: {:?}",
+            draft.summary
+        );
+    }
+
+    /// Guard: an SSRF witness round-trips through `parse_ssrf_witness`, and a
+    /// witness missing any field (or carrying a non-SSRF capability) is rejected
+    /// fail-closed (ADR-0022). Pure, no Docker. Mutation: drop a field's check ->
+    /// the matching `rejected` case parses -> fails.
+    #[test]
+    fn parse_ssrf_witness_round_trips_and_rejects_an_incomplete_witness() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = ssrf_draft(
+            "lab",
+            "api:8081".to_owned(),
+            "/fetch?url=http://canary:8082/tok",
+            "tok",
+            "canary",
+            8082,
+            &observation,
+            Duration::from_millis(5_000),
+        );
+        let (segment, target, request_path, token, alias, port, timeout) =
+            parse_ssrf_witness(&draft.reproduction).expect("a complete SSRF witness parses");
+        assert_eq!(segment, "lab");
+        assert_eq!(target, "api:8081");
+        assert_eq!(request_path, "/fetch?url=http://canary:8082/tok");
+        assert_eq!(token, "tok");
+        assert_eq!(alias, "canary");
+        assert_eq!(port, 8082);
+        assert_eq!(timeout, Duration::from_millis(5_000));
+
+        let without = |key: &str| {
+            let mut params = draft.reproduction.params.clone();
+            params.as_object_mut().unwrap().remove(key);
+            Reproduction {
+                capability: HTTP_SSRF_VANTAGE.to_owned(),
+                target: "api:8081".to_owned(),
+                params,
+            }
+        };
+        assert!(
+            parse_ssrf_witness(&without("token")).is_err(),
+            "a witness with no token is rejected"
+        );
+        assert!(
+            parse_ssrf_witness(&without("canary_alias")).is_err(),
+            "a witness with no canary_alias is rejected"
+        );
+        assert!(
+            parse_ssrf_witness(&without("canary_port")).is_err(),
+            "a witness with no canary_port is rejected"
+        );
+        assert!(
+            parse_ssrf_witness(&without("vantage_segment")).is_err(),
+            "a witness with no vantage_segment is rejected"
+        );
+        let not_ssrf = Reproduction {
+            capability: HTTP_SQLI_VANTAGE.to_owned(),
+            target: "api:8081".to_owned(),
+            params: draft.reproduction.params.clone(),
+        };
+        assert!(
+            parse_ssrf_witness(&not_ssrf).is_err(),
+            "a non-SSRF witness is rejected"
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native SSRF check verdicts `Fail` against the vulnerable playground, with
+    /// the ADR-0009 SSRF diagnostic, and the witness is OUT-OF-BAND (#65 AC1/AC3).
+    /// The attacker coerces the api to fetch the in-lab canary; the canary records
+    /// the token; the api's OWN response never carries it. A positive control (a
+    /// direct vantage->canary hit) proves the canary witnesses on this lab. RK-011:
+    /// the draft mirrors the observation, is tagged `http_ssrf_vantage`, and is
+    /// attributed to the app (`target`), not the canary. Mutation: have the api
+    /// `serve_fetch` refuse the internal host (the fix) -> the canary is not reached
+    /// -> the verdict assertion fails.
+    #[test]
+    fn ssrf_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping ssrf_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp", "redstep/canary:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping ssrf_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .service("canary", "redstep/canary:mvp", "lab")
+                .build()
+                .expect("the api+db+canary environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let canary_container = lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+
+            let ctx =
+                crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage.clone());
+            let recorded = ctx
+                .exploit_ssrf_from_vantage(
+                    &target,
+                    SSRF_CANARY_ALIAS,
+                    SSRF_CANARY_PORT,
+                    &canary_container,
+                    SSRF_TOKEN,
+                )
+                .await
+                .expect("the vantage SSRF probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // AC1: the api's OWN response never carries the token. The witness is at
+            // the canary; the body alone would not reveal the SSRF.
+            let coerce =
+                format!("/fetch?url=http://{SSRF_CANARY_ALIAS}:{SSRF_CANARY_PORT}/{SSRF_TOKEN}");
+            let api_url = format!("http://{}:{}{}", target.host(), target.port(), coerce);
+            let (_s, api_body, _h) = run_probe_capturing(
+                &docker,
+                vantage.name(),
+                wget_cmd(&api_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the api /fetch probe ran");
+
+            // Positive control: a direct vantage->canary hit is recorded, so the
+            // canary witnesses on this lab (an absent token means not reached, not a
+            // dead canary).
+            let control_url =
+                format!("http://{SSRF_CANARY_ALIAS}:{SSRF_CANARY_PORT}/{SSRF_CONTROL_TOKEN}");
+            let _ = run_probe_capturing(
+                &docker,
+                vantage.name(),
+                wget_cmd(&control_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the direct canary probe ran");
+            let (canary_out, _canary_err) = read_container_logs(&docker, &canary_container)
+                .await
+                .expect("read the canary logs");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the target reached the canary (out-of-band witness)"
+            );
+            assert!(
+                !api_body.contains(SSRF_TOKEN),
+                "the api's own response does not carry the token: the body alone would not show the SSRF (AC1): {api_body:?}"
+            );
+            assert!(
+                canary_out.contains(SSRF_CONTROL_TOKEN),
+                "positive control: a direct hit is recorded, so the canary witnesses on this lab"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(SSRF_CANARY_ALIAS)
+                    && diagnostic.probable_cause.contains("SSRF"),
+                "the domain cause names the internal host and the technique: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("allowlist"),
+                "the domain remediation names the allowlist fix: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011 + AC3.
+            assert_eq!(drafts[0].capability, "http_ssrf_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].target, "api:8081",
+                "the witness is attributed to the app, not the canary"
+            );
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/api:fixed`): the SSRF attack-to-defense loop closes (#65
+    /// AC2), parallel to the SQLi/IDOR loops. A genuine coercion is recorded against
+    /// the vulnerable api and its own witness is replayed against two fresh labs: it
+    /// reproduces the callback against the vulnerable image and is not-exploitable,
+    /// confidently, against the allowlisting `redstep/api:fixed`. A positive control
+    /// (a direct canary hit on the fixed lab) proves the canary still records, so
+    /// "not seen" is the fix holding, not the canary down (RK-016). Mutation: revert
+    /// the api `serve_fetch` allowlist fix -> the app reaches the canary again ->
+    /// `on_fixed.value` is true -> this fails.
+    #[test]
+    fn ssrf_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!("skipping ssrf_fix_and_replay_closes_the_loop: no Linux Docker daemon");
+            return;
+        }
+        for image in [
+            "redstep/api:mvp",
+            "redstep/api:fixed",
+            "redstep/db:mvp",
+            "redstep/canary:mvp",
+        ] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping ssrf_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .service("canary", "redstep/canary:mvp", "lab")
+                    .build()
+                    .expect("the api+db+canary environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+
+            // Record a genuine SSRF against the vulnerable lab and take ITS witness,
+            // so replaying round-trips the recorder's own output through
+            // `parse_ssrf_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let vuln_canary = vuln_lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+            let (recorded_vuln, draft) = ssrf_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                SSRF_CANARY_ALIAS,
+                SSRF_CANARY_PORT,
+                &vuln_canary,
+                SSRF_TOKEN,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording SSRF ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_ssrf_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_ssrf_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more: a positive control, then the #65 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let fixed_canary = fixed_lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+
+            // Positive control: a direct vantage->canary hit on the fixed lab is
+            // recorded, proving the canary still witnesses (so "not seen" below is
+            // the fix holding, not a dead canary).
+            let control_url =
+                format!("http://{SSRF_CANARY_ALIAS}:{SSRF_CANARY_PORT}/{SSRF_CONTROL_TOKEN}");
+            let _ = run_probe_capturing(
+                &docker,
+                net.name(),
+                wget_cmd(&control_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the direct canary probe ran");
+            let (canary_out, _) = read_container_logs(&docker, &fixed_canary)
+                .await
+                .expect("read the canary logs");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_ssrf_from_vantage(
+                    &target,
+                    SSRF_CANARY_ALIAS,
+                    SSRF_CANARY_PORT,
+                    &fixed_canary,
+                    SSRF_TOKEN,
+                )
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely coerces the app to reach the canary"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                canary_out.contains(SSRF_CONTROL_TOKEN),
+                "positive control: the canary still records a direct hit on the fixed lab"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #65 check passes against the fixed lab"
             );
         });
     }
