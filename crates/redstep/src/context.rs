@@ -333,6 +333,7 @@ impl TestContext {
             HTTP_SQLI_VANTAGE,
             request_path,
             marker,
+            &[],
             DEFAULT_CONNECT_TIMEOUT,
         )
         .await?;
@@ -381,6 +382,7 @@ impl TestContext {
             HTTP_PATH_TRAVERSAL_VANTAGE,
             request_path,
             marker,
+            &[],
             DEFAULT_CONNECT_TIMEOUT,
         )
         .await?;
