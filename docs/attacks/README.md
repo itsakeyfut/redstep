@@ -104,11 +104,16 @@ first.
 - [Insecure Direct Object Reference](idor.md)
 - [Path Traversal](path-traversal.md)
 - [Server-Side Request Forgery](ssrf.md)
+- [Cross-Site Request Forgery](csrf.md)
+- [CORS Misconfiguration](cors-misconfiguration.md)
+- [Clickjacking](clickjacking.md)
+- [Open Redirect](open-redirect.md)
 
 ### API
 
 - [NoSQL Injection](nosql-injection.md)
 - [Insecure Deserialization](insecure-deserialization.md)
+- [CORS Misconfiguration](cors-misconfiguration.md)
 
 ### Network
 
@@ -138,13 +143,6 @@ consumption of APIs) are deliberately left out.
 - Brute force (a directory: password guessing, password spraying, credential stuffing, password cracking)
 - JWT attacks
 - OAuth vulnerabilities
-
-**Client-side**
-
-- Cross-site request forgery (CSRF)
-- CORS misconfiguration
-- Clickjacking
-- Open redirect
 
 **Request and protocol**
 
