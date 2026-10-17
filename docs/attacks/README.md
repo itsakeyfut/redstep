@@ -70,6 +70,14 @@ the contract a code comment depends on exactly as a flat slug is, so splitting a
 technique into a directory, or collapsing one back into a file, is as deliberate as a
 rename.
 
+One deliberate exception: a technique that is reference-only and out of the
+software-defined lab's scope may fold its sub-techniques into a single flat file,
+naming them in the body, rather than spend a directory of files redstep will never
+exercise. The identity genre's Active-Directory and host-OS techniques
+(`os-credential-dumping`, `kerberos-ticket-attacks`,
+`alternate-authentication-material`) do this; an in-scope technique with
+sub-techniques still gets a directory, as `brute-force` does.
+
 ## Linking, and why the slug is frozen
 
 Code comments reference a file by its repository-relative path, for example
@@ -121,6 +129,7 @@ first.
 - [Race Conditions](race-conditions.md)
 - [Information Disclosure](information-disclosure.md)
 - [Prototype Pollution](prototype-pollution.md)
+- [Session Hijacking](session-hijacking.md)
 
 ### API
 
@@ -172,25 +181,25 @@ first.
 - [Cloud IAM Privilege Escalation](cloud-iam-privilege-escalation.md)
 - [Valid Cloud Accounts](valid-cloud-accounts.md)
 - [Credentials in Container Images](credentials-in-container-images.md)
+- [Session Hijacking](session-hijacking.md)
+- [Use of Alternate Authentication Material](alternate-authentication-material.md)
+- [Multi-Factor Authentication Bypass](mfa-bypass.md)
+- [OS Credential Dumping](os-credential-dumping.md)
+- [Kerberos Ticket Attacks](kerberos-ticket-attacks.md)
 
-## Backlog (not yet written)
+## Coverage
 
-This is the coverage gap made visible: known techniques still to catalogue, by genre. A
-name moves up into the genre index above, as a link, when its file is written.
+The mainstream set across all six genres is now catalogued: Web and API from OWASP Top 10
+(2021), the OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy;
+Network, Cloud, Container, and Identity from the ATT&CK Enterprise, Cloud, and Containers
+matrices and the Credential Access tactic. Pure categories that are not a single technique
+(security misconfiguration, improper inventory management, unsafe consumption of APIs)
+were deliberately left out, and the techniques that need a radio, a physical switch, a
+real cloud provider, or an Active Directory domain are kept as `capability: none` and
+marked out of the software-defined lab's scope.
 
-The Web, API, Network, and Cloud genres are complete to their mainstream sets: Web and
-API from OWASP Top 10 (2021), the OWASP API Security Top 10 (2023), and the PortSwigger
-Web Security Academy (pure categories that are not a single technique, security
-misconfiguration, improper inventory management, unsafe consumption of APIs, were
-deliberately left out); Network, Cloud, and Container from the ATT&CK Enterprise, Cloud,
-and Containers matrices (with the techniques that need a radio, a physical switch, or a
-real cloud provider kept as `capability: none` and marked out of the software-defined
-lab's scope). The one genre still uncatalogued:
-
-- **Identity:** the credential-access and session techniques beyond the brute-force,
-  name-resolution-poisoning, cloud-account, and image-credential families already listed
-  (for example Kerberoasting, pass-the-hash, token theft, and session hijacking), from
-  the ATT&CK Credential Access and related tactics.
-
-Enumerate it from its authoritative taxonomy, as the earlier genres were, before writing
-its files.
+The backlog is therefore empty, and the coverage gap is now visible the other way: in the
+index above, every technique whose `capability` is `none` is one redstep does not yet
+exercise, which is the list of checks still to build. New techniques are added as the
+field evolves, each enumerated from its authoritative taxonomy before its file is
+written.
