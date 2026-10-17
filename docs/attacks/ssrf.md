@@ -1,7 +1,6 @@
 ---
 name: Server-Side Request Forgery
 slug: ssrf
-status: implemented
 attack: [T1190, T1552.005]
 owasp: [A10:2021-SSRF]
 cwe: [CWE-918]

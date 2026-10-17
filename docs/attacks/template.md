@@ -1,7 +1,6 @@
 ---
 name: the technique's common name, e.g. Server-Side Request Forgery
 slug: kebab-case, equal to the file name without .md, e.g. ssrf
-status: planned | partial | implemented
 attack: MITRE ATT&CK technique ids as a list, e.g. [T1190], or [unmapped]
 owasp: app-layer OWASP ids, e.g. [A10:2021-SSRF]; empty list if none
 cwe: CWE ids, e.g. [CWE-918]; empty list if none
@@ -44,7 +43,8 @@ name the marker or the token. The playground vulnerability it is proven against 
 the fix that closes it, and the exploit-fix-replay loop
 ([ADR-0022](../adr/0022-capture-a-success-witness-and-generate-a-pinned-replay.md)).
 Keep this honest about what is built versus planned, so a comment that links here
-does not promise what the code does not do; the `status` field above says which.
+does not promise what the code does not do; a `capability` of `none` says it is not
+built yet.
 
 ## What a verdict means
 

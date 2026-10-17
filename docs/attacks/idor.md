@@ -1,7 +1,6 @@
 ---
 name: Insecure Direct Object Reference
 slug: idor
-status: implemented
 attack: [T1190]
 owasp: [A01:2021-Broken Access Control]
 cwe: [CWE-639]

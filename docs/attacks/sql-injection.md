@@ -1,7 +1,6 @@
 ---
 name: SQL Injection
 slug: sql-injection
-status: implemented
 attack: [T1190]
 owasp: [A03:2021-Injection]
 cwe: [CWE-89]

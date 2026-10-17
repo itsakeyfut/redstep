@@ -1,13 +1,19 @@
 # Attack techniques
 
-One file per attack technique, each a reference the code links to from its
-comments. A capability or a check that implements a technique points a reader here
-for what the attack is and what a verdict about it means, rather than carrying a
-second copy of that prose in a doc comment that drifts.
+A catalog of attack techniques, one file each, written so a reader meeting a
+technique for the first time can learn what it is and how it works. It is the
+reference redstep is built from, not a record of what redstep has built: a
+capability is implemented by working from the technique file, and a code comment
+links back here instead of restating the attack in prose that drifts.
+
+Kept as a catalog, it also shows what is missing. A documented technique with no
+capability yet, or a known technique with no file at all, is a gap in coverage made
+visible, and closing those gaps is how the native checks grow.
 
 These files are reference, not intent and not decisions. What is wanted lives in
 `../roadmap/`; the settled cross-cutting reasoning lives in `../adr/`; a technique
-file describes a real attack and how redstep exercises it, and links to both.
+file teaches a real attack, links to both, and says how redstep exercises it, or
+will when no capability exists yet.
 
 ## Writing one
 
@@ -31,9 +37,11 @@ template's own comments say what each section is for.
   metadata service). The genres are the sections of the index below; keep to that
   set and add one only as deliberately as you would have added a folder. The set:
   `web`, `api`, `network`, `container`, `cloud`, `identity`.
-- **Set `status` honestly:** `implemented`, `partial`, or `planned`. A code comment
-  may link to a `planned` file; the field is what stops that link promising a
-  capability that does not exist yet.
+- **Name the `capability` when one exists, else `none`.** This is the coverage
+  signal: a file with `capability: none` is a technique the catalog teaches but
+  redstep does not yet exercise, which is exactly the gap the catalog exists to make
+  visible. A code comment may link to such a file; keep "How redstep exercises it"
+  honest that it is not built yet.
 
 ## Linking, and why the slug is frozen
 
@@ -51,18 +59,18 @@ Grouped by target genre, the `targets` field. A technique is listed under each
 genre it carries, so a cross-genre one (SSRF under both Web and Cloud) appears more
 than once; that is the by-genre view the catalog is organised around. Add a file to
 every genre in its `targets` as it is written: one row per technique, a link to its
-file followed by its status.
+file.
 
 Do not list a file before it exists: an entry for a missing file is a dead link,
-which `.claude/scripts/docs-links.sh` fails. The four implemented native checks are
-listed below; the genres with no file yet await their first.
+which `.claude/scripts/docs-links.sh` fails. The genres with no file yet await their
+first.
 
 ### Web
 
-- [SQL Injection](sql-injection.md) - implemented
-- [Insecure Direct Object Reference](idor.md) - implemented
-- [Path Traversal](path-traversal.md) - implemented
-- [Server-Side Request Forgery](ssrf.md) - implemented
+- [SQL Injection](sql-injection.md)
+- [Insecure Direct Object Reference](idor.md)
+- [Path Traversal](path-traversal.md)
+- [Server-Side Request Forgery](ssrf.md)
 
 ### API
 
@@ -72,6 +80,6 @@ listed below; the genres with no file yet await their first.
 
 ### Cloud
 
-- [Server-Side Request Forgery](ssrf.md) - implemented
+- [Server-Side Request Forgery](ssrf.md)
 
 ### Identity
