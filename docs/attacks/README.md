@@ -97,11 +97,18 @@ first.
 - [SQL Injection](sql-injection.md)
 - [Cross-Site Scripting](xss.md)
 - [OS Command Injection](command-injection.md)
+- [XML External Entity Injection](xxe.md)
+- [Server-Side Template Injection](ssti.md)
+- [NoSQL Injection](nosql-injection.md)
+- [Insecure Deserialization](insecure-deserialization.md)
 - [Insecure Direct Object Reference](idor.md)
 - [Path Traversal](path-traversal.md)
 - [Server-Side Request Forgery](ssrf.md)
 
 ### API
+
+- [NoSQL Injection](nosql-injection.md)
+- [Insecure Deserialization](insecure-deserialization.md)
 
 ### Network
 
@@ -121,13 +128,6 @@ moves up into the genre index above, as a link, when its file is written; this
 section is the coverage gap made visible. Pure categories that are not a single
 technique (security misconfiguration, improper inventory management, unsafe
 consumption of APIs) are deliberately left out.
-
-**Injection**
-
-- XML external entity (XXE) injection
-- Server-side template injection (SSTI)
-- NoSQL injection
-- Insecure deserialization
 
 **Access control**
 
