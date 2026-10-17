@@ -20,11 +20,15 @@ will when no capability exists yet.
 Copy [`template.md`](template.md) to `docs/attacks/<slug>.md` and fill it in. The
 template's own comments say what each section is for.
 
-- **One technique, one file, flat.** No `web/` or `network/` subfolders. The
-  classification is the tags inside the file, not the directory, so a technique is
-  never re-filed and its path never moves (see below on why that matters). This is
+- **One file per technique; a directory only to hold sub-techniques.** There are no
+  genre subfolders (no `web/` or `network/`): the genre is the `targets` tag, not the
+  path, so a technique is never re-filed across genres and its path never moves for
+  that reason. This is
   [ADR-0016](../adr/0016-tag-attacks-with-attack-and-owasp-optional-but-first-class.md):
-  the taxonomy is tag-driven, and a coverage view is generated from the tags.
+  the taxonomy is tag-driven, and a coverage view is generated from the tags. The one
+  case a technique becomes a directory is when it maps to an ATT&CK technique that has
+  sub-techniques worth teaching on their own (see "Techniques with sub-techniques"
+  below); the directory is then the signal that the technique is divided.
 - **Name by the common name, kebab-case:** `ssrf.md`, `sql-injection.md`,
   `idor.md`, `path-traversal.md`. The file name is the `slug`.
 - **Tag it, ATT&CK first, OWASP for the app layer, CWE where it sharpens the
@@ -42,6 +46,29 @@ template's own comments say what each section is for.
   redstep does not yet exercise, which is exactly the gap the catalog exists to make
   visible. A code comment may link to such a file; keep "How redstep exercises it"
   honest that it is not built yet.
+
+## Techniques with sub-techniques
+
+Most techniques are one flat file. When a technique maps to an ATT&CK technique that
+has sub-techniques worth teaching individually, make it a directory instead, so the
+split is visible from the tree and a reader sees at once that the technique divides:
+
+```
+docs/attacks/brute-force/
+  README.md               the umbrella: Summary, Mechanism and References for the
+                          general technique, and a list linking its sub-techniques.
+                          It carries the parent ATT&CK id (e.g. T1110) and no
+                          capability of its own.
+  password-spraying.md    one file per sub-technique, the full template, each with
+  credential-stuffing.md  its own sub-technique ATT&CK id (T1110.003, .004), its
+  ...                     own targets, and its own capability or none.
+```
+
+The genre index links the umbrella, one row per recognisable technique, and the
+umbrella links its sub-techniques. The path, `brute-force/credential-stuffing.md`, is
+the contract a code comment depends on exactly as a flat slug is, so splitting a
+technique into a directory, or collapsing one back into a file, is as deliberate as a
+rename.
 
 ## Linking, and why the slug is frozen
 
