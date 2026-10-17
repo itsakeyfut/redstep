@@ -53,12 +53,16 @@ than once; that is the by-genre view the catalog is organised around. Add a file
 every genre in its `targets` as it is written: one row per technique, a link to its
 file followed by its status.
 
-Every section is empty until a file exists: an entry for a file that is not there
-yet would be a dead link, which `.claude/scripts/docs-links.sh` fails. The
-implemented native checks (SSRF, SQL injection, IDOR, path traversal) are the
-natural first files, all under Web (SSRF also under Cloud).
+Do not list a file before it exists: an entry for a missing file is a dead link,
+which `.claude/scripts/docs-links.sh` fails. The four implemented native checks are
+listed below; the genres with no file yet await their first.
 
 ### Web
+
+- [SQL Injection](sql-injection.md) - implemented
+- [Insecure Direct Object Reference](idor.md) - implemented
+- [Path Traversal](path-traversal.md) - implemented
+- [Server-Side Request Forgery](ssrf.md) - implemented
 
 ### API
 
@@ -67,5 +71,7 @@ natural first files, all under Web (SSRF also under Cloud).
 ### Container
 
 ### Cloud
+
+- [Server-Side Request Forgery](ssrf.md) - implemented
 
 ### Identity
