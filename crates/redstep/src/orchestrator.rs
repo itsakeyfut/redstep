@@ -961,8 +961,9 @@ pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
 /// the native HTTP app-security checks whose witness is a `marker` that appears in
 /// the probe's OWN response body: a SQL injection whose `marker` is a DB-only
-/// value, and a path traversal whose `marker` is a file-outside-the-web-root
-/// sentinel.
+/// value, a path traversal whose `marker` is a file-outside-the-web-root sentinel,
+/// and an IDOR whose `marker` is another user's object body (reached by carrying an
+/// identity in `request_headers`).
 ///
 /// A technique whose witness is out-of-band does NOT belong on this seam. An SSRF
 /// (#65) is confirmed by a canary callback that a separate listener observes; its
@@ -1000,12 +1001,16 @@ pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 ///
 /// `request_headers` are added to the probe request, one `--header` each (#64).
 /// A technique that acts as a particular identity (IDOR) passes a credential or
-/// session header here; SQLi and path traversal pass none. They are validated
-/// (no CR/LF, no `:` in a name) with the rest of the request before the probe.
-// allow(too_many_arguments): every argument is a distinct probe input the seam
-// needs (the lab handle, the scoped target, the capability tag, the request, the
-// identity headers, the timeout); bundling them into a struct would hide what the
-// one seam takes behind a type that has no other use, for no gain here.
+/// session header here; SQLi and path traversal pass none. They are validated by
+/// [`validate_http_request`] (an RFC 7230 token name, no control bytes in a value)
+/// with the rest of the request before the probe, and recorded in the reproduction
+/// so a replay re-sends the same identity.
+// allow(too_many_arguments): each argument is a distinct probe input (the lab
+// handle, the scoped target, the capability tag, the request path, the marker, the
+// identity headers, the timeout). This seam is the provisional M1/M2 shape of the
+// generalized in-container capability the roadmap reshapes in M3 (mvp.md); a
+// probe-inputs struct is the clean refactor at that point, so it is kept flat until
+// the M3 shape is known rather than invented now.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn http_witness_exploit_from(
     docker: &Docker,
@@ -1061,11 +1066,14 @@ pub(crate) async fn http_witness_exploit_from(
 /// witness). CR/LF are refused so the path cannot inject a request line. Pure, so
 /// the guard runs without Docker, and it fronts every caller including a replay.
 ///
-/// Each of `headers` (the IDOR identity channel, #64) is checked the same way: a
-/// CR or LF in a header name or value could inject a second header or a request
-/// line (the RK-015 injection class, now on the header channel), a `:` in a name
-/// would split it, and an empty name is malformed. The marker is refused inside a
-/// header value too, so a server that reflects a header cannot forge the witness.
+/// Each of `headers` (the IDOR identity channel, #64) is validated too. The name
+/// must be an RFC 7230 token (non-empty, token characters only): that rejects a
+/// `:` that would split it, a CR/LF or any other control that could inject a second
+/// header or a request line (the RK-015 injection class on the header channel), and
+/// a leading space that a server would read as an obs-fold of the previous header.
+/// A value is refused any control character for the same injection reason. The
+/// marker is refused in a header name and value, so a server that reflects a header
+/// cannot forge the witness.
 fn validate_http_request(
     request_path: &str,
     marker: &str,
@@ -1099,28 +1107,36 @@ fn validate_http_request(
         ));
     }
     for (name, value) in headers {
-        if name.trim().is_empty() {
-            return Err(invalid("a request header name must be non-empty"));
-        }
-        if name.contains(':') {
-            return Err(invalid("a request header name must not contain ':'"));
-        }
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
+        // An RFC 7230 token name (non-empty, token characters only) subsumes the
+        // empty/whitespace name, the ':' that would split it, and any CR/LF or other
+        // control that could smuggle a second header or a request line; a leading
+        // space would be read as an obs-fold of the previous header.
+        if name.is_empty() || !name.bytes().all(is_token_char) {
             return Err(invalid(
-                "a request header must not contain CR or LF (it could inject another header or a request line)",
+                "a request header name must be a non-empty RFC 7230 token (letters, digits, and !#$%&'*+-.^_`|~)",
             ));
         }
-        if value.contains(marker) {
+        // A CR, LF, or any other control byte in a value is the same injection class.
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
             return Err(invalid(
-                "the marker must not appear in a request header value (a reflected header could forge the witness)",
+                "a request header value must not contain a control character (it could inject another header or a request line)",
+            ));
+        }
+        if name.contains(marker) || value.contains(marker) {
+            return Err(invalid(
+                "the marker must not appear in a request header (a reflected header could forge the witness)",
             ));
         }
     }
     Ok(())
+}
+
+/// Whether `b` is an RFC 7230 `tchar`, a valid HTTP header-name byte: an ASCII
+/// letter or digit, or one of the token punctuation characters. Used by
+/// [`validate_http_request`] to reject a header name that could be split, folded,
+/// or injected.
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// The busybox `wget` probe as argv (never a shell line): fetch `url` to stdout
@@ -1133,8 +1149,9 @@ fn validate_http_request(
 /// shell could interpret, so it cannot inject a command into the probe container.
 /// Each of `headers` is added as a `--header` option with its `"name: value"` as a
 /// single argument (busybox `wget --header STR`, #64), before the url as busybox
-/// expects options first; validated by [`validate_http_request`] so a value cannot
-/// carry CR/LF. Pure, so the argv shape is unit-tested without Docker.
+/// expects options first; validated by [`validate_http_request`] so a name is a
+/// token and a value carries no control byte. Pure, so the argv shape is
+/// unit-tested without Docker.
 fn wget_cmd(url: &str, secs: u64, headers: &[(String, String)]) -> Vec<String> {
     let mut cmd = vec![
         "wget".to_owned(),
@@ -1280,10 +1297,12 @@ fn http_witness_draft(
         reproduction: Reproduction {
             capability: capability.to_owned(),
             target: target_spec,
-            // `headers` is added only when non-empty, so a SQLi/traversal witness
-            // (which carries none) serializes byte-for-byte as before: the
+            // `request_headers` is added only when non-empty, so a SQLi/traversal
+            // witness (which carries none) serializes byte-for-byte as before: the
             // published canonical-JSON shape of those techniques is unchanged
-            // (RK-003). A replay reads it back with `parse_http_witness`.
+            // (RK-003). A replay reads it back with `parse_http_witness`. The key
+            // mirrors the Rust name; a bare `headers` next to `request_path` would
+            // read as the response headers, which the code avoids by naming.
             params: {
                 let mut params = serde_json::json!({
                     "request_path": request_path,
@@ -1292,7 +1311,7 @@ fn http_witness_draft(
                     "timeout_ms": applied.as_millis() as u64,
                 });
                 if !request_headers.is_empty() {
-                    params["headers"] = serde_json::Value::Array(
+                    params["request_headers"] = serde_json::Value::Array(
                         request_headers
                             .iter()
                             .map(|(name, value)| serde_json::json!([name, value]))
@@ -1397,7 +1416,8 @@ pub(crate) async fn replay_vantage_probe(
 }
 
 /// The env-independent replay inputs parsed from an HTTP witness: the capability,
-/// the segment, the target, the request path, the marker, and the applied timeout.
+/// the segment, the target, the request path, the marker, the request headers (the
+/// IDOR identity channel, #64), and the applied timeout.
 /// Pure and Docker-free (parallel to [`parse_vantage_witness`]), so "a witness
 /// missing a field cannot replay" is a guard that runs offline before
 /// [`replay_http_witness_probe`] stands a lab up. A missing or ill-typed field is
@@ -1407,6 +1427,9 @@ pub(crate) async fn replay_vantage_probe(
 /// `&'static str`; matching the recorded name to a known technique both yields that
 /// `&'static str` and fails closed on an unknown one, so a witness naming a
 /// capability this build does not have cannot be replayed into the wrong technique.
+// allow(type_complexity): the parsed witness is a flat tuple of the probe inputs,
+// read positionally straight back into `http_witness_exploit_from`; a named struct
+// is the clean refactor for when M3 reshapes this seam (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_http_witness(
     witness: &Reproduction,
@@ -1453,27 +1476,27 @@ fn parse_http_witness(
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
-    // `headers` is optional: a SQLi/traversal witness has no such key and replays
-    // with none, so those techniques are unaffected by the identity channel (#64).
-    // When present it must be an array of [name, value] string pairs; a malformed
-    // one is `InvalidTarget`, fail-closed, not silently dropped.
-    let headers = match witness.params.get("headers") {
+    // `request_headers` is optional: a SQLi/traversal witness has no such key and
+    // replays with none, so those techniques are unaffected by the identity channel
+    // (#64). When present it must be an array of [name, value] string pairs; a
+    // malformed one is `InvalidTarget`, fail-closed, not silently dropped.
+    let headers = match witness.params.get("request_headers") {
         None => Vec::new(),
         Some(value) => {
             let array = value
                 .as_array()
-                .ok_or_else(|| invalid("replay witness headers is not an array"))?;
+                .ok_or_else(|| invalid("replay witness request_headers is not an array"))?;
             let mut out = Vec::with_capacity(array.len());
             for entry in array {
                 let pair = entry.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
-                    invalid("a replay witness header is not a [name, value] pair")
+                    invalid("a replay witness request header is not a [name, value] pair")
                 })?;
-                let name = pair[0]
-                    .as_str()
-                    .ok_or_else(|| invalid("a replay witness header name is not a string"))?;
-                let hvalue = pair[1]
-                    .as_str()
-                    .ok_or_else(|| invalid("a replay witness header value is not a string"))?;
+                let name = pair[0].as_str().ok_or_else(|| {
+                    invalid("a replay witness request header name is not a string")
+                })?;
+                let hvalue = pair[1].as_str().ok_or_else(|| {
+                    invalid("a replay witness request header value is not a string")
+                })?;
                 out.push((name.to_owned(), hvalue.to_owned()));
             }
             out
@@ -1507,9 +1530,10 @@ fn parse_http_witness(
 /// `Scope::from_environment(env)` so a replay cannot aim outside scope, the lab
 /// is always torn down, and it runs no [`boundary_self_check`] and issues no
 /// verdict. What is specific here is that `parse_http_witness` then
-/// `validate_http_request` re-check the witnessed `request_path` and `marker`, so
-/// an untrusted witness cannot smuggle an authority through the appended request
-/// component (RK-015), which a vantage witness has no equivalent of. The
+/// `validate_http_request` re-check the witnessed `request_path`, `marker`, and
+/// request headers, so an untrusted witness cannot smuggle an authority through the
+/// appended request component or an injected header (RK-015), which a vantage
+/// witness has no equivalent of. The
 /// guarantee is the same observation against the same `Environment`, not
 /// byte-reproducibility; image pinning (ADR-0019) is deferred, so the mvp/fixed
 /// distinction is `env`'s choice.
@@ -2368,10 +2392,12 @@ mod tests {
     /// check -> `""` passes -> the empty-marker case fails; drop the contains(marker)
     /// check -> the reflected case fails. Mutation: weaken the marker check back to
     /// `marker.is_empty()` -> the whitespace-only `" "` marker passes -> that case
-    /// fails (a `" "` marker reads almost any 200 as exploited). A header with CR/LF,
-    /// a `:` in a name, an empty name, or the marker in its value is refused too
-    /// (#64); mutation: drop the per-header loop -> those header cases pass -> they
-    /// fail.
+    /// fails (a `" "` marker reads almost any 200 as exploited). A header is refused
+    /// unless its name is an RFC 7230 token and its value has no control character,
+    /// and the marker is refused in a header name or value (#64). Mutations: drop
+    /// the per-header loop, or weaken it to `.take(1)`, or drop the token-name check,
+    /// a single CR/LF sub-check, the control-in-value check, or the marker-in-name
+    /// check -> the matching header case passes -> it fails.
     #[test]
     fn validate_http_request_fails_closed() {
         // Valid: a leading-slash path with a marker not in it, and a benign header.
@@ -2434,11 +2460,64 @@ mod tests {
         );
         assert!(
             rejected_header("   ", "v"),
-            "an empty header name is refused"
+            "a whitespace (non-token) header name is refused"
         );
         assert!(
             rejected_header("X-Reflect", "FLAG123"),
             "the marker in a header value is refused (a reflected header could forge the witness)"
+        );
+        // Each CR and LF, in a name and a value, is refused on its own (the earlier
+        // cases pair them), so bare-CR and bare-LF header injection is caught.
+        assert!(
+            rejected_header("X", "a\rb"),
+            "a bare CR in a header value is refused"
+        );
+        assert!(
+            rejected_header("X", "a\nb"),
+            "a bare LF in a header value is refused"
+        );
+        assert!(
+            rejected_header("X\rY", "v"),
+            "a bare CR in a header name is refused"
+        );
+        assert!(
+            rejected_header("X\nY", "v"),
+            "a bare LF in a header name is refused"
+        );
+        // A non-token name: a leading space (an obs-fold vector) or an internal space.
+        assert!(
+            rejected_header(" X", "v"),
+            "a header name with a leading space is refused"
+        );
+        assert!(
+            rejected_header("X Y", "v"),
+            "a header name with an internal space is refused"
+        );
+        // Any control byte in a value, not only CR/LF.
+        assert!(
+            rejected_header("X", "a\u{0}b"),
+            "a NUL in a header value is refused"
+        );
+        // The marker in a header NAME is refused too, not only in a value.
+        assert!(
+            rejected_header("X-FLAG123", "v"),
+            "the marker in a header name is refused"
+        );
+        // The loop checks every header, not just the first: a hostile SECOND header
+        // (so a `.take(1)` mutation would skip it) is refused.
+        assert!(
+            matches!(
+                validate_http_request(
+                    "/lookup",
+                    "FLAG123",
+                    &[
+                        ("Good".to_owned(), "v".to_owned()),
+                        ("X".to_owned(), "a\r\nInjected: 1".to_owned()),
+                    ],
+                ),
+                Err(Error::InvalidTarget { .. })
+            ),
+            "a hostile second header is refused (the loop checks every header)"
         );
     }
 
@@ -2469,14 +2548,18 @@ mod tests {
             ],
             "the probe is wget argv with the quiet/headers/timeout/stdout flags and the url as one argument"
         );
-        // A header becomes `--header` + one `name: value` argument, before the url.
-        let with_header = wget_cmd(
+        // Two headers each become `--header` + one `name: value` argument, in order,
+        // before the url. Two (not one) so a `.take(1)` over the loop is caught.
+        let with_headers = wget_cmd(
             "http://api:8081/object?id=2",
             5,
-            &[("Authorization".to_owned(), "tok-alice".to_owned())],
+            &[
+                ("Authorization".to_owned(), "tok-alice".to_owned()),
+                ("X-Tenant".to_owned(), "acme".to_owned()),
+            ],
         );
         assert_eq!(
-            with_header,
+            with_headers,
             vec![
                 "wget".to_owned(),
                 "-q".to_owned(),
@@ -2487,9 +2570,11 @@ mod tests {
                 "-".to_owned(),
                 "--header".to_owned(),
                 "Authorization: tok-alice".to_owned(),
+                "--header".to_owned(),
+                "X-Tenant: acme".to_owned(),
                 "http://api:8081/object?id=2".to_owned(),
             ],
-            "a header is a --header option with 'name: value' as one argument before the url"
+            "each header is a --header option with 'name: value' as one argument before the url"
         );
         assert!(
             !cmd.iter().any(|a| a == "sh" || a == "-c"),
@@ -2679,7 +2764,7 @@ mod tests {
             "the exploited summary is pinned exact, capability-neutral, and names the marker"
         );
         assert!(
-            draft.reproduction.params.get("headers").is_none(),
+            draft.reproduction.params.get("request_headers").is_none(),
             "a draft with no request headers omits the key, so the SQLi/traversal canonical-JSON shape is unchanged (RK-003)"
         );
 
@@ -2781,17 +2866,24 @@ mod tests {
 
     /// Guard: request headers (the IDOR identity, #64) round-trip through the draft's
     /// reproduction and back out of `parse_http_witness`, so a replay re-sends the
-    /// same identity. Pure, no Docker. Mutation: drop the `if !request_headers.is_empty()`
-    /// serialization in `http_witness_draft` -> the reproduction has no "headers" ->
-    /// the draft assertion fails; drop the headers parse in `parse_http_witness` ->
-    /// the parsed headers are empty -> the round-trip assertion fails.
+    /// same identity, and the IDOR witness resolves to its own capability (not the
+    /// SQLi one). Two headers, so a `.take(1)` over either loop is caught. Pure, no
+    /// Docker. Mutations: drop the `if !request_headers.is_empty()` serialization in
+    /// `http_witness_draft` -> no `request_headers` key -> the draft assertion fails;
+    /// drop the headers parse in `parse_http_witness` -> empty -> the round-trip fails;
+    /// `.take(1)` either loop -> the second header is lost -> fails; map the
+    /// `HTTP_IDOR_VANTAGE` parse arm to `HTTP_SQLI_VANTAGE` -> the capability assertion
+    /// fails.
     #[test]
     fn http_witness_draft_and_parse_round_trip_request_headers() {
         let exploited = Observation {
             value: true,
             confidence: Confidence::High,
         };
-        let headers = [("Authorization".to_owned(), "tok-alice".to_owned())];
+        let headers = [
+            ("Authorization".to_owned(), "tok-alice".to_owned()),
+            ("X-Tenant".to_owned(), "acme".to_owned()),
+        ];
         let draft = http_witness_draft(
             HTTP_IDOR_VANTAGE,
             "lab",
@@ -2803,16 +2895,23 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(
-            draft.reproduction.params["headers"],
-            serde_json::json!([["Authorization", "tok-alice"]]),
-            "the request headers are recorded in the reproduction for a faithful replay"
+            draft.reproduction.params["request_headers"],
+            serde_json::json!([["Authorization", "tok-alice"], ["X-Tenant", "acme"]]),
+            "the request headers are recorded in the reproduction, in order, for a faithful replay"
         );
-        let (_cap, _seg, _target, _path, _marker, parsed_headers, _timeout) =
+        let (cap, _seg, _target, _path, _marker, parsed_headers, _timeout) =
             parse_http_witness(&draft.reproduction).expect("the IDOR witness parses");
         assert_eq!(
+            cap, "http_idor_vantage",
+            "the IDOR witness resolves to its own capability, not SQLi's"
+        );
+        assert_eq!(
             parsed_headers,
-            vec![("Authorization".to_owned(), "tok-alice".to_owned())],
-            "parse_http_witness reads the identity headers back out of the witness"
+            vec![
+                ("Authorization".to_owned(), "tok-alice".to_owned()),
+                ("X-Tenant".to_owned(), "acme".to_owned()),
+            ],
+            "parse_http_witness reads every identity header back out of the witness"
         );
     }
 
@@ -3568,15 +3667,17 @@ mod tests {
     }
 
     /// Guard: `parse_http_witness` reads back every field an HTTP witness replay
-    /// needs (capability, segment, target, request_path, marker, timeout) and fails
-    /// closed on a missing or ill-typed one, including a capability this build does
-    /// not know, so an incomplete or unknown-technique witness cannot replay by
-    /// defaulting (ADR-0022, parallel to `parse_vantage_witness`). Pure, no Docker.
-    /// Mutation: drop any one field's check -> the witness missing it parses -> the
-    /// matching `rejected` case fails; drop the unknown-capability arm -> the
-    /// unknown-capability case parses -> that assertion fails; map the traversal arm
-    /// to `HTTP_SQLI_VANTAGE` -> the traversal round-trip returns the wrong
-    /// capability -> that assertion fails.
+    /// needs (capability, segment, target, request_path, marker, request_headers,
+    /// timeout) and fails closed on a missing or ill-typed one, including a
+    /// capability this build does not know and a malformed `request_headers`, so an
+    /// incomplete or unknown-technique witness cannot replay by defaulting (ADR-0022,
+    /// parallel to `parse_vantage_witness`). Pure, no Docker. Mutation: drop any one
+    /// field's check -> the witness missing it parses -> the matching `rejected` case
+    /// fails; drop the unknown-capability arm -> the unknown-capability case parses
+    /// -> that assertion fails; map the traversal arm to `HTTP_SQLI_VANTAGE` -> the
+    /// traversal round-trip returns the wrong capability -> that assertion fails;
+    /// weaken any `request_headers` fail-closed branch to silent tolerance -> the
+    /// matching malformed case parses -> it fails.
     #[test]
     fn parse_http_witness_rejects_an_incomplete_witness() {
         let params = serde_json::json!({
@@ -3598,8 +3699,8 @@ mod tests {
         assert_eq!(request_path, "/lookup?name=x");
         assert_eq!(marker, "FLAG123");
         assert_eq!(timeout, Duration::from_millis(5_000));
-        // A witness with no "headers" key (SQLi/traversal) parses as no headers, so
-        // the identity channel leaves those techniques unaffected (#64, AC3).
+        // A witness with no "request_headers" key (SQLi/traversal) parses as no
+        // headers, so the identity channel leaves those techniques unaffected (#64, AC3).
         assert!(
             headers.is_empty(),
             "a witness without a headers key replays with no identity headers"
@@ -3664,6 +3765,29 @@ mod tests {
                 "blank vantage_segment",
                 "web:8080",
                 serde_json::json!({ "request_path": "/lookup?name=x", "marker": "FLAG123", "vantage_segment": " ", "timeout_ms": 5_000 }),
+            ),
+            // A present-but-malformed `request_headers` is fail-closed, not silently
+            // dropped (which would replay with no identity): not an array, an entry
+            // that is not a 2-pair, and a non-string name or value.
+            (
+                "request_headers not an array",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": 42 }),
+            ),
+            (
+                "request_headers entry not a pair",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [["a"]] }),
+            ),
+            (
+                "request_headers name not a string",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [[1, "v"]] }),
+            ),
+            (
+                "request_headers value not a string",
+                "web:8080",
+                serde_json::json!({ "request_path": "/x", "marker": "FLAG123", "vantage_segment": "lab", "timeout_ms": 5_000, "request_headers": [["n", 2]] }),
             ),
         ];
         for (label, target, params) in rejected {

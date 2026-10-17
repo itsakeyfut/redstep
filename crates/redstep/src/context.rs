@@ -402,24 +402,39 @@ impl TestContext {
     /// diagnostic that [`to_be`](ExpectationBuilder::to_be) attaches if the
     /// expectation fails.
     ///
-    /// The third native app-security check, parallel to
+    /// A native app-security check (OWASP A01, object-level authorization / BOLA),
+    /// parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and
     /// [`exploit_path_traversal_from_vantage`](Self::exploit_path_traversal_from_vantage)
     /// and built on the same HTTP witness seam, differing in the capability name,
     /// the diagnostic, and that it carries an identity in `request_headers` (the
     /// attacker's own session or credential). `request_path` requests another user's
     /// object by id, and `marker` is a value present only in that object, so its
-    /// appearance in the response proves the identity crossed the ownership
-    /// boundary. An exploit is observed at `High`, a clean non-exploit at `High`, and
-    /// an abnormal probe at `Low` (ADR-0010, RK-002). The diagnostic is carried only
-    /// when the object was actually read (`observation.value`), like the siblings.
+    /// appearance proves that object's body was served to this request. An exploit
+    /// is observed at `High`, a clean non-exploit at `High`, and an abnormal probe at
+    /// `Low` (ADR-0010, RK-002). The diagnostic is carried only when the object was
+    /// actually read (`observation.value`), like the siblings.
     ///
-    /// `request_headers` legitimately carries a credential (the attacker's token);
-    /// it is recorded in the evidence reproduction so a replay re-sends the same
-    /// identity. The evidence store is already treated as sensitive
-    /// (docs/rules/security.md section 4); the playground token is a non-secret
-    /// fixture, and redaction for a real target is that existing model, not new
-    /// here. Errors with [`Error::LabUnavailable`] on a context with no lab bound.
+    /// A confident "not exploitable" PASS here means only "this identity did not read
+    /// that object", NOT "the endpoint enforces ownership". If the target silently
+    /// ignores or rejects the credential and answers a marker-less 200 (not a
+    /// redirect), the probe never established that the identity took effect, yet it
+    /// reads `false`/`High`. So an IDOR check MUST be paired with a positive control:
+    /// a baseline read of the attacker's OWN object succeeding in the same run, which
+    /// proves the identity authenticated (the fix-replay loop test does exactly this).
+    /// Enforcing that corroboration inside the capability is deferred to a follow-up,
+    /// under ADR-0010's corroboration-deferred model that the sibling single-probe
+    /// checks also sit under.
+    ///
+    /// `request_headers` legitimately carries a credential (the attacker's token),
+    /// and it is recorded VERBATIM in the evidence reproduction and the canonical
+    /// JSON so a replay re-sends the same identity (security.md section 4/8: the
+    /// store is sensitive, and a witness may capture credentials for a deterministic
+    /// replay). The terminal report does not print it, but a shared renderer (the M2
+    /// SARIF or HTML attack graph) must redact the `request_headers` key before the
+    /// evidence leaves the box; nothing redacts it today, so that is a follow-up (the
+    /// named key is the hook). For the playground the token is a non-secret fixture.
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound.
     pub async fn exploit_idor_from_vantage(
         &self,
         target: &ScopedTarget,
@@ -457,9 +472,7 @@ impl TestContext {
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
     /// base id to resolve the run-scoped `EvidenceId` (issue #14). Shared by
-    /// [`run`](Self::run), [`connect_from_vantage`](Self::connect_from_vantage),
-    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and
-    /// [`exploit_path_traversal_from_vantage`](Self::exploit_path_traversal_from_vantage).
+    /// [`run`](Self::run) and every `*_from_vantage` capability method.
     fn record_draft(&self, draft: EvidenceDraft) -> DraftRef {
         let mut drafts = self.evidence_drafts.borrow_mut();
         let index = drafts.len();
@@ -503,27 +516,29 @@ fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
 }
 
 /// The ADR-0009 domain diagnostic for a successful IDOR: the cause names the
-/// `marker`, another user's data, returned to a request that authenticated as a
-/// different user, so the endpoint served an object by id without checking it
-/// belongs to the caller; the remediation is to enforce that ownership check.
+/// `marker`, another user's data, which the endpoint served by id without checking
+/// it belongs to the requesting identity; the remediation is to enforce that
+/// ownership check. The cause does not claim the request "authenticated as a
+/// different user": the check observes only that another user's object came back,
+/// not that a credential was validated (the endpoint may ignore identity entirely,
+/// as the playground mvp does), so it states what the marker proves and no more.
 /// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
 /// without Docker (`idor_diagnostic_names_the_marker_and_the_fix`).
 fn idor_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
-            "the response returned {marker:?}, another user's data, though the request \
-             authenticated as a different user, so the endpoint served an object by id without \
-             checking that it belongs to the authenticated caller"
+            "the response returned {marker:?}, a value present only in another user's object, \
+             so the endpoint served an object by id without checking that it belongs to the \
+             requesting identity"
         ),
         remediation: "enforce an authorization check that the requested object belongs to the \
-             authenticated identity, so a caller cannot read another user's object by its id"
+             requesting identity, so a caller cannot read another user's object by its id"
             .to_owned(),
     }
 }
 
-/// What [`TestContext::run`], [`TestContext::connect_from_vantage`],
-/// [`TestContext::exploit_sqli_from_vantage`] and
-/// [`TestContext::exploit_path_traversal_from_vantage`] return:
+/// What [`TestContext::run`], [`TestContext::connect_from_vantage`] and the
+/// `*_from_vantage` capability methods (SQLi, path traversal, IDOR) return:
 /// the capability's [`Observation`] and a per-test reference to the evidence it
 /// produced. Passing it to [`expect`](TestContext::expect) links the judgement to
 /// that evidence automatically.
@@ -533,9 +548,8 @@ fn idor_diagnostic(marker: &str) -> Diagnostic {
 /// `Observation` a `Capability` returns to all carry a link they cannot fill, and
 /// would make `execute`'s observation meaningless until `run` rewrote it. So the
 /// observation stays a plain signal and only a capability's result carries a link
-/// (ADR-0010, issue #14). Only `run`, `connect_from_vantage`,
-/// `exploit_sqli_from_vantage` and `exploit_path_traversal_from_vantage` construct
-/// one.
+/// (ADR-0010, issue #14). Only `run`, `connect_from_vantage`, and the
+/// `*_from_vantage` capability methods construct one.
 ///
 /// The reference is a per-test index (see [`DraftRef`]), so a
 /// `Recorded` is only meaningful to the context that produced it. Judging one on
