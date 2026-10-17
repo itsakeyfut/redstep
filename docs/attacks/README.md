@@ -112,6 +112,9 @@ first.
 - [Brute Force](brute-force/README.md)
 - [JWT Attacks](jwt-attacks.md)
 - [OAuth Vulnerabilities](oauth-vulnerabilities.md)
+- [HTTP Request Smuggling](http-request-smuggling.md)
+- [HTTP Host Header Attacks](http-host-header-attacks.md)
+- [Web Cache Poisoning](web-cache-poisoning.md)
 
 ### API
 
@@ -145,12 +148,6 @@ moves up into the genre index above, as a link, when its file is written; this
 section is the coverage gap made visible. Pure categories that are not a single
 technique (security misconfiguration, improper inventory management, unsafe
 consumption of APIs) are deliberately left out.
-
-**Request and protocol**
-
-- HTTP request smuggling
-- HTTP Host header attacks
-- Web cache poisoning
 
 **API**
 
