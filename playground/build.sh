@@ -14,8 +14,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 docker build -t redstep/db:mvp  "$here/db"
 docker build -t redstep/api:mvp "$here/api"
 docker build -t redstep/web:mvp "$here/web"
-# The patched api variant (#54): same crate, the `fixed` feature parameterizes
-# the lookup query. The attack-to-defense loop replays the same probe against it.
+# The SSRF canary (#65): an out-of-band witness point the coerced api reaches over
+# the lab network; the orchestrator reads its logs to witness the callback.
+docker build -t redstep/canary:mvp "$here/canary"
+# The patched api variant (#54, #63, #64, #65): same crate, the `fixed` feature
+# parameterizes the vulnerable handlers. The attack-to-defense loops replay the
+# same probes against it.
 docker build -t redstep/api:fixed --build-arg FEATURES=fixed "$here/api"
 
-echo "built redstep/db:mvp, redstep/api:mvp, redstep/api:fixed, redstep/web:mvp"
+echo "built redstep/db:mvp, redstep/api:mvp, redstep/api:fixed, redstep/web:mvp, redstep/canary:mvp"

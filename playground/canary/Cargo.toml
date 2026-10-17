@@ -1,0 +1,16 @@
+[package]
+name = "redstep-playground-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The binary is copied as `/app` by the Dockerfile and run as the entrypoint and
+# the HEALTHCHECK (`/app healthcheck`).
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+# A tiny blocking HTTP server; the canary needs no async runtime or client crate
+# (it only records what it receives and returns 200).
+tiny_http = "0.12.0"

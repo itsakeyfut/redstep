@@ -88,6 +88,7 @@ fn handle(url: &str, auth: Option<&str>) -> (u16, String) {
                 Err(code) => (code, "not found".to_owned()),
             }
         }
+        "/fetch" => serve_fetch(&percent_decode(&query_param(query, "url").unwrap_or_default())),
         _ => (404, "not found".to_owned()),
     }
 }
@@ -197,6 +198,63 @@ fn serve_file(path: &str) -> Result<String, u16> {
         Ok(full) if full.starts_with(&root) => std::fs::read_to_string(full).map_err(|_| 404),
         _ => Ok("refused: the path escapes the web root\n".to_owned()),
     }
+}
+
+/// The `/fetch?url=` handler, by build. The default (mvp image) is THE FOURTH
+/// VULNERABILITY (SSRF): it fetches the caller-named `url` server-side with no
+/// allowlist, so a crafted `url` coerces this server to reach an in-lab host it
+/// should never contact (the canary). The witness is OUT-OF-BAND: the proof is the
+/// request arriving AT the canary, so this returns only the fetched status and
+/// NEVER the fetched body (the body alone would not reveal the SSRF). A malformed
+/// url is a 400, a fetch failure a 502; neither panics.
+#[cfg(not(feature = "fixed"))]
+fn serve_fetch(url: &str) -> (u16, String) {
+    match parse_http_url(url) {
+        Some((host, port, path)) => match http_get(&host, port, &path) {
+            Ok((code, _body)) => (200, format!("fetched {code}\n")),
+            Err(e) => (502, format!("fetch error: {e}\n")),
+        },
+        None => (400, "bad url\n".to_owned()),
+    }
+}
+
+/// THE FIX (`redstep/api:fixed`): fetch only a host on a small outbound allowlist;
+/// an internal/in-lab host like the canary is not on it and is refused WITHOUT a
+/// fetch, so the canary never receives the request and the out-of-band witness
+/// stays absent. A refused request answers `200` with a safe body (mirrors the
+/// other fixes: a confident clean negative, not a non-zero exit). The allowlisted
+/// branch returns a canned body rather than making an outbound call, because the
+/// egress-less lab has no such external host and the SSRF probe never targets it;
+/// a real deployment would fetch it.
+#[cfg(feature = "fixed")]
+fn serve_fetch(url: &str) -> (u16, String) {
+    const ALLOWED: &[&str] = &["updates.example.com"];
+    match parse_http_url(url) {
+        Some((host, _, _)) if ALLOWED.contains(&host.as_str()) => {
+            (200, "fetched (allowlisted)\n".to_owned())
+        }
+        _ => (200, "refused: host not on the outbound allowlist\n".to_owned()),
+    }
+}
+
+/// Parse `http://host[:port]/path` into `(host, port, path)` for the `/fetch`
+/// client; default port 80, default path `/`. Minimal and fixture-only: it returns
+/// `None` for anything it does not understand and never panics (a malformed url
+/// must not kill the single-threaded request loop).
+fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (authority, 80u16),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_owned(), port, path.to_owned()))
 }
 
 /// Run a simple (unprepared) query and return its rows as `|`-joined columns,
