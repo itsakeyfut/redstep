@@ -3111,6 +3111,36 @@ mod tests {
         );
     }
 
+    /// The body of bob's seeded object (`objects` id 2); its presence in a response
+    /// alice made witnesses that she read across the ownership boundary (#64). Kept
+    /// in sync with the db seed, which `idor_witness_matches_the_seed` checks offline.
+    const IDOR_WITNESS: &str = "REDSTEP_IDOR_WITNESS_9C2E";
+
+    /// The attacker alice's seeded token (mapped to user `alice` by the api), sent as
+    /// the `Authorization` header; bob's object is id 2, alice's own is id 1 whose
+    /// body is the positive-control marker.
+    const IDOR_ALICE_TOKEN: &str = "tok-alice";
+    const IDOR_VICTIM_OBJECT: &str = "/object?id=2";
+    const IDOR_OWN_OBJECT: &str = "/object?id=1";
+    const IDOR_OWN_BODY: &str = "alice private note";
+
+    /// Guard: bob's object body the IDOR check witnesses is the one the db image
+    /// actually seeds. Runs offline on every gate, unlike the Docker-gated IDOR
+    /// tests which self-skip without Docker or the built images, so a drift between
+    /// the two copies of the witness cannot hide behind that self-skip and silently
+    /// disarm the check (RK-014, CLAUDE.md row 6). `include_str!` resolves the path
+    /// across the workspace `exclude` boundary at compile time. Mutation: change
+    /// `IDOR_WITNESS` or the seed literal so the two differ -> this fails.
+    #[test]
+    fn idor_witness_matches_the_seed() {
+        let seed = include_str!("../../../playground/db/seed.sql");
+        assert!(
+            seed.contains(IDOR_WITNESS),
+            "IDOR_WITNESS {IDOR_WITNESS:?} is not seeded in playground/db/seed.sql; \
+             the check and the db seed have drifted"
+        );
+    }
+
     /// A one-shot busybox probe: fetch web's `/lookup?name=<name>` and succeed
     /// (exit 0) only if the response carries the witness flag, so the existing
     /// exit-code seam (`classify_probe`) reads the result. `name` is interpolated
@@ -4203,6 +4233,279 @@ mod tests {
                 "replaying the witness reproduces the recorded observation"
             );
             assert_eq!(replayed.confidence, recorded.confidence);
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native IDOR check verdicts `Fail` against the vulnerable playground api and
+    /// the `Fail` carries the ADR-0009 IDOR diagnostic (#64 AC 1). alice (her token
+    /// in the `Authorization` header) requesting bob's object id witnesses bob's
+    /// marker; alice requesting her OWN object does not, so the differential is real
+    /// rather than a constant-true probe. Mutation: add the ownership check to the
+    /// api `serve_object` (the fix) -> alice no longer reads bob's object -> the
+    /// verdict assertion fails; change the diagnostic gate from
+    /// `observation.value.then(..)` to `Some(..)` in `exploit_idor_from_vantage` ->
+    /// the control carries a diagnostic -> the `control.diagnostic.is_none()` fails.
+    /// The draft-mirrors-observation check is RK-011.
+    #[test]
+    fn idor_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping idor_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping idor_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat api+db environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let alice_auth = [("Authorization".to_owned(), IDOR_ALICE_TOKEN.to_owned())];
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_idor_from_vantage(&target, IDOR_VICTIM_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the vantage IDOR probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // alice reading her OWN object does not carry bob's marker: the
+            // differential is real, not a probe that reads anything as a hit.
+            let control = ctx
+                .exploit_idor_from_vantage(&target, IDOR_OWN_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the own-object control ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable playground is a security FAIL"
+            );
+            assert!(
+                observed,
+                "alice read bob's object across the ownership boundary"
+            );
+            assert!(
+                !control.observation.value,
+                "alice reading her own object never carries bob's marker: the differential is real"
+            );
+            assert!(
+                control.diagnostic.is_none(),
+                "a non-exploit (the own-object control) carries no diagnostic: the ADR-0009 cause is attached only to a real IDOR, not a clean result"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(IDOR_WITNESS)
+                    && diagnostic.probable_cause.contains("another user"),
+                "the domain cause names the marker and that it is another user's data: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("authorization"),
+                "the domain remediation names the authorization check: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation and is tagged as the
+            // IDOR capability, not a faithful-looking projection of a constant nor
+            // mislabelled as another technique.
+            assert_eq!(drafts[0].capability, "http_idor_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a daemon or the built images including
+    /// `redstep/api:fixed`): the IDOR attack-to-defense loop closes (#64 AC 2),
+    /// parallel to the SQLi and traversal loops. alice-reads-bob is recorded against
+    /// the vulnerable api and its own witness (the identity header included) replays
+    /// as exploited on a fresh vulnerable lab and not-exploitable, confidently so,
+    /// against the ownership-checking `redstep/api:fixed`. The #64 check then verdicts
+    /// `Pass` against the fixed lab. The labs differ only in the api image, so the
+    /// difference is the fix.
+    ///
+    /// A positive control probes alice's OWN object on the fixed lab and requires her
+    /// body back; it distinguishes a working endpoint from a "fix" that denied every
+    /// request (which would satisfy "the IDOR is closed" just as well, RK-016).
+    /// Taking the witness from the recorder round-trips it through
+    /// `parse_http_witness`, identity headers included, so a replay that rejected
+    /// what the seam writes would `Err`.
+    ///
+    /// Mutation: revert the api `serve_object` to the no-ownership-check form -> the
+    /// replay observes `true` and the fixed-lab check `Fail`s -> this fails. Make the
+    /// `fixed` `serve_object` deny everyone (serve no body) -> `benign.value` is
+    /// `false` -> this fails (the gap the positive control closes).
+    #[test]
+    fn idor_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!("skipping idor_fix_and_replay_closes_the_loop: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/api:fixed", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping idor_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat api+db environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let alice_auth = [("Authorization".to_owned(), IDOR_ALICE_TOKEN.to_owned())];
+
+            // Record a genuine IDOR against the vulnerable lab and take ITS witness,
+            // so replaying round-trips the recorder's own output (identity headers
+            // included) through `parse_http_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable playground");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_idor_vantage",
+                IDOR_VICTIM_OBJECT,
+                IDOR_WITNESS,
+                &alice_auth,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording IDOR ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for two checks on one bring-up: a positive
+            // control, then the #64 check's Pass.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed playground");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+
+            // Positive control: alice reads her OWN object on the fixed lab and gets
+            // her body back, so the fix is a working endpoint and not one that denies
+            // everyone. Her own body is the marker.
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_idor_vantage",
+                IDOR_OWN_OBJECT,
+                IDOR_OWN_BODY,
+                &alice_auth,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the own-object read ran");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), net);
+            let recorded = ctx
+                .exploit_idor_from_vantage(&target, IDOR_VICTIM_OBJECT, IDOR_WITNESS, &alice_auth)
+                .await
+                .expect("the fixed-lab check ran");
+            let verdict = ctx.expect(&recorded).to_be(false);
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely reads bob's object across the ownership boundary"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                benign.value,
+                "positive control: alice still reads her own object on the fixed lab, so the fix is a working endpoint and not one that denies everyone"
+            );
+            assert_eq!(
+                benign.confidence,
+                Confidence::High,
+                "the own-object read is a confident read, not an abnormal probe"
+            );
+            assert_eq!(
+                verdict,
+                crate::Verdict::Pass,
+                "the #64 check passes against the fixed lab"
+            );
         });
     }
 }

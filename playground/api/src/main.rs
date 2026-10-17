@@ -43,13 +43,21 @@ fn main() {
 
     let server = tiny_http::Server::http("0.0.0.0:8081").expect("bind :8081");
     for request in server.incoming_requests() {
-        let (status, body) = handle(request.url());
+        // The caller's identity for `/object` rides the `Authorization` header, as
+        // a session would; the fixture maps the token to a user. Other endpoints
+        // ignore it.
+        let auth = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().to_owned());
+        let (status, body) = handle(request.url(), auth.as_deref());
         let response = tiny_http::Response::from_string(body).with_status_code(status);
         let _ = request.respond(response);
     }
 }
 
-fn handle(url: &str) -> (u16, String) {
+fn handle(url: &str, auth: Option<&str>) -> (u16, String) {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     match path {
         // Healthy only when the seeded db answers, so web's health (which reaches
@@ -72,7 +80,65 @@ fn handle(url: &str) -> (u16, String) {
                 Err(code) => (code, "not found".to_owned()),
             }
         }
+        "/object" => {
+            let id = query_param(query, "id").unwrap_or_default();
+            let caller = auth.and_then(user_for_token);
+            match serve_object(&id, caller) {
+                Ok(body) => (200, body),
+                Err(code) => (code, "not found".to_owned()),
+            }
+        }
         _ => (404, "not found".to_owned()),
+    }
+}
+
+/// Map a seeded `Authorization` token to the user it stands for. A fixture stand-in
+/// for a real session/token store; an unknown token is no identity.
+fn user_for_token(token: &str) -> Option<&'static str> {
+    match token {
+        "tok-alice" => Some("alice"),
+        "tok-bob" => Some("bob"),
+        _ => None,
+    }
+}
+
+/// The `/object?id=` handler, by build. The default (mvp image) is THE THIRD
+/// VULNERABILITY: it serves the object by id with NO ownership check, so a caller
+/// reads any user's object (IDOR). The id is a bound parameter, so the endpoint is
+/// not itself a SQL injection; the flaw is the missing authorization. Returns the
+/// object body, or an HTTP status to send on failure.
+#[cfg(not(feature = "fixed"))]
+fn serve_object(id: &str, _caller: Option<&str>) -> Result<String, u16> {
+    let n: i32 = id.parse().map_err(|_| 404u16)?;
+    let mut client = postgres::Client::connect(DB_CONN, postgres::NoTls).map_err(|_| 503u16)?;
+    let rows = client
+        .query("SELECT body FROM objects WHERE id = $1", &[&n])
+        .map_err(|_| 500u16)?;
+    match rows.first() {
+        Some(row) => Ok(row.get::<_, &str>(0).to_owned()),
+        None => Err(404),
+    }
+}
+
+/// THE FIX (`redstep/api:fixed`): serve the object only to the authenticated owner.
+/// A missing identity, an unparsable id, or a non-owner caller gets a `200` with a
+/// safe body that never contains another user's data, so the probe reads a
+/// confident clean negative rather than a non-zero exit it would treat as
+/// inconclusive (the invariant is that another user's body never leaves, not the
+/// HTTP status of a refusal).
+#[cfg(feature = "fixed")]
+fn serve_object(id: &str, caller: Option<&str>) -> Result<String, u16> {
+    const DENIED: &str = "forbidden: not your object\n";
+    let (Ok(n), Some(caller)) = (id.parse::<i32>(), caller) else {
+        return Ok(DENIED.to_owned());
+    };
+    let mut client = postgres::Client::connect(DB_CONN, postgres::NoTls).map_err(|_| 503u16)?;
+    let rows = client
+        .query("SELECT owner, body FROM objects WHERE id = $1", &[&n])
+        .map_err(|_| 500u16)?;
+    match rows.first() {
+        Some(row) if row.get::<_, &str>(0) == caller => Ok(row.get::<_, &str>(1).to_owned()),
+        _ => Ok(DENIED.to_owned()),
     }
 }
 
