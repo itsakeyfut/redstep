@@ -30,7 +30,7 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, LabNetwork,
-    http_witness_exploit_from, ssrf_exploit_from, tcp_reachable_from,
+    http_witness_exploit_from, ssrf_exploit_from, ssrf_token, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -496,12 +496,15 @@ impl TestContext {
         canary_alias: &str,
         canary_port: u16,
         canary_container: &str,
-        token: &str,
     ) -> Result<Recorded<bool>> {
         let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
             reason: "no attacker vantage is bound to this run; exploit_ssrf_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // Mint a fresh, unique per-probe token here, not from the caller: this
+        // coercion's canary callback must be distinguishable and a caller cannot
+        // pass a weak or forgeable one.
+        let token = ssrf_token();
         let (observation, draft) = ssrf_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -509,7 +512,7 @@ impl TestContext {
             canary_alias,
             canary_port,
             canary_container,
-            token,
+            &token,
             DEFAULT_CONNECT_TIMEOUT,
         )
         .await?;
@@ -1246,7 +1249,6 @@ mod tests {
             "canary",
             8082,
             "ignored-container",
-            "tok",
         ));
         assert!(
             matches!(result, Err(Error::LabUnavailable { .. })),

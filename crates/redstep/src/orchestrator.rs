@@ -1587,9 +1587,20 @@ pub(crate) async fn replay_http_witness_probe(
 /// token absent is not-exploitable (`false`/`High`); any other exit code, or an
 /// unclean exit (so the coercion itself did not complete), is `Low` (value
 /// `false`), because the probe did not establish the target's behaviour and must
-/// not read as a confident "not exploitable" (RK-002, ADR-0010). Pure given the
-/// inputs, so the mapping is unit-tested without Docker.
-fn classify_ssrf(state: &ContainerState, seen: bool) -> Observation<bool> {
+/// not read as a confident "not exploitable" (RK-002, ADR-0010). A followed
+/// redirect forces `Low` first (before the exit code): busybox `wget` exits 0 on a
+/// followed 3xx, but the redirect may have taken the probe somewhere other than the
+/// app's `/fetch`, so the coercion may never have fired and a token-absent result
+/// is not a confident "not exploitable" (the same hazard `classify_http_witness`
+/// guards for the body seam, #55). Pure given the inputs, so the mapping is
+/// unit-tested without Docker.
+fn classify_ssrf(state: &ContainerState, seen: bool, redirected: bool) -> Observation<bool> {
+    if redirected {
+        return Observation {
+            value: false,
+            confidence: Confidence::Low,
+        };
+    }
     match finished_exit_code(state) {
         Ok(0) if seen => Observation {
             value: true,
@@ -1733,6 +1744,11 @@ pub(crate) async fn ssrf_exploit_from(
     token: &str,
     timeout: Duration,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
+    // Fail-closed on a weak token before it reaches the URL or the `contains`
+    // check: an empty/short token would false-witness (an empty token makes
+    // `logs.contains(token)` vacuously true), and this fronts the replay path where
+    // the token is untrusted witness input.
+    validate_ssrf_token(token)?;
     let request_path = format!("/fetch?url=http://{canary_alias}:{canary_port}/{token}");
     // Light fail-closed validation of the coercion path (an untrusted replay
     // witness could carry a crafted one): a leading `/` keeps the authority the
@@ -1749,17 +1765,31 @@ pub(crate) async fn ssrf_exploit_from(
     let applied = Duration::from_secs(secs);
     let url = format!("http://{}:{}{}", app.host(), app.port(), request_path);
     let cmd = wget_cmd(&url, secs, &[]);
-    let (state, _body, _headers) = run_probe_capturing(
+    let (state, _body, headers) = run_probe_capturing(
         docker,
         vantage.name(),
         cmd,
         applied + Duration::from_secs(5),
     )
     .await?;
-    // The witness is out-of-band: did the token reach the canary's logs?
-    let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
-    let seen = canary_out.contains(token) || canary_err.contains(token);
-    let observation = classify_ssrf(&state, seen);
+    // The witness is out-of-band. The app's fetch is synchronous, but the canary's
+    // stdout -> Docker log propagation can lag, so a single read right after the
+    // probe could miss a just-arrived hit and read a confident false-negative (a
+    // false PASS). Poll the canary's logs over a bounded window, returning as soon
+    // as the token appears; a token still absent after the window is a genuine
+    // not-reached.
+    let mut seen = false;
+    for attempt in 0..10 {
+        let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
+        if canary_out.contains(token) || canary_err.contains(token) {
+            seen = true;
+            break;
+        }
+        if attempt + 1 < 10 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let observation = classify_ssrf(&state, seen, response_was_redirected(&headers));
     let spec = format!("{}:{}", app.host(), app.port());
     let draft = ssrf_draft(
         vantage.segment(),
@@ -1772,6 +1802,34 @@ pub(crate) async fn ssrf_exploit_from(
         applied,
     );
     Ok((observation, draft))
+}
+
+/// A fail-closed check that the per-probe SSRF `token` is safe to embed in the
+/// coercion URL and specific enough that `logs.contains(token)` cannot match
+/// stale or unrelated canary-log content: at least 8 characters and only URL-safe
+/// unreserved bytes. An empty or too-short token would false-witness. The
+/// capability caller ([`ssrf_token`]) mints a fresh unique token per probe; this
+/// is the defensive floor for any caller, including a replay from an untrusted
+/// witness. Pure, so it is guarded offline.
+fn validate_ssrf_token(token: &str) -> Result<()> {
+    let safe = token.len() >= 8
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'));
+    if !safe {
+        return Err(Error::InvalidTarget {
+            spec: token.to_owned(),
+            reason: "the SSRF token must be at least 8 URL-safe (unreserved) characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// A fresh, unique, URL-safe per-probe SSRF token (reuses [`run_id`]'s uniqueness).
+/// Minted by the capability caller so each coercion's canary callback is
+/// distinguishable and cannot match a prior probe's log line.
+pub(crate) fn ssrf_token() -> String {
+    format!("ssrf-{}", run_id())
 }
 
 /// Replay an SSRF witness against `env` (ADR-0022, #65), parallel to
@@ -1790,9 +1848,22 @@ pub(crate) async fn replay_ssrf_probe(
     env: &Environment,
     witness: &Reproduction,
 ) -> Result<Observation<bool>> {
-    let (segment, target, _request_path, token, canary_alias, canary_port, timeout) =
+    let (segment, target, request_path, token, canary_alias, canary_port, timeout) =
         parse_ssrf_witness(witness)?;
     let scoped = Scope::from_environment(env).resolve(&target)?;
+    // Reproduce the recorded coercion, not a freshly-built one: the witnessed
+    // request_path must be the one this canary and token regenerate, else the
+    // witness was tampered and the replay would verify a different attack than the
+    // one recorded (ADR-0022). `ssrf_exploit_from` rebuilds the same path, so this
+    // refuses a mismatch rather than silently replaying a different coercion.
+    let expected_path = format!("/fetch?url=http://{canary_alias}:{canary_port}/{token}");
+    if request_path != expected_path {
+        return Err(Error::InvalidTarget {
+            spec: request_path,
+            reason: "replay witness request_path does not match its recorded canary and token"
+                .to_owned(),
+        });
+    }
 
     let lab = bring_up(docker, env).await?;
     let probed = async {
@@ -4905,17 +4976,52 @@ mod tests {
             exit_code: code,
             ..Default::default()
         };
-        let seen = classify_ssrf(&state(Some(EXITED), Some(0)), true);
+        let seen = classify_ssrf(&state(Some(EXITED), Some(0)), true, false);
         assert!(seen.value);
         assert_eq!(seen.confidence, Confidence::High);
 
-        let clean = classify_ssrf(&state(Some(EXITED), Some(0)), false);
+        let clean = classify_ssrf(&state(Some(EXITED), Some(0)), false, false);
         assert!(!clean.value);
         assert_eq!(clean.confidence, Confidence::High);
 
-        let abnormal = classify_ssrf(&state(Some(EXITED), Some(1)), true);
+        let abnormal = classify_ssrf(&state(Some(EXITED), Some(1)), true, false);
         assert!(!abnormal.value);
         assert_eq!(abnormal.confidence, Confidence::Low);
+
+        // A followed redirect is Low even on a clean exit with the token seen: the
+        // probe may not have reached the app's /fetch, so the coercion may not have
+        // fired. Mutation: drop the `redirected` short-circuit in classify_ssrf ->
+        // this reads true/High -> fails.
+        let redirected = classify_ssrf(&state(Some(EXITED), Some(0)), true, true);
+        assert!(!redirected.value);
+        assert_eq!(redirected.confidence, Confidence::Low);
+    }
+
+    /// Guard: `validate_ssrf_token` fails closed on a token that is empty, too
+    /// short, or not URL-safe. An empty token would make the canary-log `contains`
+    /// check vacuously true (a forged witness). Mutation: drop the length check or
+    /// the char check in `validate_ssrf_token` -> the matching case passes -> this
+    /// fails.
+    #[test]
+    fn validate_ssrf_token_fails_closed() {
+        assert!(validate_ssrf_token("redstep-ssrf-witness-7e1a").is_ok());
+        assert!(validate_ssrf_token("ssrf-redstep-1a2b-3").is_ok());
+        assert!(
+            validate_ssrf_token("").is_err(),
+            "an empty token is refused"
+        );
+        assert!(
+            validate_ssrf_token("short").is_err(),
+            "a sub-8-char token is refused"
+        );
+        assert!(
+            validate_ssrf_token("has space 1234").is_err(),
+            "a non-URL-safe token is refused"
+        );
+        assert!(
+            validate_ssrf_token("tok/../../x").is_err(),
+            "a path-traversal-ish token is refused ('/' is not unreserved)"
+        );
     }
 
     /// Guard: the SSRF draft attributes the witness to the coerced app (`target`),
@@ -5090,7 +5196,6 @@ mod tests {
                     SSRF_CANARY_ALIAS,
                     SSRF_CANARY_PORT,
                     &canary_container,
-                    SSRF_TOKEN,
                 )
                 .await
                 .expect("the vantage SSRF probe ran");
@@ -5311,7 +5416,6 @@ mod tests {
                     SSRF_CANARY_ALIAS,
                     SSRF_CANARY_PORT,
                     &fixed_canary,
-                    SSRF_TOKEN,
                 )
                 .await
                 .expect("the fixed-lab check ran");
