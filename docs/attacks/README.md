@@ -140,6 +140,13 @@ first.
 
 ### Network
 
+- [Adversary-in-the-Middle](adversary-in-the-middle/README.md)
+- [Network Sniffing](network-sniffing.md)
+- [Network Service Discovery](network-service-discovery.md)
+- [Exploitation of Remote Services](exploitation-of-remote-services.md)
+- [DNS Spoofing and Cache Poisoning](dns-spoofing.md)
+- [VLAN Hopping](vlan-hopping.md)
+
 ### Container
 
 ### Cloud
@@ -151,26 +158,26 @@ first.
 - [Brute Force](brute-force/README.md)
 - [JWT Attacks](jwt-attacks.md)
 - [OAuth Vulnerabilities](oauth-vulnerabilities.md)
+- [Adversary-in-the-Middle](adversary-in-the-middle/README.md)
 
 ## Backlog (not yet written)
 
 This is the coverage gap made visible: known techniques still to catalogue, by genre. A
 name moves up into the genre index above, as a link, when its file is written.
 
-The Web and API genres are complete to the mainstream set drawn from OWASP Top 10
-(2021), the OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy;
-pure categories that are not a single technique (security misconfiguration, improper
-inventory management, unsafe consumption of APIs) were deliberately left out. The next
-frontier is the genres redstep's scope reaches beyond the application layer, none
-catalogued yet:
+The Web, API, and Network genres are complete to their mainstream sets: Web and API from
+OWASP Top 10 (2021), the OWASP API Security Top 10 (2023), and the PortSwigger Web
+Security Academy (pure categories that are not a single technique, security
+misconfiguration, improper inventory management, unsafe consumption of APIs, were
+deliberately left out); Network from ATT&CK Enterprise (with Evil Twin and VLAN hopping
+kept as `capability: none` and marked out of the software-defined lab's scope). The next
+frontier is the genres still uncatalogued:
 
-- **Network:** the classic on-path and discovery techniques (ARP/DNS spoofing,
-  man-in-the-middle, service discovery to exploitation), from ATT&CK Enterprise.
 - **Cloud:** instance metadata credential theft, IAM misconfiguration and privilege
   escalation, from the ATT&CK Cloud matrices.
 - **Container:** image and runtime escapes, from the ATT&CK Containers matrix.
-- **Identity:** the credential-access techniques beyond the brute-force family already
-  listed.
+- **Identity:** the credential-access techniques beyond the brute-force and
+  name-resolution-poisoning families already listed.
 
-Enumerate each genre from its authoritative taxonomy, as the Web and API genres were,
-before writing its files.
+Enumerate each genre from its authoritative taxonomy, as the Web, API, and Network
+genres were, before writing its files.
