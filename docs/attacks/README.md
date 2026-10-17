@@ -95,6 +95,8 @@ first.
 ### Web
 
 - [SQL Injection](sql-injection.md)
+- [Cross-Site Scripting](xss.md)
+- [OS Command Injection](command-injection.md)
 - [Insecure Direct Object Reference](idor.md)
 - [Path Traversal](path-traversal.md)
 - [Server-Side Request Forgery](ssrf.md)
@@ -110,3 +112,56 @@ first.
 - [Server-Side Request Forgery](ssrf.md)
 
 ### Identity
+
+## Backlog (not yet written)
+
+Known Web and API techniques still to catalogue, drawn from OWASP Top 10 (2021), the
+OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy. A name
+moves up into the genre index above, as a link, when its file is written; this
+section is the coverage gap made visible. Pure categories that are not a single
+technique (security misconfiguration, improper inventory management, unsafe
+consumption of APIs) are deliberately left out.
+
+**Injection**
+
+- XML external entity (XXE) injection
+- Server-side template injection (SSTI)
+- NoSQL injection
+- Insecure deserialization
+
+**Access control**
+
+- Privilege escalation (broken function-level authorization)
+
+**Authentication and identity**
+
+- Brute force (a directory: password guessing, password spraying, credential stuffing, password cracking)
+- JWT attacks
+- OAuth vulnerabilities
+
+**Client-side**
+
+- Cross-site request forgery (CSRF)
+- CORS misconfiguration
+- Clickjacking
+- Open redirect
+
+**Request and protocol**
+
+- HTTP request smuggling
+- HTTP Host header attacks
+- Web cache poisoning
+
+**API**
+
+- Mass assignment (broken object property level authorization)
+- Unrestricted resource consumption
+- Business logic vulnerabilities
+- GraphQL API vulnerabilities
+
+**Other**
+
+- File upload vulnerabilities
+- Race conditions
+- Information disclosure
+- Prototype pollution
