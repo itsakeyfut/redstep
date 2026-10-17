@@ -115,6 +115,8 @@ first.
 - [HTTP Request Smuggling](http-request-smuggling.md)
 - [HTTP Host Header Attacks](http-host-header-attacks.md)
 - [Web Cache Poisoning](web-cache-poisoning.md)
+- [Mass Assignment](mass-assignment.md)
+- [Business Logic Vulnerabilities](business-logic-vulnerabilities.md)
 
 ### API
 
@@ -125,6 +127,10 @@ first.
 - [Brute Force](brute-force/README.md)
 - [JWT Attacks](jwt-attacks.md)
 - [OAuth Vulnerabilities](oauth-vulnerabilities.md)
+- [Mass Assignment](mass-assignment.md)
+- [Unrestricted Resource Consumption](unrestricted-resource-consumption.md)
+- [Business Logic Vulnerabilities](business-logic-vulnerabilities.md)
+- [GraphQL API Vulnerabilities](graphql-api-vulnerabilities.md)
 
 ### Network
 
@@ -148,13 +154,6 @@ moves up into the genre index above, as a link, when its file is written; this
 section is the coverage gap made visible. Pure categories that are not a single
 technique (security misconfiguration, improper inventory management, unsafe
 consumption of APIs) are deliberately left out.
-
-**API**
-
-- Mass assignment (broken object property level authorization)
-- Unrestricted resource consumption
-- Business logic vulnerabilities
-- GraphQL API vulnerabilities
 
 **Other**
 
