@@ -149,6 +149,11 @@ first.
 
 ### Container
 
+- [Container Escape to Host](container-escape-to-host.md)
+- [Container Runtime Socket Exposure](container-socket-exposure.md)
+- [Container and Resource Discovery](container-and-resource-discovery.md)
+- [Credentials in Container Images](credentials-in-container-images.md)
+
 ### Cloud
 
 - [Server-Side Request Forgery](ssrf.md)
@@ -166,6 +171,7 @@ first.
 - [Adversary-in-the-Middle](adversary-in-the-middle/README.md)
 - [Cloud IAM Privilege Escalation](cloud-iam-privilege-escalation.md)
 - [Valid Cloud Accounts](valid-cloud-accounts.md)
+- [Credentials in Container Images](credentials-in-container-images.md)
 
 ## Backlog (not yet written)
 
@@ -176,14 +182,15 @@ The Web, API, Network, and Cloud genres are complete to their mainstream sets: W
 API from OWASP Top 10 (2021), the OWASP API Security Top 10 (2023), and the PortSwigger
 Web Security Academy (pure categories that are not a single technique, security
 misconfiguration, improper inventory management, unsafe consumption of APIs, were
-deliberately left out); Network and Cloud from the ATT&CK Enterprise and Cloud matrices
-(with the techniques that need a radio, a physical switch, or a real cloud provider kept
-as `capability: none` and marked out of the software-defined lab's scope). The next
-frontier is the genres still uncatalogued:
+deliberately left out); Network, Cloud, and Container from the ATT&CK Enterprise, Cloud,
+and Containers matrices (with the techniques that need a radio, a physical switch, or a
+real cloud provider kept as `capability: none` and marked out of the software-defined
+lab's scope). The one genre still uncatalogued:
 
-- **Container:** image and runtime escapes, from the ATT&CK Containers matrix.
-- **Identity:** the credential-access techniques beyond the brute-force,
-  name-resolution-poisoning, and cloud-account families already listed.
+- **Identity:** the credential-access and session techniques beyond the brute-force,
+  name-resolution-poisoning, cloud-account, and image-credential families already listed
+  (for example Kerberoasting, pass-the-hash, token theft, and session hijacking), from
+  the ATT&CK Credential Access and related tactics.
 
-Enumerate each genre from its authoritative taxonomy, as the earlier genres were, before
-writing its files.
+Enumerate it from its authoritative taxonomy, as the earlier genres were, before writing
+its files.
