@@ -130,6 +130,14 @@ first.
 - [Information Disclosure](information-disclosure.md)
 - [Prototype Pollution](prototype-pollution.md)
 - [Session Hijacking](session-hijacking.md)
+- [File Inclusion (LFI and RFI)](file-inclusion.md)
+- [Code Injection](code-injection.md)
+- [XPath Injection](xpath-injection.md)
+- [LDAP Injection](ldap-injection.md)
+- [Server-Side Includes Injection](ssi-injection.md)
+- [IMAP/SMTP Injection](smtp-injection.md)
+- [HTTP Verb Tampering](http-verb-tampering.md)
+- [HTTP Parameter Pollution](http-parameter-pollution.md)
 
 ### API
 
@@ -146,6 +154,10 @@ first.
 - [GraphQL API Vulnerabilities](graphql-api-vulnerabilities.md)
 - [Race Conditions](race-conditions.md)
 - [Information Disclosure](information-disclosure.md)
+- [XPath Injection](xpath-injection.md)
+- [LDAP Injection](ldap-injection.md)
+- [HTTP Verb Tampering](http-verb-tampering.md)
+- [HTTP Parameter Pollution](http-parameter-pollution.md)
 
 ### Network
 
