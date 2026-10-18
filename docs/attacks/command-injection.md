@@ -5,7 +5,7 @@ attack: [T1190]
 owasp: [A03:2021-Injection]
 cwe: [CWE-78]
 targets: [web]
-capability: none
+capability: http_cmdi_vantage
 ---
 
 # OS Command Injection
@@ -30,21 +30,28 @@ callback, never the payload appearing in the body.
 
 ## How redstep exercises it
 
-Not yet implemented (`capability: none`). Two witness shapes fit: for a non-blind
-injection, a unique marker printed by the injected command returns in the response
-and the existing body-marker seam (`classify_http_witness`) reads it; for a blind
-injection, the out-of-band canary pattern
-([ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)) has
-the injected command call back to the in-lab canary. When built it would likely
-carry both, like a combined in-band and out-of-band check.
+Implemented in-band as `http_cmdi_vantage` (`exploit_command_injection_from_vantage`),
+a caller over the shared HTTP witness seam, like the SQL injection check. The target is
+a dedicated playground fixture, `redstep/cmdi`, because the other fixtures' runtime is
+distroless and cannot run a shell; its `GET /exec?cmd=` builds a shell command from the
+input on the mvp build and runs it with an argument vector (no shell) on the fixed one.
+The probe injects `;cat` of a sentinel file the image bakes in, and the witness is that
+file's body appearing in the response (read by `classify_http_witness`), which is the
+injected command's OUTPUT, never the injected bytes: the seam refuses a marker that
+appears in the request path, so a reflected path cannot forge it. The blind,
+out-of-band variant (the injected command calls back to the in-lab canary,
+[ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)) is a
+follow-up, not yet built.
 
 ## What a verdict means
 
-When implemented, a `Fail` (High) would mean an injected command executed: a marker
-it printed came back, or the canary recorded its callback. A `Pass` (not-exploitable)
-would mean this payload did not execute. A confident "not exploitable" would prove
-only that this payload and quoting did not break out, not that every shell context is
-safe ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+A `Fail` (High) means an injected command executed: the baked sentinel, which only a
+successful `cat` could return, came back in the response. A `Pass` (not-exploitable,
+High) means this payload did not execute. A followed redirect or an abnormal probe is
+`Inconclusive`. A confident "not exploitable" proves only that this payload and quoting
+did not break out of the command, not that every shell context is safe, and it does not
+cover the blind case, which has no in-response output and awaits the out-of-band variant
+([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
 
 ## Confinement
 

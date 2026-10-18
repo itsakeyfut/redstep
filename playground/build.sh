@@ -17,9 +17,14 @@ docker build -t redstep/web:mvp "$here/web"
 # The SSRF canary (#65): an out-of-band witness point the coerced api reaches over
 # the lab network; the orchestrator reads its logs to witness the callback.
 docker build -t redstep/canary:mvp "$here/canary"
+# The command-injection fixture (#85): a separate shell-bearing target (the api is
+# distroless and cannot run an injected command), so its `/exec` runs a command
+# built from request input. Its own `fixed` variant uses an argument vector.
+docker build -t redstep/cmdi:mvp "$here/cmdi"
 # The patched api variant (#54, #63, #64, #65): same crate, the `fixed` feature
 # parameterizes the vulnerable handlers. The attack-to-defense loops replay the
 # same probes against it.
 docker build -t redstep/api:fixed --build-arg FEATURES=fixed "$here/api"
+docker build -t redstep/cmdi:fixed --build-arg FEATURES=fixed "$here/cmdi"
 
-echo "built redstep/db:mvp, redstep/api:mvp, redstep/api:fixed, redstep/web:mvp, redstep/canary:mvp"
+echo "built redstep/db:mvp, redstep/api:mvp, redstep/api:fixed, redstep/web:mvp, redstep/canary:mvp, redstep/cmdi:mvp, redstep/cmdi:fixed"
