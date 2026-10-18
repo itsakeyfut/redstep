@@ -316,6 +316,9 @@ impl TestContext {
     /// `false` gets `judge`'s generic text, not a false "the injection executed".
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound, like
     /// [`connect_from_vantage`](Self::connect_from_vantage).
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/sql-injection.md`.
     pub async fn exploit_sqli_from_vantage(
         &self,
         target: &ScopedTarget,
@@ -365,6 +368,9 @@ impl TestContext {
     /// only when the traversal actually read the sentinel (`observation.value`),
     /// like the SQLi check. Errors with [`Error::LabUnavailable`] on a context with
     /// no lab bound.
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/path-traversal.md`.
     pub async fn exploit_path_traversal_from_vantage(
         &self,
         target: &ScopedTarget,
@@ -435,6 +441,9 @@ impl TestContext {
     /// evidence leaves the box; nothing redacts it today, so that is a follow-up (the
     /// named key is the hook). For the playground the token is a non-secret fixture.
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound.
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/idor.md`.
     pub async fn exploit_idor_from_vantage(
         &self,
         target: &ScopedTarget,
@@ -492,6 +501,9 @@ impl TestContext {
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound, or
     /// [`Error::InvalidTarget`] if the canary coordinates would not assemble a safe
     /// coercion request line (a weak token, or an alias carrying CR/LF).
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/ssrf.md`.
     pub async fn exploit_ssrf_from_vantage(
         &self,
         app: &ScopedTarget,
