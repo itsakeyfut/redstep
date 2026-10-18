@@ -29,8 +29,8 @@ use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
-    HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, LabNetwork,
-    http_witness_exploit_from, ssrf_exploit_from, ssrf_token, tcp_reachable_from,
+    HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
+    LabNetwork, http_witness_exploit_from, ssrf_exploit_from, ssrf_token, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -351,6 +351,56 @@ impl TestContext {
         })
     }
 
+    /// The lab-wired command injection check, parallel to
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
+    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the attacker vantage whose `request_path` injects a command into the target's
+    /// `/exec`, and `marker` is the body of a sentinel file only an executed command
+    /// could read, so the shared `classify_http_witness` reads it from the response.
+    /// The marker is the injected command's OUTPUT, never the injected bytes, so a
+    /// reflected path cannot forge the witness (`validate_http_request` refuses a
+    /// marker that appears in `request_path`). An exploit is observed at `High`, a
+    /// clean non-exploit at `High`, and an abnormal probe at `Low` (ADR-0010,
+    /// RK-002). The diagnostic is carried only when the command executed
+    /// (`observation.value`), like the siblings. Errors with
+    /// [`Error::LabUnavailable`] on a context with no lab bound.
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/command-injection.md`.
+    pub async fn exploit_command_injection_from_vantage(
+        &self,
+        target: &ScopedTarget,
+        request_path: &str,
+        marker: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_command_injection_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = http_witness_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            HTTP_CMDI_VANTAGE,
+            request_path,
+            marker,
+            &[],
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only an executed command earns the domain diagnostic; its text asserts a
+        // command ran, true iff the marker (the command's output) was observed.
+        let diagnostic = observation
+            .value
+            .then(|| command_injection_diagnostic(marker));
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
+        })
+    }
+
     /// Attempt a path traversal against `target` from the attacker's vantage and
     /// return its [`Recorded`] result, carrying an ADR-0009 remediation diagnostic
     /// that [`to_be`](ExpectationBuilder::to_be) attaches if the expectation fails.
@@ -567,6 +617,24 @@ fn sqli_diagnostic(marker: &str) -> Diagnostic {
         ),
         remediation: "use a parameterized query (a prepared statement with bound parameters) \
              so request input cannot alter the SQL"
+            .to_owned(),
+    }
+}
+
+/// The ADR-0009 domain diagnostic for a successful OS command injection: the cause
+/// names the `marker`, the output of a command the request injected, and that
+/// request input reached an OS shell; the remediation is to run the program with an
+/// argument vector (no shell) and validate the input. Framework-emitted, not
+/// author-written (ADR-0009). Pure, so the text is guarded without Docker
+/// (`command_injection_diagnostic_names_the_marker_and_the_fix`).
+fn command_injection_diagnostic(marker: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the response returned {marker:?}, the output of a command the request injected, \
+             so request input reached an OS shell and the command executed"
+        ),
+        remediation: "run the program with an argument vector (no shell) and validate the \
+             input against an expected shape, so request input cannot inject a command"
             .to_owned(),
     }
 }
@@ -1286,6 +1354,53 @@ mod tests {
         assert!(
             d.remediation.contains("allowlist"),
             "the remediation names the allowlist fix: {:?}",
+            d.remediation
+        );
+    }
+
+    /// Guard: `exploit_command_injection_from_vantage` on a context with no lab bound
+    /// fails closed with `LabUnavailable`, like its siblings (no daemon needed).
+    /// Mutation: unwrap `self.lab` instead of the `ok_or_else` -> the `None` case
+    /// panics -> this (expecting an `Err`) fails.
+    #[test]
+    fn exploit_command_injection_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("cmdi:8083")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("cmdi:8083").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.exploit_command_injection_from_vantage(
+            &target,
+            "/exec?cmd=x",
+            "marker",
+        ));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_command_injection_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the command-injection domain diagnostic names the marker (the command's
+    /// output) and that input reached a shell, and names the argument-vector fix, so a
+    /// reader gets ADR-0009 actionable guidance. Pure, no Docker. Mutation: drop the
+    /// marker or "shell" from the cause, or change "argument vector" in the remediation
+    /// -> the matching assertion fails.
+    #[test]
+    fn command_injection_diagnostic_names_the_marker_and_the_fix() {
+        let d = command_injection_diagnostic("CMDI42");
+        assert!(
+            d.probable_cause.contains("CMDI42") && d.probable_cause.contains("shell"),
+            "the cause names the marker and that input reached a shell: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("argument vector"),
+            "the remediation names the argument-vector fix: {:?}",
             d.remediation
         );
     }

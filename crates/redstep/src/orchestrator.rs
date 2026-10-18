@@ -956,12 +956,13 @@ fn vantage_draft(
 /// evidence `capability` field and the canonical JSON (a published contract, so
 /// the string values are fixed). Shared by the context callers that run each check
 /// and by [`parse_http_witness`], which maps a recorded name back to one of the
-/// three body-marker techniques above it (the out-of-band `HTTP_SSRF_VANTAGE` below
+/// body-marker techniques above it (the out-of-band `HTTP_SSRF_VANTAGE` below
 /// is on its own path and is parsed by `parse_ssrf_witness`), so the name lives in
 /// one place rather than being retyped at each site.
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
+pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";
 /// SSRF is on its own path, not the body-marker seam: its witness is out-of-band
 /// (observed at the canary, #65), not in the probe's response. The string follows
 /// the `http_<technique>_vantage` family for the canonical JSON.
@@ -1463,6 +1464,7 @@ fn parse_http_witness(
         HTTP_SQLI_VANTAGE => HTTP_SQLI_VANTAGE,
         HTTP_PATH_TRAVERSAL_VANTAGE => HTTP_PATH_TRAVERSAL_VANTAGE,
         HTTP_IDOR_VANTAGE => HTTP_IDOR_VANTAGE,
+        HTTP_CMDI_VANTAGE => HTTP_CMDI_VANTAGE,
         other => {
             return Err(invalid(&format!(
                 "replay witness names an unknown capability {other:?}"
@@ -3525,6 +3527,277 @@ mod tests {
     /// from the `secrets` table (two columns, matching the `notes` lookup's two).
     const SQLI_INJECTION: &str = "%27%20UNION%20SELECT%20flag%2C%27x%27%20FROM%20secrets--%20";
 
+    /// The body of the sentinel the cmdi fixture bakes in (`playground/cmdi/secret.txt`,
+    /// copied to `/srv/cmdi_secret.txt`); reachable only by an executed command, so its
+    /// presence in a response is an unambiguous witness that the injection ran (#85).
+    /// Kept in sync with that file, which `witness_flag_matches_the_cmdi_seed` checks
+    /// offline on every gate.
+    const CMDI_WITNESS: &str = "REDSTEP_CMDI_WITNESS_3D5F";
+
+    /// A URL-encoded command injection for `/exec?cmd=`: a benign token, then a
+    /// `;cat` of the sentinel the image bakes in. The witness (`CMDI_WITNESS`, the
+    /// file body) is not a substring of this path, so `validate_http_request` accepts
+    /// it and only an executed `cat` can surface the witness in the response.
+    const CMDI_INJECTION: &str = "x%3Bcat%20/srv/cmdi_secret.txt";
+
+    /// The constant banner the cmdi fixture prefixes to every `/exec` response; it is
+    /// not derived from the input, so the fix-replay positive control looks for it to
+    /// prove the fixed endpoint still answers (a broken fix returning nothing would not).
+    const CMDI_BANNER: &str = "exec result:";
+
+    /// Guard: the marker the cmdi exploit reads is the one the image actually bakes
+    /// in. Offline on every gate, unlike the Docker-gated cmdi tests that self-skip
+    /// without the image, so a drift between the two copies of the witness cannot hide
+    /// behind that self-skip and silently disarm the check (CLAUDE.md row 6, RK-014).
+    /// `include_str!` resolves the path across the workspace `exclude` boundary at
+    /// compile time. Mutation: change `CMDI_WITNESS` or the secret file so they differ
+    /// -> this fails.
+    #[test]
+    fn witness_flag_matches_the_cmdi_seed() {
+        let secret = include_str!("../../../playground/cmdi/secret.txt");
+        assert!(
+            secret.contains(CMDI_WITNESS),
+            "CMDI_WITNESS {CMDI_WITNESS:?} is not in playground/cmdi/secret.txt; \
+             the exploit marker and the baked secret have drifted"
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built image): the
+    /// native command-injection check verdicts `Fail` against the vulnerable cmdi
+    /// fixture, carrying the ADR-0009 diagnostic (#85). The witness is the injected
+    /// command's OUTPUT (the baked sentinel), not the injected bytes, so the test also
+    /// asserts a benign request does NOT return it: a reflected path could otherwise
+    /// forge the witness. RK-011: the draft mirrors the observation and is attributed
+    /// to the cmdi app. Mutation: `classify_http_witness` returns `false` on a
+    /// witnessed body -> no Fail -> the verdict assertion fails.
+    #[test]
+    fn command_injection_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping command_injection_check_flags_the_playground: no Linux Docker daemon"
+            );
+            return;
+        }
+        if !image_present("redstep/cmdi:mvp") {
+            eprintln!(
+                "skipping command_injection_check_flags_the_playground: image redstep/cmdi:mvp absent (run playground/build.sh)"
+            );
+            return;
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("cmdi", "redstep/cmdi:mvp", "lab")
+                .build()
+                .expect("the cmdi environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the cmdi fixture (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("cmdi:8083").expect("cmdi is in scope");
+            let request_path = format!("/exec?cmd={CMDI_INJECTION}");
+
+            let ctx =
+                crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage.clone());
+            let recorded = ctx
+                .exploit_command_injection_from_vantage(&target, &request_path, CMDI_WITNESS)
+                .await
+                .expect("the vantage command-injection probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // The witness is the command's OUTPUT: a benign request must not carry it,
+            // or a reflected path could forge the witness (Decision 4 / the
+            // marker-not-in-path rule of validate_http_request).
+            let benign_url = format!("http://{}:{}/exec?cmd=benign", target.host(), target.port());
+            let (_s, benign_body, _h) = run_probe_capturing(
+                &docker,
+                vantage.name(),
+                wget_cmd(&benign_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the benign /exec probe ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable cmdi fixture is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the injected command executed (the witness was returned)"
+            );
+            assert!(
+                !benign_body.contains(CMDI_WITNESS),
+                "a benign request never returns the witness: it is the command's output, \
+                 not a reflected path"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(CMDI_WITNESS)
+                    && diagnostic.probable_cause.contains("command"),
+                "the domain cause names the witness and the command: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("argument vector"),
+                "the domain remediation names the arg-vector fix: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the draft mirrors the observation, and the finding is attributed
+            // to the cmdi app (its host:port), not a constant.
+            assert_eq!(drafts[0].capability, "http_cmdi_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].target,
+                format!("{}:{}", target.host(), target.port())
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// recorded command-injection witness replays as still-exploitable against the
+    /// vulnerable cmdi fixture and not-exploitable, confidently, against the fixed one
+    /// (#85). RK-016 positive control: a benign `/exec` on the fixed build still
+    /// returns the banner, so "witness absent" is the fix holding, not a dead
+    /// endpoint. Mutation: revert the api neutralisation (shell-concat in `fixed` too)
+    /// -> the injection executes again -> the `on_fixed` assertion fails.
+    #[test]
+    fn command_injection_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping command_injection_fix_and_replay_closes_the_loop: no Linux Docker daemon"
+            );
+            return;
+        }
+        for image in ["redstep/cmdi:mvp", "redstep/cmdi:fixed"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping command_injection_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |cmdi_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("cmdi", cmdi_image, "lab")
+                    .build()
+                    .expect("the cmdi environment is valid")
+            };
+            let vuln_env = flat("redstep/cmdi:mvp");
+            let fixed_env = flat("redstep/cmdi:fixed");
+            let request_path = format!("/exec?cmd={CMDI_INJECTION}");
+
+            // Record a genuine exploit against the vulnerable lab and take ITS witness,
+            // the reproduction the recorder emits (parallel to the SQLi loop).
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable cmdi fixture");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("cmdi:8083").expect("cmdi is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_cmdi_vantage",
+                &request_path,
+                CMDI_WITNESS,
+                &[],
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording exploit ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // Positive control on the fixed lab: a benign /exec still returns the
+            // banner, so "witness absent" is the fix, not a dead endpoint (RK-016).
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed cmdi fixture");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("cmdi:8083").expect("cmdi is in scope");
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_cmdi_vantage",
+                "/exec?cmd=benign",
+                CMDI_BANNER,
+                &[],
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the benign /exec ran");
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording exploit observed the command injection"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as still-exploitable against the vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the witness replays not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed negative is confident, not inconclusive"
+            );
+            assert!(
+                benign.value,
+                "positive control: the fixed /exec still answers (the banner is returned)"
+            );
+        });
+    }
+
     /// The body of the sentinel file seeded OUTSIDE the api's web root
     /// (`playground/api/secret.txt`, baked to `/srv/secret.txt`); its presence in a
     /// `/file` response witnesses that a path traversal escaped the web root and
@@ -4073,6 +4346,24 @@ mod tests {
         assert_eq!(
             traversal_cap, "http_path_traversal_vantage",
             "the traversal witness resolves to its own capability, not SQLi's"
+        );
+
+        // The command-injection arm round-trips to its own capability too (#85):
+        // mapping it to another in `parse_http_witness` returns the wrong one here.
+        let cmdi = Reproduction {
+            capability: HTTP_CMDI_VANTAGE.to_owned(),
+            target: "cmdi:8083".to_owned(),
+            params: serde_json::json!({
+                "request_path": "/exec?cmd=x%3Bcat%20/srv/cmdi_secret.txt",
+                "marker": "REDSTEP_CMDI_WITNESS_3D5F",
+                "vantage_segment": "lab",
+                "timeout_ms": 5_000,
+            }),
+        };
+        let (cmdi_cap, ..) = parse_http_witness(&cmdi).expect("a complete cmdi witness parses");
+        assert_eq!(
+            cmdi_cap, "http_cmdi_vantage",
+            "the command-injection witness resolves to its own capability"
         );
 
         let rejected = [
