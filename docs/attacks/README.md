@@ -140,6 +140,7 @@ first.
 - [HTTP Parameter Pollution](http-parameter-pollution.md)
 - [Vulnerable and Outdated Components](vulnerable-and-outdated-components.md)
 - [Improper LLM Output Handling](improper-output-handling.md)
+- [Valid Accounts](valid-accounts.md)
 
 ### API
 
@@ -161,6 +162,7 @@ first.
 - [HTTP Verb Tampering](http-verb-tampering.md)
 - [HTTP Parameter Pollution](http-parameter-pollution.md)
 - [Vulnerable and Outdated Components](vulnerable-and-outdated-components.md)
+- [Valid Accounts](valid-accounts.md)
 
 ### Network
 
@@ -201,6 +203,8 @@ first.
 - [Multi-Factor Authentication Bypass](mfa-bypass.md)
 - [OS Credential Dumping](os-credential-dumping.md)
 - [Kerberos Ticket Attacks](kerberos-ticket-attacks.md)
+- [Valid Accounts](valid-accounts.md)
+- [Phishing](phishing.md)
 
 ### AI
 
@@ -219,15 +223,29 @@ Identity from the ATT&CK Enterprise, Cloud, and Containers matrices and the Cred
 Access tactic; AI from the OWASP Top 10 for LLM Applications (2025); all cross-checked
 against OWASP WSTG and the CWE Top 25.
 
-What was deliberately left out, each for a reason: pure categories that
+The taxonomies above are themselves built from real-world data, but to confirm the catalog
+against what actually causes damage rather than only what the frameworks list, it is also
+cross-checked against two empirical sources: the CISA Known Exploited Vulnerabilities (KEV)
+catalog, the vulnerabilities observed exploited in the wild, and the Verizon Data Breach
+Investigations Report (DBIR), what actually causes breaches. KEV's prominent types (OS
+command injection, deserialization, path traversal, XSS, code injection, improper
+authentication, SSRF, and edge-device RCE) all map to existing files, so it validated the
+coverage rather than expanding it. DBIR's leading initial-access vectors did surface two
+gaps the earlier scope decision had left out, both access-gaining and so in scope, now
+added: credential abuse (its top vector) as [valid accounts](valid-accounts.md), and
+[phishing](phishing.md) (its third). DBIR's other major theme, ransomware, is a
+post-compromise impact and stays out of scope (below).
+
+What is still deliberately left out, each for a reason: pure categories that
 are not a single technique (security misconfiguration, improper inventory management,
 unsafe consumption of APIs); native memory-safety weaknesses (out-of-bounds, use-after-free,
 integer overflow, from the CWE Top 25) that are reached, not themselves tested, via
-[exploitation of remote services](exploitation-of-remote-services.md); and social,
-physical, or client-user initial access (phishing, drive-by, trusted relationship,
-removable media, Wi-Fi). Techniques that need a radio, a physical switch, a real cloud
-provider, or an Active Directory domain are kept as `capability: none` and marked out of
-the software-defined lab's scope.
+[exploitation of remote services](exploitation-of-remote-services.md); and the physical and
+client-user initial-access vectors (drive-by, trusted relationship, removable media, Wi-Fi).
+Phishing, though social, is now catalogued because it is empirically a top vector, kept
+`capability: none` and marked outside the non-interactive lab. Techniques that need a radio,
+a physical switch, a real cloud provider, or an Active Directory domain are likewise kept
+as `capability: none` and marked out of the software-defined lab's scope.
 
 The backlog is therefore empty within scope, and the coverage gap is now visible the other
 way: in the index above, every technique whose `capability` is `none` is one redstep does
