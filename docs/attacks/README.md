@@ -88,6 +88,23 @@ comment that pointed at the old path and no script will catch it. So the slug an
 the section headings are a published contract once a comment links them. Rename one
 only as deliberately as a public function.
 
+## Implementing a technique
+
+The catalog is the backlog for the native checks: a file whose `capability` is `none` is a
+technique redstep documents but does not yet exercise. Build checks by choosing from here
+rather than inventing a technique ad hoc, preferring the ones with the most real-world
+impact. When a check is implemented:
+
+- set that file's `capability` to the capability string the code uses (for example
+  `http_ssrf_vantage`), so the index stops showing it as a gap;
+- rewrite its "How redstep exercises it" and "What a verdict means" from the planned
+  future tense to what the code actually does;
+- keep the code's doc comment pointing back at the file, so the link holds both ways.
+
+Until a technique has a file here it is not ready to implement: add it to the catalog
+first, enumerated from its authoritative taxonomy, so what is built is always something the
+catalog already describes.
+
 ## Index
 
 Grouped by target genre, the `targets` field. A technique is listed under each
