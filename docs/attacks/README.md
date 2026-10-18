@@ -217,10 +217,9 @@ authoritative taxonomies: Web and API from OWASP Top 10 (2021), the OWASP API Se
 10 (2023), and the PortSwigger Web Security Academy; Network, Cloud, Container, and
 Identity from the ATT&CK Enterprise, Cloud, and Containers matrices and the Credential
 Access tactic; AI from the OWASP Top 10 for LLM Applications (2025); all cross-checked
-against OWASP WSTG and the CWE Top 25. [`coverage.md`](coverage.md) records that audit as
-a source-to-file matrix, so "the major techniques are catalogued" is a checkable claim.
+against OWASP WSTG and the CWE Top 25.
 
-What was deliberately left out, each with its reason in the matrix: pure categories that
+What was deliberately left out, each for a reason: pure categories that
 are not a single technique (security misconfiguration, improper inventory management,
 unsafe consumption of APIs); native memory-safety weaknesses (out-of-bounds, use-after-free,
 integer overflow, from the CWE Top 25) that are reached, not themselves tested, via
