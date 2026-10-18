@@ -1,8 +1,9 @@
 //! A deliberately vulnerable "diagnostics" tier for the redstep command-injection
 //! playground (#85). This is a security test fixture, NOT product code:
 //! `GET /exec?cmd=` builds a shell command by string concatenation on purpose, so
-//! an injected `;`/`$()`/backtick runs on the host. It exists only to be attacked
-//! inside the egress-less lab and must never be deployed.
+//! an injected `;`/`$()`/backtick runs in this fixture's shell (inside its own
+//! container, confined to the egress-less lab, never the Docker host). It exists
+//! only to be attacked inside the lab and must never be deployed.
 //!
 //! The `fixed` cargo feature builds the patched variant (`redstep/cmdi:fixed`):
 //! `/exec` then runs the base command with an argument vector and no shell, so the

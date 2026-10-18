@@ -3630,6 +3630,16 @@ mod tests {
             .await
             .expect("the benign /exec probe ran");
 
+            // A benign probe THROUGH the capability earns no diagnostic: the domain
+            // diagnostic is gated on `observation.value`, so a clean non-exploit must
+            // carry none. Mutation: drop the `observation.value.then(..)` gate in
+            // `exploit_command_injection_from_vantage` -> a diagnostic attaches here
+            // -> the `is_none()` assertion below fails.
+            let benign_recorded = ctx
+                .exploit_command_injection_from_vantage(&target, "/exec?cmd=benign", CMDI_WITNESS)
+                .await
+                .expect("the benign command-injection probe ran");
+
             let judgements = ctx.take_judgements();
             let drafts = ctx.take_evidence_drafts();
             let _ = lab.teardown().await;
@@ -3647,6 +3657,14 @@ mod tests {
                 !benign_body.contains(CMDI_WITNESS),
                 "a benign request never returns the witness: it is the command's output, \
                  not a reflected path"
+            );
+            assert!(
+                !benign_recorded.observation.value,
+                "a benign request through the capability is not exploitable"
+            );
+            assert!(
+                benign_recorded.diagnostic.is_none(),
+                "a clean non-exploit carries no diagnostic (the observation.value gate)"
             );
             let (judgement, _) = &judgements[0];
             assert_eq!(judgement.verdict, crate::Verdict::Fail);
