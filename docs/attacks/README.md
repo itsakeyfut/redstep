@@ -40,7 +40,7 @@ template's own comments say what each section is for.
   carries all of them (SSRF is `[web, cloud]`, a web input that pivots to the cloud
   metadata service). The genres are the sections of the index below; keep to that
   set and add one only as deliberately as you would have added a folder. The set:
-  `web`, `api`, `network`, `container`, `cloud`, `identity`.
+  `web`, `api`, `network`, `container`, `cloud`, `identity`, `ai`.
 - **Name the `capability` when one exists, else `none`.** This is the coverage
   signal: a file with `capability: none` is a technique the catalog teaches but
   redstep does not yet exercise, which is exactly the gap the catalog exists to make
@@ -130,6 +130,17 @@ first.
 - [Information Disclosure](information-disclosure.md)
 - [Prototype Pollution](prototype-pollution.md)
 - [Session Hijacking](session-hijacking.md)
+- [File Inclusion (LFI and RFI)](file-inclusion.md)
+- [Code Injection](code-injection.md)
+- [XPath Injection](xpath-injection.md)
+- [LDAP Injection](ldap-injection.md)
+- [Server-Side Includes Injection](ssi-injection.md)
+- [IMAP/SMTP Injection](smtp-injection.md)
+- [HTTP Verb Tampering](http-verb-tampering.md)
+- [HTTP Parameter Pollution](http-parameter-pollution.md)
+- [Vulnerable and Outdated Components](vulnerable-and-outdated-components.md)
+- [Improper LLM Output Handling](improper-output-handling.md)
+- [Valid Accounts](valid-accounts.md)
 
 ### API
 
@@ -146,6 +157,12 @@ first.
 - [GraphQL API Vulnerabilities](graphql-api-vulnerabilities.md)
 - [Race Conditions](race-conditions.md)
 - [Information Disclosure](information-disclosure.md)
+- [XPath Injection](xpath-injection.md)
+- [LDAP Injection](ldap-injection.md)
+- [HTTP Verb Tampering](http-verb-tampering.md)
+- [HTTP Parameter Pollution](http-parameter-pollution.md)
+- [Vulnerable and Outdated Components](vulnerable-and-outdated-components.md)
+- [Valid Accounts](valid-accounts.md)
 
 ### Network
 
@@ -186,20 +203,63 @@ first.
 - [Multi-Factor Authentication Bypass](mfa-bypass.md)
 - [OS Credential Dumping](os-credential-dumping.md)
 - [Kerberos Ticket Attacks](kerberos-ticket-attacks.md)
+- [Valid Accounts](valid-accounts.md)
+- [Phishing](phishing.md)
+
+### AI
+
+- [Prompt Injection](prompt-injection.md)
+- [Improper LLM Output Handling](improper-output-handling.md)
+- [System Prompt Leakage](system-prompt-leakage.md)
+- [LLM Sensitive Information Disclosure](llm-sensitive-information-disclosure.md)
+- [Excessive Agency](excessive-agency.md)
 
 ## Coverage
 
-The mainstream set across all six genres is now catalogued: Web and API from OWASP Top 10
-(2021), the OWASP API Security Top 10 (2023), and the PortSwigger Web Security Academy;
-Network, Cloud, Container, and Identity from the ATT&CK Enterprise, Cloud, and Containers
-matrices and the Credential Access tactic. Pure categories that are not a single technique
-(security misconfiguration, improper inventory management, unsafe consumption of APIs)
-were deliberately left out, and the techniques that need a radio, a physical switch, a
-real cloud provider, or an Active Directory domain are kept as `capability: none` and
-marked out of the software-defined lab's scope.
+The mainstream set across all seven genres is now catalogued, audited against its
+authoritative taxonomies: Web and API from OWASP Top 10 (2021), the OWASP API Security Top
+10 (2023), and the PortSwigger Web Security Academy; Network, Cloud, Container, and
+Identity from the ATT&CK Enterprise, Cloud, and Containers matrices and the Credential
+Access tactic; AI from the OWASP Top 10 for LLM Applications (2025); all cross-checked
+against OWASP WSTG and the CWE Top 25.
 
-The backlog is therefore empty, and the coverage gap is now visible the other way: in the
-index above, every technique whose `capability` is `none` is one redstep does not yet
-exercise, which is the list of checks still to build. New techniques are added as the
-field evolves, each enumerated from its authoritative taxonomy before its file is
+The taxonomies above are themselves built from real-world data, but to confirm the catalog
+against what actually causes damage rather than only what the frameworks list, it is also
+cross-checked against two empirical sources: the CISA Known Exploited Vulnerabilities (KEV)
+catalog, the vulnerabilities observed exploited in the wild, and the Verizon Data Breach
+Investigations Report (DBIR), what actually causes breaches. KEV's prominent types (OS
+command injection, deserialization, path traversal, XSS, code injection, improper
+authentication, SSRF, and edge-device RCE) all map to existing files, so it validated the
+coverage rather than expanding it. DBIR's leading initial-access vectors did surface two
+gaps the earlier scope decision had left out, both access-gaining and so in scope, now
+added: credential abuse (its top vector) as [valid accounts](valid-accounts.md), and
+[phishing](phishing.md) (its third). DBIR's other major theme, ransomware, is a
+post-compromise impact and stays out of scope (below).
+
+What is still deliberately left out, each for a reason: pure categories that
+are not a single technique (security misconfiguration, improper inventory management,
+unsafe consumption of APIs); native memory-safety weaknesses (out-of-bounds, use-after-free,
+integer overflow, from the CWE Top 25) that are reached, not themselves tested, via
+[exploitation of remote services](exploitation-of-remote-services.md); and the physical and
+client-user initial-access vectors (drive-by, trusted relationship, removable media, Wi-Fi).
+Phishing, though social, is now catalogued because it is empirically a top vector, kept
+`capability: none` and marked outside the non-interactive lab. Techniques that need a radio,
+a physical switch, a real cloud provider, or an Active Directory domain are likewise kept
+as `capability: none` and marked out of the software-defined lab's scope.
+
+The backlog is therefore empty within scope, and the coverage gap is now visible the other
+way: in the index above, every technique whose `capability` is `none` is one redstep does
+not yet exercise, which is the list of checks still to build. New techniques are added as
+the field evolves, each enumerated from its authoritative taxonomy before its file is
 written.
+
+### Out of current scope: the post-compromise lifecycle
+
+The catalog's scope is techniques by which an attacker gains or escalates access against a
+target. The post-compromise attacker lifecycle, lateral movement (beyond
+[exploitation of remote services](exploitation-of-remote-services.md)), command and
+control, persistence, defense evasion, collection, and exfiltration, from the later ATT&CK
+Enterprise tactics, is deliberately not catalogued yet. redstep's model reaches toward it
+(the attack graph and a C2 session as a foothold, ADR-0020), so it is the next frontier
+for the catalog when that part of the tool is built; enumerate it from the ATT&CK tactics
+then, as the access-gaining genres were.
