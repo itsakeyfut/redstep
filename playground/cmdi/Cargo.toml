@@ -1,0 +1,21 @@
+[package]
+name = "redstep-playground-cmdi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The binary is copied as `/app` by the Dockerfile and run as the entrypoint and
+# the HEALTHCHECK (`/app healthcheck`).
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[features]
+# `fixed` builds the patched variant (`redstep/cmdi:fixed`): `/exec` runs the
+# base command with an argument vector and no shell. The feature adds no
+# dependency, so Cargo.lock is unchanged and `--locked` holds either way.
+fixed = []
+
+[dependencies]
+# A tiny blocking HTTP server; the fixture needs no async runtime or client crate.
+tiny_http = "0.12.0"
