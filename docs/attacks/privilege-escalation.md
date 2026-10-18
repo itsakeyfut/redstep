@@ -55,6 +55,6 @@ and the lab network is egress-less
 ## References
 
 - OWASP: [A01:2021 Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/); for APIs, [API5:2023 Broken Function Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/)
-- CWE: [CWE-862 Missing Authorization](https://cwe.mitre.org/data/definitions/862.html)
+- CWE: [CWE-862 Missing Authorization](https://cwe.mitre.org/data/definitions/862.html); the authentication counterpart, [CWE-306 Missing Authentication for a Critical Function](https://cwe.mitre.org/data/definitions/306.html) (a sensitive action that requires no authentication at all), is folded here as the same broken-access-control failure seen from the authentication side.
 - PortSwigger Web Security Academy: [Access control vulnerabilities](https://portswigger.net/web-security/access-control)
 - ATT&CK: no enterprise technique maps cleanly to web function-level authorization; OWASP above is the mapping (ADR-0016).
