@@ -30,6 +30,18 @@ const DB_CONN: &str = "host=db port=5432 user=redstep password=redstep dbname=re
 /// sentinel, whose body is the path-traversal witness the attacker observes.
 const WEB_ROOT: &str = "/srv/public";
 
+/// The SSTI witness (#90): a secret seeded into the `/render` template context.
+/// The injected `{{ flag }}` evaluates to it on the vulnerable build; the fixed
+/// build renders a fixed template exposing only the input, so the secret stays
+/// absent from the response. Pinned offline against this file by the orchestrator
+/// (`witness_flag_matches_the_ssti_seed`, RK-014).
+const SSTI_SECRET: &str = "REDSTEP_SSTI_WITNESS_7B1A";
+
+/// A constant banner prefixed to every `/render` response, so a benign request has
+/// a stable marker not derived from the input: the fix-replay positive control
+/// reads it to prove the endpoint still answers (RK-016), and it is not the secret.
+const SSTI_BANNER: &str = "render result:";
+
 fn main() {
     // `/app healthcheck` backs the image HEALTHCHECK (the distroless runtime has
     // no shell), so the readiness gate (bring_up, #47) waits on a real end-to-end
@@ -89,6 +101,10 @@ fn handle(url: &str, auth: Option<&str>) -> (u16, String) {
             }
         }
         "/fetch" => serve_fetch(&percent_decode(&query_param(query, "url").unwrap_or_default())),
+        "/render" => {
+            let tpl = percent_decode(&query_param(query, "tpl").unwrap_or_default());
+            (200, format!("{SSTI_BANNER} {}", render_tpl(&tpl)))
+        }
         _ => (404, "not found".to_owned()),
     }
 }
@@ -235,6 +251,39 @@ fn serve_fetch(url: &str) -> (u16, String) {
         }
         _ => (200, "refused: host not on the outbound allowlist\n".to_owned()),
     }
+}
+
+/// The `/render` handler, by build. The default (mvp image) is THE FIFTH
+/// VULNERABILITY (SSTI): the caller's input IS the template source, rendered with
+/// the secret in scope, so an injected `{{ flag }}` is evaluated by the engine and
+/// `SSTI_SECRET` is returned. The witness is in-band: the secret appears in the
+/// response only when the expression was evaluated, not merely reflected. A
+/// malformed expression is a template error returned as a safe body (never the
+/// secret), not a panic: a panic here would kill the single-threaded request loop.
+#[cfg(not(feature = "fixed"))]
+fn render_tpl(input: &str) -> String {
+    let env = minijinja::Environment::new();
+    match env.render_str(input, minijinja::context! { flag => SSTI_SECRET }) {
+        Ok(out) => out,
+        Err(_) => "template error".to_owned(),
+    }
+}
+
+/// THE FIX (`redstep/api:fixed`): a FIXED template renders the caller's input as a
+/// bound DATA value (`{{ input }}`), so template syntax in the input is shown
+/// literally and not evaluated. The secret (`SSTI_SECRET`) is still seeded into the
+/// context, so it remains in scope exactly as on the vulnerable build; what changed
+/// is that the fixed template exposes only `input`, never `flag`, so the same probe
+/// reads the secret absent. A benign input still renders through the fixed template,
+/// so the endpoint stays live for the fix-replay positive control.
+#[cfg(feature = "fixed")]
+fn render_tpl(input: &str) -> String {
+    let env = minijinja::Environment::new();
+    env.render_str(
+        "{{ input }}",
+        minijinja::context! { input => input, flag => SSTI_SECRET },
+    )
+    .unwrap_or_else(|_| "template error".to_owned())
 }
 
 /// Parse `http://host[:port]/path` into `(host, port, path)` for the `/fetch`
