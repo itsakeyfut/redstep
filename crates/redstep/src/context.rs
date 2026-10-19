@@ -30,7 +30,8 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
-    LabNetwork, http_witness_exploit_from, ssrf_exploit_from, ssrf_token, tcp_reachable_from,
+    HTTP_SSTI_VANTAGE, LabNetwork, http_witness_exploit_from, ssrf_exploit_from, ssrf_token,
+    tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -401,6 +402,55 @@ impl TestContext {
         })
     }
 
+    /// The lab-wired server-side template injection (SSTI) check, parallel to
+    /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
+    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the attacker vantage whose `request_path` injects a template expression into
+    /// the target's `/render`, and `marker` is a secret seeded into the engine's
+    /// template context, present in the response only when the expression was
+    /// EVALUATED rather than reflected. Because the secret is not in `request_path`,
+    /// a server that merely echoed the path could not forge the witness
+    /// (`validate_http_request` refuses a marker that appears in `request_path`). An
+    /// exploit is observed at `High`, a clean non-exploit at `High`, and an abnormal
+    /// probe at `Low` (ADR-0010, RK-002). The diagnostic is carried only when the
+    /// expression evaluated (`observation.value`), like the siblings. Errors with
+    /// [`Error::LabUnavailable`] on a context with no lab bound.
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/ssti.md`.
+    pub async fn exploit_ssti_from_vantage(
+        &self,
+        target: &ScopedTarget,
+        request_path: &str,
+        marker: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_ssti_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let (observation, draft) = http_witness_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            HTTP_SSTI_VANTAGE,
+            request_path,
+            marker,
+            &[],
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only an evaluated expression earns the domain diagnostic; its text asserts
+        // the template was evaluated, which holds iff the marker (the seeded secret)
+        // was observed.
+        let diagnostic = observation.value.then(|| ssti_diagnostic(marker));
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
+        })
+    }
+
     /// Attempt a path traversal against `target` from the attacker's vantage and
     /// return its [`Recorded`] result, carrying an ADR-0009 remediation diagnostic
     /// that [`to_be`](ExpectationBuilder::to_be) attaches if the expectation fails.
@@ -635,6 +685,25 @@ fn command_injection_diagnostic(marker: &str) -> Diagnostic {
         ),
         remediation: "run the program with an argument vector (no shell) and validate the \
              input against an expected shape, so request input cannot inject a command"
+            .to_owned(),
+    }
+}
+
+/// The ADR-0009 domain diagnostic for a successful SSTI: the cause names the
+/// `marker` returned, the result of an expression the request injected, which proves
+/// the input was evaluated as a server-side template rather than rendered as data;
+/// the remediation is to render a fixed template and pass input as a bound value.
+/// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
+/// without Docker (`ssti_diagnostic_names_the_marker_and_the_fix`).
+fn ssti_diagnostic(marker: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the response returned {marker:?}, the result of an expression the request injected, \
+             so request input was evaluated as a server-side template rather than rendered as data"
+        ),
+        remediation: "render a fixed template and pass request input as a bound data value, never \
+             build the template string from request input, so input cannot be evaluated as \
+             template syntax"
             .to_owned(),
     }
 }
@@ -1401,6 +1470,50 @@ mod tests {
         assert!(
             d.remediation.contains("argument vector"),
             "the remediation names the argument-vector fix: {:?}",
+            d.remediation
+        );
+    }
+
+    /// Guard: `exploit_ssti_from_vantage` on a context with no lab bound fails closed
+    /// with `LabUnavailable`, like its siblings (no daemon needed). Mutation: unwrap
+    /// `self.lab` instead of the `ok_or_else` -> the `None` case panics -> this
+    /// (expecting an `Err`) fails.
+    #[test]
+    fn exploit_ssti_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("api:8081")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("api:8081").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result =
+            runtime.block_on(ctx.exploit_ssti_from_vantage(&target, "/render?tpl=x", "marker"));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_ssti_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the SSTI domain diagnostic names the marker (the evaluated secret) and
+    /// that input was evaluated as a template, and names the fixed-template fix, so a
+    /// reader gets ADR-0009 actionable guidance. Pure, no Docker. Mutation: drop the
+    /// marker or "template" from the cause, or change "bound data value" in the
+    /// remediation -> the matching assertion fails.
+    #[test]
+    fn ssti_diagnostic_names_the_marker_and_the_fix() {
+        let d = ssti_diagnostic("SSTI42");
+        assert!(
+            d.probable_cause.contains("SSTI42") && d.probable_cause.contains("template"),
+            "the cause names the marker and that input was evaluated as a template: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("bound data value"),
+            "the remediation names the fixed-template / bound-data fix: {:?}",
             d.remediation
         );
     }
