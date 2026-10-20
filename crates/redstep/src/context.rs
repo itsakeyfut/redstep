@@ -1499,21 +1499,26 @@ mod tests {
     }
 
     /// Guard: the SSTI domain diagnostic names the marker (the evaluated secret) and
-    /// that input was evaluated as a template, and names the fixed-template fix, so a
-    /// reader gets ADR-0009 actionable guidance. Pure, no Docker. Mutation: drop the
-    /// marker or "template" from the cause, or change "bound data value" in the
-    /// remediation -> the matching assertion fails.
+    /// that input was EVALUATED (not merely that a "template" is involved), and names
+    /// the fixed-template bound-data fix, so a reader gets ADR-0009 actionable
+    /// guidance. Pure, no Docker. The cause assertion checks "evaluated", not just
+    /// "template": "template" sits in the noun phrase "server-side template" and
+    /// survives a cause that no longer says the input was evaluated, so it would pass
+    /// a gutted cause ("the server-side template misbehaved"); "evaluated" is the
+    /// load-bearing word. Mutation: drop the marker or "evaluated" from the cause, or
+    /// "fixed template" / "bound data value" from the remediation -> the matching
+    /// assertion fails.
     #[test]
     fn ssti_diagnostic_names_the_marker_and_the_fix() {
         let d = ssti_diagnostic("SSTI42");
         assert!(
-            d.probable_cause.contains("SSTI42") && d.probable_cause.contains("template"),
-            "the cause names the marker and that input was evaluated as a template: {:?}",
+            d.probable_cause.contains("SSTI42") && d.probable_cause.contains("evaluated"),
+            "the cause names the marker and that input was evaluated: {:?}",
             d.probable_cause
         );
         assert!(
-            d.remediation.contains("bound data value"),
-            "the remediation names the fixed-template / bound-data fix: {:?}",
+            d.remediation.contains("fixed template") && d.remediation.contains("bound data value"),
+            "the remediation names the fixed-template bound-data fix: {:?}",
             d.remediation
         );
     }

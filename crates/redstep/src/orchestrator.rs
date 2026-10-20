@@ -3832,17 +3832,23 @@ mod tests {
     /// the witness in the response (a reflected path carries only `{{ flag }}`).
     const SSTI_INJECTION: &str = "%7B%7B%20flag%20%7D%7D";
 
-    /// The constant banner the api prefixes to every `/render` response; it is not
-    /// derived from the input, so the fix-replay positive control looks for it to
-    /// prove the fixed endpoint still answers (a broken fix returning nothing would
-    /// not). Matches `SSTI_BANNER` in the fixture.
-    const SSTI_BANNER: &str = "render result:";
+    /// A benign `tpl` with no template syntax, URL-encoded with a space (`%20`) so
+    /// its rendered (percent-decoded) form is not a substring of the request path.
+    /// Both builds render it to itself (no `{{ }}` to evaluate), so a benign
+    /// `/render` response carries the rendered form but never the secret. The
+    /// capability-level control in the flags test uses it to prove the differential
+    /// is real (a non-template input is no exploit).
+    const SSTI_BENIGN: &str = "redstep%20probe";
 
-    /// A benign plain-text `tpl` with no template syntax: it renders to itself on
-    /// both builds, so a benign `/render` response carries the banner but never the
-    /// secret. The capability-level control in the flags test uses it to prove the
-    /// differential is real (a non-template input is no exploit).
-    const SSTI_BENIGN: &str = "hello";
+    /// The benign input's RENDERED form (the percent-decoded `SSTI_BENIGN`). The
+    /// fix-replay positive control uses THIS, not the banner, as its marker: the
+    /// banner is prefixed to every response including a `template error` body, so a
+    /// broken renderer that answered a constant error would still carry the banner
+    /// and the control would pass over a dead renderer (RK-016, a row-6 false
+    /// "secure"). Only a renderer that actually rendered the input produces this
+    /// value. `validate_http_request` accepts it because the decoded form (with the
+    /// space) is not a substring of the encoded request path.
+    const SSTI_BENIGN_RENDERED: &str = "redstep probe";
 
     /// Guard: the secret the SSTI exploit reads is the one the api fixture actually
     /// seeds into its template context. Offline on every gate, unlike the Docker-gated
@@ -3987,11 +3993,16 @@ mod tests {
     /// reproduction the seam emits) replays as still-exploitable against the vulnerable
     /// image and not-exploitable, confidently, against `redstep/api:fixed` (which binds
     /// the input as data). RK-016 positive control: a benign `/render` on the fixed
-    /// build still returns the banner, so "witness absent" is the fix holding, not a
-    /// dead endpoint. Mutation: revert the api fix (render the input as the template in
-    /// `fixed` too) -> the expression evaluates again -> the `on_fixed` assertion
-    /// fails; make the fixed `render_tpl` return an empty body -> `benign.value` is
-    /// false -> this fails (the gap the positive control closes).
+    /// build still RENDERS its input (the response carries the input's rendered form,
+    /// `SSTI_BENIGN_RENDERED`, not just the banner), so "witness absent" is the fix
+    /// holding, not a renderer that answers a constant. The marker is the rendered
+    /// value rather than the banner because the banner is prefixed to every response
+    /// including a `template error` body, so a banner marker would pass over a broken
+    /// renderer (a row-6 false "secure"). Mutation: revert the api fix (render the
+    /// input as the template in `fixed` too) -> the expression evaluates again -> the
+    /// `on_fixed` assertion fails; make the fixed `render_tpl` return a constant
+    /// (`"template error"`) for every input -> the rendered benign form is absent ->
+    /// `benign.value` is false -> this fails (the gap the positive control closes).
     #[test]
     fn ssti_fix_and_replay_closes_the_loop() {
         if !linux_docker_available() {
@@ -4073,7 +4084,7 @@ mod tests {
                 &target,
                 "http_ssti_vantage",
                 &format!("/render?tpl={SSTI_BENIGN}"),
-                SSTI_BANNER,
+                SSTI_BENIGN_RENDERED,
                 &[],
                 Duration::from_millis(5_000),
             )
@@ -4100,7 +4111,7 @@ mod tests {
             );
             assert!(
                 benign.value,
-                "positive control: the fixed /render still answers (the banner is returned)"
+                "positive control: the fixed /render still RENDERS the benign input (its rendered form is returned), not merely answers with the banner"
             );
         });
     }
