@@ -963,6 +963,7 @@ pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";
+pub(crate) const HTTP_SSTI_VANTAGE: &str = "http_ssti_vantage";
 /// SSRF is on its own path, not the body-marker seam: its witness is out-of-band
 /// (observed at the canary, #65), not in the probe's response. The string follows
 /// the `http_<technique>_vantage` family for the canonical JSON.
@@ -1465,6 +1466,7 @@ fn parse_http_witness(
         HTTP_PATH_TRAVERSAL_VANTAGE => HTTP_PATH_TRAVERSAL_VANTAGE,
         HTTP_IDOR_VANTAGE => HTTP_IDOR_VANTAGE,
         HTTP_CMDI_VANTAGE => HTTP_CMDI_VANTAGE,
+        HTTP_SSTI_VANTAGE => HTTP_SSTI_VANTAGE,
         other => {
             return Err(invalid(&format!(
                 "replay witness names an unknown capability {other:?}"
@@ -3816,6 +3818,304 @@ mod tests {
         });
     }
 
+    /// The secret the api seeds into the `/render` template context
+    /// (`playground/api/src/main.rs`, `SSTI_SECRET`); reachable only when an injected
+    /// expression is evaluated, so its presence in a response is an unambiguous
+    /// witness that the SSTI ran (#90). Kept in sync with that file, which
+    /// `witness_flag_matches_the_ssti_seed` checks offline on every gate.
+    const SSTI_WITNESS: &str = "REDSTEP_SSTI_WITNESS_7B1A";
+
+    /// A URL-encoded template expression for `/render?tpl=`: `{{ flag }}`, which the
+    /// vulnerable build evaluates against its context, returning the seeded secret.
+    /// The witness (`SSTI_WITNESS`, the secret) is not a substring of this path, so
+    /// `validate_http_request` accepts it and only an evaluated expression can surface
+    /// the witness in the response (a reflected path carries only `{{ flag }}`).
+    const SSTI_INJECTION: &str = "%7B%7B%20flag%20%7D%7D";
+
+    /// A benign `tpl` with no template syntax, URL-encoded with a space (`%20`) so
+    /// its rendered (percent-decoded) form is not a substring of the request path.
+    /// Both builds render it to itself (no `{{ }}` to evaluate), so a benign
+    /// `/render` response carries the rendered form but never the secret. The
+    /// capability-level control in the flags test uses it to prove the differential
+    /// is real (a non-template input is no exploit).
+    const SSTI_BENIGN: &str = "redstep%20probe";
+
+    /// The benign input's RENDERED form (the percent-decoded `SSTI_BENIGN`). The
+    /// fix-replay positive control uses THIS, not the banner, as its marker: the
+    /// banner is prefixed to every response including a `template error` body, so a
+    /// broken renderer that answered a constant error would still carry the banner
+    /// and the control would pass over a dead renderer (RK-016, a row-6 false
+    /// "secure"). Only a renderer that actually rendered the input produces this
+    /// value. `validate_http_request` accepts it because the decoded form (with the
+    /// space) is not a substring of the encoded request path.
+    const SSTI_BENIGN_RENDERED: &str = "redstep probe";
+
+    /// Guard: the secret the SSTI exploit reads is the one the api fixture actually
+    /// seeds into its template context. Offline on every gate, unlike the Docker-gated
+    /// SSTI tests that self-skip without the image, so a drift between the two copies
+    /// of the witness cannot hide behind that self-skip and silently disarm the check
+    /// (CLAUDE.md row 6, RK-014). `include_str!` resolves the path across the workspace
+    /// `exclude` boundary at compile time. Mutation: change `SSTI_WITNESS` or the
+    /// fixture's `SSTI_SECRET` so they differ -> this fails.
+    #[test]
+    fn witness_flag_matches_the_ssti_seed() {
+        let fixture = include_str!("../../../playground/api/src/main.rs");
+        assert!(
+            fixture.contains(SSTI_WITNESS),
+            "SSTI_WITNESS {SSTI_WITNESS:?} is not seeded in playground/api/src/main.rs; \
+             the exploit marker and the fixture secret have drifted"
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native SSTI check verdicts `Fail` against the vulnerable api fixture, carrying
+    /// the ADR-0009 diagnostic (#90). The witness is the EVALUATED secret, not the
+    /// injected expression, so the test also asserts a benign (non-template) request
+    /// does NOT return it and earns no diagnostic: the differential is real and the
+    /// `observation.value` diagnostic gate holds. RK-011: the draft mirrors the
+    /// observation and is attributed to the api app. Mutation: have the api
+    /// `render_tpl` render a fixed template (the fix) in the mvp build -> the
+    /// expression is not evaluated -> no secret -> the verdict assertion fails; change
+    /// the diagnostic gate to `Some(..)` in `exploit_ssti_from_vantage` -> the benign
+    /// control carries a diagnostic -> the `control.diagnostic.is_none()` assertion fails.
+    #[test]
+    fn ssti_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!("skipping ssti_check_flags_the_playground: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping ssti_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("api", "redstep/api:mvp", "lab")
+                .service("db", "redstep/db:mvp", "lab")
+                .build()
+                .expect("the flat api+db environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the playground (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let exploit_path = format!("/render?tpl={SSTI_INJECTION}");
+
+            let ctx = crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage);
+            let recorded = ctx
+                .exploit_ssti_from_vantage(&target, &exploit_path, SSTI_WITNESS)
+                .await
+                .expect("the vantage SSTI probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // A benign (non-template) input renders to itself: it never carries the
+            // secret, so the differential is real, not a probe that reads anything as a
+            // hit. A benign probe THROUGH the capability also earns no diagnostic (the
+            // domain diagnostic is gated on `observation.value`).
+            let benign_path = format!("/render?tpl={SSTI_BENIGN}");
+            let control = ctx
+                .exploit_ssti_from_vantage(&target, &benign_path, SSTI_WITNESS)
+                .await
+                .expect("the benign SSTI control ran");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable api fixture is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the injected expression was evaluated (the seeded secret was returned)"
+            );
+            assert!(
+                !control.observation.value,
+                "a benign non-template input never carries the secret: the differential is real"
+            );
+            assert!(
+                control.diagnostic.is_none(),
+                "a non-exploit (the benign control) carries no diagnostic: the ADR-0009 cause is attached only to a real evaluation, not a clean result"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(SSTI_WITNESS)
+                    && diagnostic.probable_cause.contains("template"),
+                "the domain cause names the witness and that input was evaluated as a template: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("bound data value"),
+                "the domain remediation names the fixed-template / bound-data fix: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the evidence draft mirrors the observation, and is tagged as the
+            // SSTI capability, so the record is not a faithful-looking projection of a
+            // constant nor mislabelled as another check.
+            assert_eq!(drafts[0].capability, "http_ssti_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].target,
+                format!("{}:{}", target.host(), target.port())
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/api:fixed`): the SSTI attack-to-defense loop closes (#90),
+    /// parallel to `command_injection_fix_and_replay_closes_the_loop`. A genuine SSTI
+    /// is recorded against the vulnerable api, and its own success witness (the
+    /// reproduction the seam emits) replays as still-exploitable against the vulnerable
+    /// image and not-exploitable, confidently, against `redstep/api:fixed` (which binds
+    /// the input as data). RK-016 positive control: a benign `/render` on the fixed
+    /// build still RENDERS its input (the response carries the input's rendered form,
+    /// `SSTI_BENIGN_RENDERED`, not just the banner), so "witness absent" is the fix
+    /// holding, not a renderer that answers a constant. The marker is the rendered
+    /// value rather than the banner because the banner is prefixed to every response
+    /// including a `template error` body, so a banner marker would pass over a broken
+    /// renderer (a row-6 false "secure"). Mutation: revert the api fix (render the
+    /// input as the template in `fixed` too) -> the expression evaluates again -> the
+    /// `on_fixed` assertion fails; make the fixed `render_tpl` return a constant
+    /// (`"template error"`) for every input -> the rendered benign form is absent ->
+    /// `benign.value` is false -> this fails (the gap the positive control closes).
+    #[test]
+    fn ssti_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!("skipping ssti_fix_and_replay_closes_the_loop: no Linux Docker daemon");
+            return;
+        }
+        for image in ["redstep/api:mvp", "redstep/api:fixed", "redstep/db:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping ssti_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |api_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("api", api_image, "lab")
+                    .service("db", "redstep/db:mvp", "lab")
+                    .build()
+                    .expect("the flat api+db environment is valid")
+            };
+            let vuln_env = flat("redstep/api:mvp");
+            let fixed_env = flat("redstep/api:fixed");
+            let request_path = format!("/render?tpl={SSTI_INJECTION}");
+
+            // Record a genuine exploit against the vulnerable lab and take ITS witness,
+            // the reproduction the recorder emits (parallel to the sibling loops).
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable api fixture");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("api:8081").expect("api is in scope");
+            let (recorded_vuln, draft) = http_witness_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                "http_ssti_vantage",
+                &request_path,
+                SSTI_WITNESS,
+                &[],
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording exploit ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_http_witness_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_http_witness_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // Positive control on the fixed lab: a benign /render still returns the
+            // banner, so "witness absent" is the fix, not a dead endpoint (RK-016).
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed api fixture");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("api:8081").expect("api is in scope");
+            let (benign, _) = http_witness_exploit_from(
+                &docker,
+                &net,
+                &target,
+                "http_ssti_vantage",
+                &format!("/render?tpl={SSTI_BENIGN}"),
+                SSTI_BENIGN_RENDERED,
+                &[],
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the benign /render ran");
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording exploit observed the template injection"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as still-exploitable against the vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the witness replays not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed negative is confident, not inconclusive"
+            );
+            assert!(
+                benign.value,
+                "positive control: the fixed /render still RENDERS the benign input (its rendered form is returned), not merely answers with the banner"
+            );
+        });
+    }
+
     /// The body of the sentinel file seeded OUTSIDE the api's web root
     /// (`playground/api/secret.txt`, baked to `/srv/secret.txt`); its presence in a
     /// `/file` response witnesses that a path traversal escaped the web root and
@@ -4382,6 +4682,24 @@ mod tests {
         assert_eq!(
             cmdi_cap, "http_cmdi_vantage",
             "the command-injection witness resolves to its own capability"
+        );
+
+        // The SSTI arm round-trips to its own capability too (#90): mapping it to
+        // another in `parse_http_witness` returns the wrong one here.
+        let ssti = Reproduction {
+            capability: HTTP_SSTI_VANTAGE.to_owned(),
+            target: "api:8081".to_owned(),
+            params: serde_json::json!({
+                "request_path": "/render?tpl=%7B%7B%20flag%20%7D%7D",
+                "marker": "REDSTEP_SSTI_WITNESS_7B1A",
+                "vantage_segment": "lab",
+                "timeout_ms": 5_000,
+            }),
+        };
+        let (ssti_cap, ..) = parse_http_witness(&ssti).expect("a complete ssti witness parses");
+        assert_eq!(
+            ssti_cap, "http_ssti_vantage",
+            "the SSTI witness resolves to its own capability"
         );
 
         let rejected = [

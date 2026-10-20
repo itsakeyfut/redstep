@@ -5,7 +5,7 @@ attack: [T1190]
 owasp: [A03:2021-Injection]
 cwe: [CWE-1336]
 targets: [web]
-capability: none
+capability: http_ssti_vantage
 ---
 
 # Server-Side Template Injection
@@ -30,20 +30,28 @@ marker only code execution could return).
 
 ## How redstep exercises it
 
-Not yet implemented (`capability: none`). The natural witness is in-band: inject an
-expression that evaluates to a value the request did not contain (an arithmetic result,
-or a sentinel printed by a called function) and read it from the response through the
-body-marker seam (`classify_http_witness`). A blind SSTI that reaches code execution
-could additionally call back to the in-lab canary
-([ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)).
+The `http_ssti_vantage` capability (`TestContext::exploit_ssti_from_vantage`) runs a
+probe from the attacker vantage against the playground api's `/render?tpl=` endpoint,
+whose vulnerable build renders the caller's input as the template source. The injected
+`{{ flag }}` evaluates against a secret seeded into the engine's template context, and
+the witness is that secret appearing in the response, read in-band through the
+body-marker seam (`classify_http_witness`). The secret is never in the request, so a
+server that merely reflected the input could not forge it (`validate_http_request`
+refuses a marker that appears in the request path). A blind SSTI that reaches code
+execution could additionally call back to the in-lab canary
+([ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)); redstep
+does not yet exercise that out-of-band variant.
 
 ## What a verdict means
 
-When implemented, a `Fail` (High) would mean the injected expression was evaluated by
-the engine, not merely reflected. A confident "not exploitable" would prove only that
-this payload's syntax did not evaluate, not that another engine's syntax would not
+A `Fail` (High) means the injected expression was evaluated by the engine, not merely
+reflected: the seeded secret only reaches the response when the template was evaluated.
+A confident "not exploitable" proves only that this payload's syntax did not evaluate,
+not that another engine's syntax would not
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)):
-the correct payload depends on which template engine is in use.
+the correct payload depends on which template engine is in use. An abnormal probe (one
+that could not reach the endpoint) is `Low`, so it lands Inconclusive rather than a
+confident "secure" (RK-002).
 
 ## Confinement
 

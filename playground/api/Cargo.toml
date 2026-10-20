@@ -23,3 +23,8 @@ tiny_http = "0.12.0"
 # `simple_query` with the raw SQL string, which is the vulnerability; the `fixed`
 # build runs a parameterized `query` instead.
 postgres = "0.19.7"
+# A template engine for `/render` (#90): the default build renders the caller's
+# input as the template source, which is the SSTI; the `fixed` build renders a
+# fixed template with the input bound as data. An unconditional dependency (both
+# builds use it), so `Cargo.lock` holds for the default and `--features fixed`.
+minijinja = "3.0.1"
