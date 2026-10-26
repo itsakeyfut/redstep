@@ -3542,10 +3542,19 @@ mod tests {
     /// it and only an executed `cat` can surface the witness in the response.
     const CMDI_INJECTION: &str = "x%3Bcat%20/srv/cmdi_secret.txt";
 
-    /// The constant banner the cmdi fixture prefixes to every `/exec` response; it is
-    /// not derived from the input, so the fix-replay positive control looks for it to
-    /// prove the fixed endpoint still answers (a broken fix returning nothing would not).
-    const CMDI_BANNER: &str = "exec result:";
+    /// A benign `cmd`, URL-encoded with a space (`%20`) so its decoded echoed form is
+    /// not a substring of the request path. The fixed `/exec` runs `echo` with it as
+    /// an argument, so only a working `echo` returns it.
+    const CMDI_BENIGN: &str = "redstep%20probe";
+
+    /// The benign command's RENDERED (echoed) output: the decoded `CMDI_BENIGN`. The
+    /// fix-replay positive control marks on THIS, not the banner, because the fixture
+    /// prefixes the banner to every `/exec` response including an error body, so a
+    /// banner marker would pass over a broken `echo` and certify a dead endpoint as
+    /// fixed (RK-016, a row-6 false "secure"). The decoded form (with the space) is
+    /// not a substring of the encoded request path, so `validate_http_request` admits
+    /// it as the marker.
+    const CMDI_BENIGN_RENDERED: &str = "redstep probe";
 
     /// Guard: the marker the cmdi exploit reads is the one the image actually bakes
     /// in. Offline on every gate, unlike the Docker-gated cmdi tests that self-skip
@@ -3700,10 +3709,16 @@ mod tests {
     /// Guard (Docker; self-skips without a Linux daemon or the built images): the
     /// recorded command-injection witness replays as still-exploitable against the
     /// vulnerable cmdi fixture and not-exploitable, confidently, against the fixed one
-    /// (#85). RK-016 positive control: a benign `/exec` on the fixed build still
-    /// returns the banner, so "witness absent" is the fix holding, not a dead
-    /// endpoint. Mutation: revert the api neutralisation (shell-concat in `fixed` too)
-    /// -> the injection executes again -> the `on_fixed` assertion fails.
+    /// (#85). RK-016 positive control: a benign `/exec` on the fixed build still RUNS
+    /// echo and returns its output (`CMDI_BENIGN_RENDERED`, the echoed benign value,
+    /// not the banner), so "witness absent" is the fix holding, not a dead endpoint.
+    /// The marker is the echoed value rather than the banner because the banner is
+    /// prefixed to every response including an error body, so a banner marker would
+    /// pass over a broken echo (#91, a row-6 false "secure"). Mutation: revert the api
+    /// neutralisation (shell-concat in `fixed` too) -> the injection executes again ->
+    /// the `on_fixed` assertion fails; make the fixed `run_exec` return a constant for
+    /// every input -> the echoed benign value is absent -> `benign.value` is false ->
+    /// this fails (the gap the positive control closes).
     #[test]
     fn command_injection_fix_and_replay_closes_the_loop() {
         if !linux_docker_available() {
@@ -3767,8 +3782,11 @@ mod tests {
                 .await
                 .expect("replay against the fixed lab ran");
 
-            // Positive control on the fixed lab: a benign /exec still returns the
-            // banner, so "witness absent" is the fix, not a dead endpoint (RK-016).
+            // Positive control on the fixed lab: a benign /exec still RUNS echo and
+            // returns its output, so "witness absent" is the fix, not a dead endpoint.
+            // The marker is the echoed benign value, not the banner: the banner is
+            // prefixed to every response including an error body, so a banner marker
+            // would pass over a broken echo (RK-016).
             let fixed_lab = bring_up(&docker, &fixed_env)
                 .await
                 .expect("bring up the fixed cmdi fixture");
@@ -3785,8 +3803,8 @@ mod tests {
                 &net,
                 &target,
                 "http_cmdi_vantage",
-                "/exec?cmd=benign",
-                CMDI_BANNER,
+                &format!("/exec?cmd={CMDI_BENIGN}"),
+                CMDI_BENIGN_RENDERED,
                 &[],
                 Duration::from_millis(5_000),
             )
@@ -3813,7 +3831,7 @@ mod tests {
             );
             assert!(
                 benign.value,
-                "positive control: the fixed /exec still answers (the banner is returned)"
+                "positive control: the fixed /exec still RUNS echo (its output is returned), not merely answers with the banner"
             );
         });
     }
