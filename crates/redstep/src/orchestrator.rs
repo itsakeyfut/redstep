@@ -1947,6 +1947,18 @@ fn blind_cmdi_coercion_path(canary_alias: &str, canary_port: u16, token: &str) -
     format!("/exec?cmd=x%3Bcurl%20-s%20http://{canary_alias}:{canary_port}/{token}")
 }
 
+/// Fail-closed check that an assembled out-of-band coercion `request_path` cannot
+/// re-aim the outer request's authority or split its request line (RK-015): it must
+/// start with `/` (so the literal `/exec` prefix, not a crafted component, fixes the
+/// outer authority) and contain no CR or LF (so a crafted `canary_alias` cannot
+/// inject a second request line). Lifted out of [`blind_cmdi_exploit_from`] as a
+/// pure function so this scope-relevant guard is pinned by an offline test on every
+/// gate, not only by the Docker-gated exploit path (where a dropped check would ship
+/// green). Parallel to the inline check in `ssrf_exploit_from`; #75 unifies them.
+fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
+    request_path.starts_with('/') && !request_path.contains('\r') && !request_path.contains('\n')
+}
+
 /// Coerce `app` (the command-injection target) from the attacker vantage to run an
 /// injected OS command that fetches `http://{canary_alias}:{canary_port}/{token}`,
 /// then witness the request OUT-OF-BAND in the canary's logs, exactly as
@@ -1966,9 +1978,9 @@ fn blind_cmdi_coercion_path(canary_alias: &str, canary_port: u16, token: &str) -
 /// draft is [`blind_cmdi_draft`], stamped `HTTP_BLIND_CMDI_VANTAGE` and attributed
 /// to `app`. Keeping this parallel to `ssrf_exploit_from` (rather than generalizing
 /// it) leaves the reviewed SSRF witness path untouched and gives #75 its second
-/// concrete out-of-band caller to unify (mvp.md).
+/// concrete out-of-band caller to unify.
 // allow(too_many_arguments): each argument is a distinct probe input, parallel to
-// `ssrf_exploit_from`; the M3 probe-inputs reshape (#75, mvp.md) groups them.
+// `ssrf_exploit_from`; the probe-inputs reshape (#75) groups them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn blind_cmdi_exploit_from(
     docker: &Docker,
@@ -1987,12 +1999,11 @@ pub(crate) async fn blind_cmdi_exploit_from(
     let request_path = blind_cmdi_coercion_path(canary_alias, canary_port, token);
     // Fail-closed validation of the interpolated path, as the SSRF coercion does
     // (RK-015). `canary_alias` is the one component not already constrained (the
-    // token is validated above, the port is a u16), so reject CR/LF so a crafted
-    // alias cannot inject a second request line; the leading-`/` test is a cheap
-    // invariant on the literal `/exec` prefix. The marker-in-path check does not
-    // apply (the token is in the path by design, and the witness is at the canary).
-    if !request_path.starts_with('/') || request_path.contains('\r') || request_path.contains('\n')
-    {
+    // token is validated above, the port is a u16), so `blind_cmdi_path_is_safe`
+    // rejects CR/LF (a crafted alias injecting a second request line) and checks the
+    // literal `/exec` prefix. The marker-in-path check does not apply (the token is
+    // in the path by design, and the witness is at the canary).
+    if !blind_cmdi_path_is_safe(&request_path) {
         return Err(Error::InvalidTarget {
             spec: request_path,
             reason:
@@ -2049,7 +2060,7 @@ pub(crate) async fn blind_cmdi_exploit_from(
 /// by capability and summary) keeps the shipped SSRF path untouched; #75 unifies
 /// the two out-of-band drafts.
 // allow(too_many_arguments): each argument is a distinct draft input, parallel to
-// `ssrf_draft`; kept flat until the #75 reshape (mvp.md).
+// `ssrf_draft`; kept flat until the #75 reshape.
 #[allow(clippy::too_many_arguments)]
 fn blind_cmdi_draft(
     segment: &str,
@@ -2105,7 +2116,7 @@ fn blind_cmdi_draft(
 /// identical fields make that clean). Pure and Docker-free, fail-closed on a
 /// missing/ill-typed field or a non-blind-cmdi capability (ADR-0022).
 // allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
-// `parse_ssrf_witness`; a named struct is the same #75 reshape (mvp.md), not now.
+// `parse_ssrf_witness`; a named struct is the same #75 reshape, not now.
 #[allow(clippy::type_complexity)]
 fn parse_blind_cmdi_witness(
     witness: &Reproduction,
@@ -6632,6 +6643,131 @@ mod tests {
         assert!(
             parse_blind_cmdi_witness(&not_blind_cmdi).is_err(),
             "a non-blind-cmdi (here SSRF) witness is rejected"
+        );
+    }
+
+    /// Guard: `blind_cmdi_path_is_safe` rejects an assembled coercion path that could
+    /// re-aim the outer request's authority or split its request line (RK-015). The
+    /// live vector is a `canary_alias` carrying CR/LF; the leading-`/` half backs the
+    /// literal `/exec` prefix. This is a scope-relevant guard, and before it was lifted
+    /// into a pure function the only thing exercising it was the Docker-gated exploit
+    /// path, which default-skips, so a dropped check shipped green on the offline gate.
+    /// Pure, no Docker. Mutation: make `blind_cmdi_path_is_safe` return `true`
+    /// unconditionally -> the CR/LF and leading-`/` cases pass -> this fails.
+    #[test]
+    fn blind_cmdi_path_is_safe_rejects_a_reaiming_or_splitting_path() {
+        // A normal coercion from constrained inputs is safe.
+        assert!(blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary", 8082, "tok12345"
+        )));
+        // A canary alias carrying CR/LF would split the outer request line, even though
+        // the alias reaches the path only in the query.
+        assert!(!blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary\r\nHost: evil",
+            8082,
+            "tok12345"
+        )));
+        assert!(!blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary\nGET /x",
+            8082,
+            "tok12345"
+        )));
+        // A path that does not start with '/' cannot rely on the literal prefix to fix
+        // the outer authority.
+        assert!(!blind_cmdi_path_is_safe("exec?cmd=x"));
+    }
+
+    /// Guard: `blind_cmdi_draft` mirrors the observation in the NON-exploit and the
+    /// abnormal directions, which the attribution test (only `value:true`/`High`) does
+    /// not reach; those summary branches were otherwise dead on the offline gate
+    /// (RK-011 in both directions). Pure, no Docker. Mutation: freeze `confidence:
+    /// observation.confidence` to `Confidence::High` -> the Low case fails; replace the
+    /// non-exploit or inconclusive summary text -> the matching `contains` fails.
+    #[test]
+    fn blind_cmdi_draft_mirrors_a_non_exploit_and_an_inconclusive_observation() {
+        let clean = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x",
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(clean.observed, serde_json::Value::Bool(false));
+        assert_eq!(clean.confidence, Confidence::High);
+        assert!(
+            clean.summary.contains("did not reach the canary"),
+            "a clean non-exploit summary: {:?}",
+            clean.summary
+        );
+        let inconclusive = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x",
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::Low,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(inconclusive.confidence, Confidence::Low);
+        assert!(
+            inconclusive.summary.contains("inconclusive"),
+            "an abnormal-probe summary: {:?}",
+            inconclusive.summary
+        );
+    }
+
+    /// Guard: `replay_blind_cmdi_probe` refuses a witness whose `request_path` does not
+    /// re-derive from its recorded canary and token, so a tampered witness cannot
+    /// replay a different injection than the one recorded (ADR-0022). The tamper-check
+    /// sits before `bring_up`, so it is reachable with no daemon (the `Docker` handle
+    /// is lazy and never used here). Mutation: change the `request_path != expected_path`
+    /// guard in `replay_blind_cmdi_probe` to `false` -> the tampered witness is accepted
+    /// and the replay proceeds past the check -> this (expecting `Err`) fails.
+    #[test]
+    fn replay_blind_cmdi_probe_refuses_a_tampered_witness() {
+        let draft = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            &blind_cmdi_coercion_path("canary", 8082, "tok12345"),
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        let mut witness = draft.reproduction;
+        // Tamper: a request_path that does not re-derive from canary+token (the token
+        // in the path is DIFFERENT, not tok12345).
+        witness.params.as_object_mut().unwrap().insert(
+            "request_path".to_owned(),
+            serde_json::json!("/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/DIFFERENT"),
+        );
+        let env = Environment::builder()
+            .segment("lab")
+            .vantage("lab")
+            .service("cmdi", "redstep/cmdi:mvp", "lab")
+            .service("canary", "redstep/canary:mvp", "lab")
+            .build()
+            .expect("the cmdi+canary environment is valid");
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_blind_cmdi_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::InvalidTarget { .. })),
+            "a tampered witness whose request_path does not re-derive must be refused before bring_up (got Ok: {})",
+            result.is_ok()
         );
     }
 

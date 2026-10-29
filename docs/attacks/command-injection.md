@@ -47,7 +47,7 @@ request path, so a reflected path cannot forge it.
 The **blind, out-of-band** channel, `http_blind_cmdi_vantage`
 (`exploit_blind_command_injection_from_vantage`), handles the case where the endpoint runs
 the command but returns no output. The probe injects a `curl` that makes the target call
-back to an in-lab canary at `http://<canary>/<token>`, and the per-probe token appearing in
+back to an in-lab canary at `http://<canary>:<port>/<token>`, and the per-probe token appearing in
 the canary's container logs is the witness, observed OUT-OF-BAND
 ([ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)), never in the
 target's own response. It reuses the SSRF canary mechanism; the one difference from the SSRF
@@ -63,9 +63,17 @@ an outbound request even though its response carried nothing. A `Pass` (not-expl
 High) means this payload did not execute: in-band, the sentinel did not come back; blind,
 the token did not reach the canary. A followed redirect or an abnormal probe is
 `Inconclusive`. A confident "not exploitable" proves only that this payload and quoting did
-not break out of the command, not that every shell context is safe; for the blind channel it
-also means only that THIS injection did not call back, so, like SSRF, it must be read beside
-a positive control that the canary records on the lab
+not break out of the command, not that every shell context is safe. The blind channel is
+weaker still, and in a way the in-band channel is not: its witness is a callback the target
+makes with its own tools, so a blind "not exploitable" presupposes both that the endpoint
+actually ran a command and that the target has a reachable outbound HTTP client (a `curl`).
+A target that is genuinely command-injectable but has no outbound client, or whose injected
+command errored before the callback, produces the same "no callback" as a secure one, and
+this single-probe check cannot tell them apart. So a blind "not exploitable" must be read as
+"this callback did not fire", not "not injectable", and beside a positive control that the
+canary records on the lab. Closing that gap in the capability (corroborating that the
+coercion fired, and varying the callback tool) is the deferred ADR-0010 follow-up it shares
+with SSRF, widened by the external-client dependency
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md),
 [ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)).
 

@@ -658,7 +658,13 @@ impl TestContext {
     /// injection did not reach the canary, not that the app is safe, so it MUST be
     /// paired with a positive control that the canary records on the lab (a direct
     /// hit); enforcing that corroboration in the capability is deferred under
-    /// ADR-0010's model. Errors with [`Error::LabUnavailable`] on a context with no
+    /// ADR-0010's model. The blind channel widens that gap past SSRF's: the callback
+    /// is made by the target's OWN tools, so a "not exploitable" here also presupposes
+    /// the target has a reachable outbound HTTP client (a `curl`) and that the command
+    /// ran at all. A genuinely injectable target with no such client reads identical to
+    /// a safe one, which is why a blind negative is "this callback did not fire", not
+    /// "not injectable" (see the catalog entry and the deferred follow-up). Errors with
+    /// [`Error::LabUnavailable`] on a context with no
     /// lab bound, or [`Error::InvalidTarget`] if the canary coordinates would not
     /// assemble a safe coercion (a weak token, or an alias carrying CR/LF).
     ///
