@@ -27,16 +27,45 @@ use redstep::{
 /// real services; the real vulnerable images are the H slice).
 const STANDIN_IMAGE: &str = "busybox:1.37";
 
-/// The lab is Linux containers (egress-less bridge networks, busybox), so it
-/// needs a daemon in Linux-container mode, not merely a reachable daemon: a
+/// The lab tests default to SKIPPED and run only when `REDSTEP_RUN_DOCKER_TESTS`
+/// is set, so a local `cargo test` creates no lab containers; CI opts in. When the
+/// opt-in is set, the daemon MUST be present and in Linux-container mode (a
 /// Windows-container daemon reports success for `docker info` but cannot run the
-/// lab. Skip unless `OSType` is `linux`.
+/// lab), and its absence is a loud `assert!` failure, not a skip: a silent skip in
+/// CI would leave the Docker-gated guards unrun while CI stayed green.
+/// (Mirrors the gate in `orchestrator.rs`.)
 fn linux_docker_available() -> bool {
-    std::process::Command::new("docker")
+    if std::env::var_os("REDSTEP_RUN_DOCKER_TESTS").is_none() {
+        return false;
+    }
+    let present = std::process::Command::new("docker")
         .args(["info", "--format", "{{.OSType}}"])
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "linux")
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        present,
+        "REDSTEP_RUN_DOCKER_TESTS is set but no Linux-container Docker daemon is \
+         available; the lab tests cannot run (unset it to skip them locally)"
+    );
+    true
+}
+
+/// Guard: without the opt-in, the lab gate is closed, so the integration lab tests
+/// create no containers (#98). A no-op in CI, where `REDSTEP_RUN_DOCKER_TESTS` is
+/// set. Mutation: drop the `is_none() -> return false` short-circuit in this file's
+/// `linux_docker_available()` -> on a machine with a Linux Docker daemon and the var
+/// unset it probes and returns `true` -> this assertion fails. (Mirrors the guard in
+/// `orchestrator.rs`; this one covers this file's own copy of the gate.)
+#[test]
+fn lab_tests_default_to_skipped_without_the_opt_in() {
+    if std::env::var_os("REDSTEP_RUN_DOCKER_TESTS").is_some() {
+        return;
+    }
+    assert!(
+        !linux_docker_available(),
+        "without REDSTEP_RUN_DOCKER_TESTS the lab gate must be closed (no containers)"
+    );
 }
 
 fn runtime() -> tokio::runtime::Runtime {

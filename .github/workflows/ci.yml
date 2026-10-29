@@ -120,9 +120,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   # --------------------------------------------------------------------------
-  # Playground lab (Linux). Builds the deliberately-vulnerable playground images
-  # (#47) so the Docker-gated lab tests actually run here instead of self-skipping
-  # on `image_present` (#52); without this leg the SQLi demo runs only locally.
+  # Playground lab (Linux). The lab tests default to skipped (#98); this leg builds
+  # the deliberately-vulnerable playground images (#47) and sets the opt-in
+  # `REDSTEP_RUN_DOCKER_TESTS` so they actually run here instead of only locally
+  # (#52), and fails if any lab test skips while opted in (a guard that silently
+  # did not run).
   # On its own leg so the image build does not slow the fmt/clippy/unit legs, and
   # `--test-threads=1` because the lab tests each create `redstep-*` networks and
   # running them in parallel exhausts Docker's predefined address pools. ADR-0014
@@ -143,7 +145,20 @@ jobs:
       - name: Build the playground images
         run: bash playground/build.sh
       - name: Lab tests (serialized; parallel labs exhaust the address pool)
-        run: cargo test --workspace -- --test-threads=1
+        env:
+          # The lab tests default to skipped (#98); this leg opts in so they run.
+          REDSTEP_RUN_DOCKER_TESTS: "1"
+        run: |
+          cargo test --workspace -- --test-threads=1 --nocapture 2>&1 | tee lab.log
+          # Ran-detection: opted in, the daemon is present (an absent one is a loud
+          # assert, not a skip) and build.sh built every image, so NO lab test may
+          # skip here. A skip means a guard silently did not run; fail the leg.
+          # Every Docker-gated test prints "skipping " on its skip path (the
+          # `eprintln!` next to each `return`); this grep keys on that convention.
+          if grep -q "skipping " lab.log; then
+            echo "::error::a Docker-gated lab test skipped while opted in; an image or the daemon is missing"
+            exit 1
+          fi
 
   # --------------------------------------------------------------------------
   # Aggregation gate: the single required check for branch protection. It
