@@ -51,6 +51,23 @@ fn linux_docker_available() -> bool {
     true
 }
 
+/// Guard: without the opt-in, the lab gate is closed, so the integration lab tests
+/// create no containers (#98). A no-op in CI, where `REDSTEP_RUN_DOCKER_TESTS` is
+/// set. Mutation: drop the `is_none() -> return false` short-circuit in this file's
+/// `linux_docker_available()` -> on a machine with a Linux Docker daemon and the var
+/// unset it probes and returns `true` -> this assertion fails. (Mirrors the guard in
+/// `orchestrator.rs`; this one covers this file's own copy of the gate.)
+#[test]
+fn lab_tests_default_to_skipped_without_the_opt_in() {
+    if std::env::var_os("REDSTEP_RUN_DOCKER_TESTS").is_some() {
+        return;
+    }
+    assert!(
+        !linux_docker_available(),
+        "without REDSTEP_RUN_DOCKER_TESTS the lab gate must be closed (no containers)"
+    );
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
