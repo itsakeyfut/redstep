@@ -14,7 +14,7 @@
 //! The MVP realises the membership-only model (ADR-0011): a boundary is
 //! separate networks with no connection between them, and a non-empty `allow` is
 //! refused upstream, so no cross-segment path is wired here; the firewall
-//! gateway for port-level boundaries is Phase 4 / M3.
+//! gateway for port-level boundaries is Phase 4 / v0.3.0.
 //!
 //! This unit stands the lab up, tears it down, and verifies isolation before a
 //! run. It makes no test verdict. That the egress-less flag is set is checked
@@ -551,7 +551,7 @@ trait Prober {
 /// same network, so it detects a workload wrongly attached to the `from` network
 /// (the MVP's all-or-nothing boundary) and needs no listener. It does not verify
 /// a routed or port-level boundary: the firewall gateway (ADR-0011, Phase 4 /
-/// M3) adds those and will need a TCP-to-port probe, not name-based ICMP.
+/// v0.3.0) adds those and will need a TCP-to-port probe, not name-based ICMP.
 ///
 /// The lab-wired runner gates on this before any test ([`run_in_running_lab`](crate::run_in_running_lab),
 /// #28): a failure is returned as `RunError::Lab` and no test runs. A caller that
@@ -706,7 +706,7 @@ async fn read_container_logs(docker: &Docker, container: &str) -> Result<(String
 /// redirect (#55). Returns `(state, stdout, stderr)`. The logs are read after the
 /// probe exits and before removal. This is the narrow log-capturing path #50 needs;
 /// the generalized
-/// in-container seam is M3 (mvp.md).
+/// in-container seam is v0.3.0 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
     network: &str,
@@ -1027,9 +1027,9 @@ pub(crate) const HTTP_BLIND_CMDI_VANTAGE: &str = "http_blind_cmdi_vantage";
 // allow(too_many_arguments): each argument is a distinct probe input (the lab
 // handle, the scoped target, the capability tag, the request path, the marker, the
 // identity headers, the timeout). This seam is the provisional M1/M2 shape of the
-// generalized in-container capability the roadmap reshapes in M3 (mvp.md); a
+// generalized in-container capability the roadmap reshapes in v0.3.0 (mvp.md); a
 // probe-inputs struct is the clean refactor at that point, so it is kept flat until
-// the M3 shape is known rather than invented now.
+// the v0.3.0 shape is known rather than invented now.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn http_witness_exploit_from(
     docker: &Docker,
@@ -1230,8 +1230,11 @@ fn response_was_redirected(headers: &str) -> bool {
 /// under the default-`High` gate, not an `Error`. Taking the state (not a bare
 /// code) folds the exited-cleanly check in via [`finished_exit_code`], so the
 /// whole fail-closed mapping is unit-tested without Docker. This is the single
-/// place the mapping lives (#75): a one-sided change to it is impossible, so
-/// hardening one technique can no longer leave another behind.
+/// place the mapping lives (#75): every caller routes through it, so hardening
+/// one technique cannot leave another on a divergent copy of the mapping. The
+/// routing is a convention the callers keep, not a property the compiler holds (a
+/// new caller could still skip it); the mapping itself is pinned both ways by
+/// `classify_witness_shared_maps_fail_closed`.
 fn classify_witness_shared(
     state: &ContainerState,
     witnessed: bool,
@@ -1294,7 +1297,7 @@ fn classify_http_witness(
 /// check like the `tcp_connect_vantage` reconnaissance probe. The vantage seam runs
 /// them without an intensity gate today (it mints no `IntensityCleared`, like
 /// `connect_from_vantage`); isolation and scope confine them to the lab regardless,
-/// and gating this seam is the deferred M3 work (ADR-0006, context.rs). The honest
+/// and gating this seam is the deferred v0.3.0 work (ADR-0006, context.rs). The honest
 /// label is what that future gate will read.
 // allow(too_many_arguments): mirrors `http_witness_exploit_from`'s inputs to build
 // the draft from them; the same reasoning applies.
@@ -1467,7 +1470,7 @@ pub(crate) async fn replay_vantage_probe(
 /// capability this build does not have cannot be replayed into the wrong technique.
 // allow(type_complexity): the parsed witness is a flat tuple of the probe inputs,
 // read positionally straight back into `http_witness_exploit_from`; a named struct
-// is the clean refactor for when M3 reshapes this seam (mvp.md), not now.
+// is the clean refactor for when v0.3.0 reshapes this seam (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_http_witness(
     witness: &Reproduction,
@@ -1622,7 +1625,7 @@ pub(crate) async fn replay_http_witness_probe(
 // allow(too_many_arguments): each argument is a distinct draft input (the segment,
 // the target spec, the coercion path, the token, the canary alias and port, the
 // observation, the timing). Parallel to `http_witness_draft`, it is kept flat until
-// the M3 probe-inputs reshape (mvp.md) rather than grouped into a struct now.
+// the v0.3.0 probe-inputs reshape (mvp.md) rather than grouped into a struct now.
 #[allow(clippy::too_many_arguments)]
 fn ssrf_draft(
     segment: &str,
@@ -1671,7 +1674,7 @@ fn ssrf_draft(
 /// port, and the applied timeout. Pure and Docker-free (parallel to
 /// `parse_http_witness`), fail-closed on a missing/ill-typed field (ADR-0022).
 // allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
-// `parse_http_witness`; a named struct is the same M3 reshape (mvp.md), not now.
+// `parse_http_witness`; a named struct is the same v0.3.0 reshape (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_ssrf_witness(
     witness: &Reproduction,
@@ -1735,7 +1738,7 @@ const SSRF_CANARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// returning `true` as soon as the token appears in stdout or stderr and `false`
 /// if it is still absent after the window (see [`SSRF_CANARY_POLL_ATTEMPTS`] for
 /// why a single read would risk a false PASS). The shared out-of-band witness read
-/// behind every canary-backed technique (SSRF, blind command injection, #75), so
+/// behind every canary-backed technique (SSRF and blind command injection), so
 /// the window and its row-6 rationale live in one place rather than copied per
 /// technique. Precondition: the caller has validated `token` as non-empty and
 /// specific ([`validate_ssrf_token`]), because `contains("")` is vacuously true and
@@ -1773,7 +1776,7 @@ async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> R
 // allow(too_many_arguments): each argument is a distinct probe input (the Docker
 // handle, the vantage network, the scoped target, the canary alias/port/container,
 // the token, the timeout). Parallel to `http_witness_exploit_from`, it is the
-// provisional seam kept flat until the M3 probe-inputs reshape (mvp.md).
+// provisional seam kept flat until the v0.3.0 probe-inputs reshape (mvp.md).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ssrf_exploit_from(
     docker: &Docker,
@@ -1947,7 +1950,9 @@ fn blind_cmdi_coercion_path(canary_alias: &str, canary_port: u16, token: &str) -
 /// inject a second request line). Lifted out of [`blind_cmdi_exploit_from`] as a
 /// pure function so this scope-relevant guard is pinned by an offline test on every
 /// gate, not only by the Docker-gated exploit path (where a dropped check would ship
-/// green). Parallel to the inline check in `ssrf_exploit_from`; #75 unifies them.
+/// green). Parallel to the inline check in `ssrf_exploit_from`, kept as a separate
+/// guard: #75 unified the out-of-band witness read and its classifier, not these
+/// path checks (they stay inline/local to each coercion).
 fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
     request_path.starts_with('/') && !request_path.contains('\r') && !request_path.contains('\n')
 }
@@ -1972,7 +1977,7 @@ fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
 /// the draft differ from the SSRF path; the witness read and its classification are
 /// the shared primitives #75 unified across the two callers.
 // allow(too_many_arguments): each argument is a distinct probe input, parallel to
-// `ssrf_exploit_from`; the probe-inputs reshape (#75) groups them.
+// `ssrf_exploit_from`; the probe-inputs reshape (deferred v0.3.0, mvp.md) groups them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn blind_cmdi_exploit_from(
     docker: &Docker,
@@ -2038,10 +2043,12 @@ pub(crate) async fn blind_cmdi_exploit_from(
 /// canary lives solely in the reproduction params, #65/#87, ADR-0023).
 /// Confidence-first summary, like `http_witness_draft`, so a `true` can never read
 /// sub-`High`. A separate function from `ssrf_draft` (rather than parameterizing it
-/// by capability and summary) keeps the shipped SSRF path untouched; #75 unifies
-/// the two out-of-band drafts.
+/// by capability and summary) keeps the shipped SSRF path untouched; the two
+/// out-of-band drafts stay separate on purpose (they carry different replay
+/// inputs, ADR-0023), which #75 left as is while unifying the witness read and
+/// classifier.
 // allow(too_many_arguments): each argument is a distinct draft input, parallel to
-// `ssrf_draft`; kept flat until the #75 reshape.
+// `ssrf_draft`; kept flat until the deferred v0.3.0 probe-inputs reshape (mvp.md).
 #[allow(clippy::too_many_arguments)]
 fn blind_cmdi_draft(
     segment: &str,
@@ -2093,11 +2100,14 @@ fn blind_cmdi_draft(
 /// canary alias and port, and the applied timeout. The witness fields are identical
 /// to an SSRF witness's (the out-of-band family shares them), so this is parallel to
 /// [`parse_ssrf_witness`]; it is a separate fail-closed parser rather than a shared
-/// one so the shipped SSRF parse stays untouched, and #75 unifies them (the
-/// identical fields make that clean). Pure and Docker-free, fail-closed on a
-/// missing/ill-typed field or a non-blind-cmdi capability (ADR-0022).
+/// one so the shipped SSRF parse stays untouched; the two parsers stay separate on
+/// purpose (the shared out-of-band family differs in capability and diagnostic),
+/// which #75 left as is while unifying the witness read and classifier. Pure and
+/// Docker-free, fail-closed on a missing/ill-typed field or a non-blind-cmdi
+/// capability (ADR-0022).
 // allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
-// `parse_ssrf_witness`; a named struct is the same #75 reshape, not now.
+// `parse_ssrf_witness`; a named struct is the deferred v0.3.0 probe-inputs reshape
+// (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_blind_cmdi_witness(
     witness: &Reproduction,
@@ -2797,7 +2807,9 @@ mod tests {
     /// still present downgrades to Low (so `redirected` is forwarded, not dropped).
     /// Mutations: drop the `body.contains` guard (hardcode `witnessed`) -> the
     /// present/absent pair no longer differ -> one fails; hardcode `redirected` to
-    /// `false` -> the redirected marker body reads true/High -> that assertion fails.
+    /// `false` -> the redirected marker body reads true/High -> that assertion fails;
+    /// substitute a clean `ContainerState` for the forwarded `state` -> the abnormal
+    /// case below reads High -> fails.
     #[test]
     fn classify_http_witness_reads_the_body_and_fails_closed() {
         use bollard::models::ContainerStateStatusEnum::EXITED;
@@ -2837,6 +2849,19 @@ mod tests {
         );
         assert!(!redirected.value);
         assert_eq!(redirected.confidence, Confidence::Low);
+
+        // An abnormal exit with the marker present is Low, not a confident exploit:
+        // this pins that the wrapper forwards the real `state` to the shared
+        // classifier rather than substituting one. A crashed probe whose captured
+        // body happens to contain the marker must not read as a clean witnessed hit.
+        let abnormal = classify_http_witness(
+            &state(Some(EXITED), Some(1)),
+            "label|REDSTEP_SQLI_WITNESS_7F3A\n",
+            witness,
+            false,
+        );
+        assert!(!abnormal.value);
+        assert_eq!(abnormal.confidence, Confidence::Low);
     }
 
     /// Guard: `response_was_redirected` fires on a 3xx *status line* anywhere in
@@ -4528,7 +4553,7 @@ mod tests {
     /// all three tiers share one egress-less network, and `web -> api -> db` is an
     /// application chain by DNS name. The network-segmented boundary ("db not
     /// directly reachable") is the boundary demo's own lab; the enforced port
-    /// boundary is M3. It reuses the one-shot probe seam (`run_probe_cmd`) with a
+    /// boundary is v0.3.0. It reuses the one-shot probe seam (`run_probe_cmd`) with a
     /// busybox `wget | grep`, so no first-class HTTP capability is built here (that
     /// is the check slice). It lives in-crate because `run_probe_cmd` is
     /// `pub(crate)` and it reads a run-scoped network name off the `RunningLab`.
@@ -5920,17 +5945,21 @@ mod tests {
 
     /// Guard: `classify_witness_shared` is the one fail-closed mapping every
     /// technique routes through (#75), so this single test pins the whole mapping
-    /// for the body-marker seam and every out-of-band caller at once: a one-sided
-    /// change to it can no longer pass. A clean exit (0) with the witness is
+    /// for the body-marker seam and the out-of-band callers at once: a one-sided
+    /// change to the mapping can no longer pass. (It pins the mapping, not which
+    /// `witnessed`/`redirected` each caller passes: that call-site wiring is pinned
+    /// by the Docker-gated end-to-end tests.) A clean exit (0) with the witness is
     /// exploited/High; a clean exit without it is not-exploitable/High; a followed
     /// redirect is Low even with the witness and a clean exit (the response may be
     /// from the redirect's host, or the out-of-band coercion may never have fired,
     /// #55); any other exit code, a kill, a missing code, or a never-run container
-    /// is Low even with the witness, because the probe did not establish the
+    /// is Low in BOTH witness directions, because the probe did not establish the
     /// target's behaviour and must not read as a confident "not exploitable"
     /// (RK-002, CLAUDE.md row 6). Pure, no Docker. Mutations, each caught here: give
     /// the abnormal arm `High` -> the abnormal cases read as a confident clean ->
-    /// fail; drop the `redirected` short-circuit -> the redirected witness reads
+    /// fail; split the abnormal arm so `_ if !witnessed => High` -> an errored
+    /// witnessless probe reads as a confident clean -> the witnessed=false abnormal
+    /// pass fails; drop the `redirected` short-circuit -> the redirected witness reads
     /// true/High -> fails; restrict the downgrade to `redirected && witnessed` -> the
     /// redirected witness-less clean reads false/High -> the redirect-no-witness case
     /// fails; drop the `witnessed` guard on the clean arm -> a clean exit without the
@@ -5964,22 +5993,35 @@ mod tests {
         assert!(!redirected_no_witness.value);
         assert_eq!(redirected_no_witness.confidence, Confidence::Low);
 
-        // Every abnormal probe is Low (value false) even with the witness seen: an
+        // Every abnormal probe is Low (value false) in BOTH witness directions: an
         // exit code other than 0, a kill, a missing code, and a never-run container.
+        // The witness-absent direction is the common real case (the probe refused /
+        // timed out / 404'd and nothing was witnessed), and it must still be Low, not
+        // a confident "not exploitable". Guarding only `witnessed=true` would let the
+        // `_` arm be split so `_ if !witnessed => High`, reading an errored witnessless
+        // probe as a confident clean (row 6). Mutation: `_ if !witnessed => ... High`
+        // (or `_ if witnessed => Low` with `_ => High`) -> the witnessed=false pass
+        // here fails.
         for abnormal in [
             state(Some(EXITED), Some(1)),
             state(Some(EXITED), Some(137)),
             state(Some(EXITED), None),
             state(Some(CREATED), Some(0)),
         ] {
-            let obs = classify_witness_shared(&abnormal, true, false);
-            assert!(!obs.value, "abnormal: {:?}", abnormal.status);
-            assert_eq!(
-                obs.confidence,
-                Confidence::Low,
-                "an abnormal probe is Low, not a confident not-exploitable: {:?}",
-                abnormal.status
-            );
+            for witnessed in [true, false] {
+                let obs = classify_witness_shared(&abnormal, witnessed, false);
+                assert!(
+                    !obs.value,
+                    "abnormal: {:?} witnessed={witnessed}",
+                    abnormal.status
+                );
+                assert_eq!(
+                    obs.confidence,
+                    Confidence::Low,
+                    "an abnormal probe is Low, not a confident not-exploitable: {:?} witnessed={witnessed}",
+                    abnormal.status
+                );
+            }
         }
     }
 
