@@ -14,13 +14,8 @@ the outside in. When an attack succeeds that is a security failure: redstep
 captures a success witness, you apply a fix, and a pinned replay confirms the
 attack is now blocked.
 
-## Status
-
-v0.1.0 is the first vertical slice (milestone M1): an isolated Docker lab, a
-scope gate and intensity ladder, a native TCP reachability capability, a native
-SQL-injection exploit -> fix -> replay loop over an HTTP vantage, a Pass / Fail /
-Inconclusive verdict oracle, and append-only evidence rendered as canonical JSON
-and a rustc-style diagnostic. The public API is not yet stable (pre-1.0).
+The public API is not yet stable (pre-1.0), and redstep is under active
+development.
 
 Docker is required: the lab is built as Docker containers.
 
