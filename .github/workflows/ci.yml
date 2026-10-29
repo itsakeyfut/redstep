@@ -153,6 +153,8 @@ jobs:
           # Ran-detection: opted in, the daemon is present (an absent one is a loud
           # assert, not a skip) and build.sh built every image, so NO lab test may
           # skip here. A skip means a guard silently did not run; fail the leg.
+          # Every Docker-gated test prints "skipping " on its skip path (the
+          # `eprintln!` next to each `return`); this grep keys on that convention.
           if grep -q "skipping " lab.log; then
             echo "::error::a Docker-gated lab test skipped while opted in; an image or the daemon is missing"
             exit 1
