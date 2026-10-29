@@ -1209,26 +1209,32 @@ fn response_was_redirected(headers: &str) -> bool {
     })
 }
 
-/// Classify a captured HTTP witness probe (see [`http_witness_exploit_from`] for why a followed
-/// redirect is untrustworthy). A redirect forces `Low` (value `false`), checked
-/// before the exit code because a witnessed marker with a clean exit would
-/// otherwise read `High`. Else a clean exit (0) whose body contains the `marker`
-/// is an exploit (`true`, `High`); a clean exit whose body lacks it is
-/// not-exploitable (`false`, `High`); any other exit code, or an unclean exit, is
-/// `Low` (value `false`), because the probe did not establish the endpoint's
-/// state and must not read as a confident "not exploitable" (RK-002, CLAUDE.md
-/// row 6, under ADR-0010's confidence gate). A redirect and an abnormal probe
-/// share that Inconclusive bucket: both downgrade to `Low` rather than erroring
-/// like `nc_result`/`classify_probe` (which back the boundary self-check, where
-/// an abnormal probe is a lab fault that must refuse the run); here it is a
+/// The one fail-closed witness mapping, shared by every technique whether its
+/// success signal is in-band (a marker in the probe's own body) or out-of-band (a
+/// per-probe token at a canary). `witnessed` is that signal, already reduced to a
+/// boolean by the caller. A followed redirect forces `Low` (value `false`),
+/// checked before the exit code because a witnessed-and-clean probe would
+/// otherwise read `High`: the response may be from the redirect's host rather than
+/// the scoped target (so a body marker is not provably the target's), and for an
+/// out-of-band probe the coercion may never have fired at the target at all, so a
+/// token-absent result is not a confident "not exploitable" (#55). Else a clean
+/// exit (0) with the witness is an exploit (`true`, `High`); a clean exit without
+/// it is not-exploitable (`false`, `High`); any other exit code, or an unclean
+/// exit, is `Low` (value `false`), because the probe did not establish the
+/// endpoint's state and must not read as a confident "not exploitable" (RK-002,
+/// CLAUDE.md row 6, under ADR-0010's confidence gate). A redirect and an abnormal
+/// probe share that Inconclusive bucket: both downgrade to `Low` rather than
+/// erroring like `nc_result`/`classify_probe` (which back the boundary self-check,
+/// where an abnormal probe is a lab fault that must refuse the run); here it is a
 /// per-test observation that could not conclude, which belongs in Inconclusive
 /// under the default-`High` gate, not an `Error`. Taking the state (not a bare
 /// code) folds the exited-cleanly check in via [`finished_exit_code`], so the
-/// whole fail-closed mapping is unit-tested without Docker.
-fn classify_http_witness(
+/// whole fail-closed mapping is unit-tested without Docker. This is the single
+/// place the mapping lives (#75): a one-sided change to it is impossible, so
+/// hardening one technique can no longer leave another behind.
+fn classify_witness_shared(
     state: &ContainerState,
-    body: &str,
-    marker: &str,
+    witnessed: bool,
     redirected: bool,
 ) -> Observation<bool> {
     if redirected {
@@ -1238,7 +1244,7 @@ fn classify_http_witness(
         };
     }
     match finished_exit_code(state) {
-        Ok(0) if body.contains(marker) => Observation {
+        Ok(0) if witnessed => Observation {
             value: true,
             confidence: Confidence::High,
         },
@@ -1251,6 +1257,19 @@ fn classify_http_witness(
             confidence: Confidence::Low,
         },
     }
+}
+
+/// Classify a captured HTTP body-marker probe (see [`http_witness_exploit_from`]
+/// for why a followed redirect is untrustworthy): the witness is `marker` present
+/// in the probe's own `body`. Reduces that to the boolean and defers the whole
+/// fail-closed mapping to [`classify_witness_shared`].
+fn classify_http_witness(
+    state: &ContainerState,
+    body: &str,
+    marker: &str,
+    redirected: bool,
+) -> Observation<bool> {
+    classify_witness_shared(state, body.contains(marker), redirected)
 }
 
 /// Compose the evidence draft for an HTTP witness vantage probe (parallel to
@@ -1593,43 +1612,6 @@ pub(crate) async fn replay_http_witness_probe(
     probed
 }
 
-/// Classify a captured SSRF probe by whether the coerced target reached the canary.
-/// The witness is OUT-OF-BAND: `seen` is whether the per-probe token appeared in
-/// the canary's logs, not anything in the probe's own response. A clean probe exit
-/// (0) with the token seen is an exploit (`true`/`High`); a clean exit with the
-/// token absent is not-exploitable (`false`/`High`); any other exit code, or an
-/// unclean exit (so the coercion itself did not complete), is `Low` (value
-/// `false`), because the probe did not establish the target's behaviour and must
-/// not read as a confident "not exploitable" (RK-002, ADR-0010). A followed
-/// redirect forces `Low` first (before the exit code): busybox `wget` exits 0 on a
-/// followed 3xx, but the redirect may have taken the probe somewhere other than the
-/// app's `/fetch`, so the coercion may never have fired and a token-absent result
-/// is not a confident "not exploitable" (the same hazard `classify_http_witness`
-/// guards for the body seam, #55). Pure given the inputs, so the mapping is
-/// unit-tested without Docker.
-fn classify_ssrf(state: &ContainerState, seen: bool, redirected: bool) -> Observation<bool> {
-    if redirected {
-        return Observation {
-            value: false,
-            confidence: Confidence::Low,
-        };
-    }
-    match finished_exit_code(state) {
-        Ok(0) if seen => Observation {
-            value: true,
-            confidence: Confidence::High,
-        },
-        Ok(0) => Observation {
-            value: false,
-            confidence: Confidence::High,
-        },
-        _ => Observation {
-            value: false,
-            confidence: Confidence::Low,
-        },
-    }
-}
-
 /// Compose the evidence draft for an SSRF vantage probe. The `target` is the
 /// coerced app (the scoped target), NOT the canary: the canary is only the
 /// observation point, so the finding is attributed to the app and the canary
@@ -1739,7 +1721,7 @@ fn parse_ssrf_witness(
     ))
 }
 
-/// The canary-log poll window for an out-of-band SSRF witness. The app's fetch is
+/// The canary-log poll window for an out-of-band witness. The app's callback is
 /// synchronous, but stdout -> Docker-log propagation can lag, so a single read
 /// could miss a just-arrived hit and read a confident false-negative (a false PASS,
 /// CLAUDE.md row 6). Ten reads at 200 ms (about 2 s) covers the propagation lag
@@ -1748,6 +1730,28 @@ fn parse_ssrf_witness(
 /// confident High `false`, so it is named rather than inlined.
 const SSRF_CANARY_POLL_ATTEMPTS: usize = 10;
 const SSRF_CANARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Poll `container`'s logs for `token` over the bounded out-of-band window,
+/// returning `true` as soon as the token appears in stdout or stderr and `false`
+/// if it is still absent after the window (see [`SSRF_CANARY_POLL_ATTEMPTS`] for
+/// why a single read would risk a false PASS). The shared out-of-band witness read
+/// behind every canary-backed technique (SSRF, blind command injection, #75), so
+/// the window and its row-6 rationale live in one place rather than copied per
+/// technique. Precondition: the caller has validated `token` as non-empty and
+/// specific ([`validate_ssrf_token`]), because `contains("")` is vacuously true and
+/// would forge a witness.
+async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> Result<bool> {
+    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
+        let (out, err) = read_container_logs(docker, container).await?;
+        if out.contains(token) || err.contains(token) {
+            return Ok(true);
+        }
+        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
+            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
+        }
+    }
+    Ok(false)
+}
 
 /// Coerce `app` (the SSRF target) from the attacker vantage to fetch
 /// `http://{canary_alias}:{canary_port}/{token}` server-side, then witness the
@@ -1812,21 +1816,10 @@ pub(crate) async fn ssrf_exploit_from(
         applied + Duration::from_secs(5),
     )
     .await?;
-    // The witness is out-of-band, so poll the canary's logs over the bounded window
-    // (see SSRF_CANARY_POLL_ATTEMPTS for why a single read would risk a false PASS),
-    // returning as soon as the token appears.
-    let mut seen = false;
-    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
-        let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
-        if canary_out.contains(token) || canary_err.contains(token) {
-            seen = true;
-            break;
-        }
-        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
-            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
-        }
-    }
-    let observation = classify_ssrf(&state, seen, response_was_redirected(&headers));
+    // The witness is out-of-band, so poll the canary's logs over the bounded
+    // window, returning as soon as the token appears.
+    let seen = poll_logs_for_token(docker, canary_container, token).await?;
+    let observation = classify_witness_shared(&state, seen, response_was_redirected(&headers));
     let spec = format!("{}:{}", app.host(), app.port());
     let draft = ssrf_draft(
         vantage.segment(),
@@ -1969,16 +1962,15 @@ fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
 /// what "blind" means), so this is a separate path from the body-marker seam, like
 /// SSRF.
 ///
-/// It reuses the shared, content-free out-of-band primitives rather than refactoring
-/// the shipped SSRF path: `validate_ssrf_token` (the token is untrusted on the
-/// replay path and an empty one would false-witness), `run_probe_capturing`, the
-/// bounded canary-log poll (`SSRF_CANARY_POLL_*`, so a hit still propagating is not
-/// read as a confident not-reached), `classify_ssrf` (the pure out-of-band
-/// classifier, which carries no SSRF-specific text), and `read_container_logs`. The
-/// draft is [`blind_cmdi_draft`], stamped `HTTP_BLIND_CMDI_VANTAGE` and attributed
-/// to `app`. Keeping this parallel to `ssrf_exploit_from` (rather than generalizing
-/// it) leaves the reviewed SSRF witness path untouched and gives #75 its second
-/// concrete out-of-band caller to unify.
+/// It shares the content-free out-of-band primitives with [`ssrf_exploit_from`]:
+/// `validate_ssrf_token` (the token is untrusted on the replay path and an empty
+/// one would false-witness), `run_probe_capturing`, [`poll_logs_for_token`] (the
+/// bounded canary-log poll, so a hit still propagating is not read as a confident
+/// not-reached), and [`classify_witness_shared`] (the one fail-closed witness
+/// mapping, in-band and out-of-band alike). The draft is [`blind_cmdi_draft`],
+/// stamped `HTTP_BLIND_CMDI_VANTAGE` and attributed to `app`. Only the coercion and
+/// the draft differ from the SSRF path; the witness read and its classification are
+/// the shared primitives #75 unified across the two callers.
 // allow(too_many_arguments): each argument is a distinct probe input, parallel to
 // `ssrf_exploit_from`; the probe-inputs reshape (#75) groups them.
 #[allow(clippy::too_many_arguments)]
@@ -2022,21 +2014,10 @@ pub(crate) async fn blind_cmdi_exploit_from(
         applied + Duration::from_secs(5),
     )
     .await?;
-    // The witness is out-of-band, so poll the canary's logs over the bounded window
-    // (see SSRF_CANARY_POLL_ATTEMPTS for why a single read would risk a false PASS),
-    // returning as soon as the token appears.
-    let mut seen = false;
-    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
-        let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
-        if canary_out.contains(token) || canary_err.contains(token) {
-            seen = true;
-            break;
-        }
-        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
-            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
-        }
-    }
-    let observation = classify_ssrf(&state, seen, response_was_redirected(&headers));
+    // The witness is out-of-band, so poll the canary's logs over the bounded
+    // window, returning as soon as the token appears.
+    let seen = poll_logs_for_token(docker, canary_container, token).await?;
+    let observation = classify_witness_shared(&state, seen, response_was_redirected(&headers));
     let spec = format!("{}:{}", app.host(), app.port());
     let draft = blind_cmdi_draft(
         vantage.segment(),
@@ -2806,25 +2787,20 @@ mod tests {
         }
     }
 
-    /// Guard: `classify_http_witness` reads a captured HTTP witness probe. A followed redirect is
-    /// `Low` even with the witness in the body, because the body may be from the
-    /// redirect's host, not the target (#55). Else a clean exit (0) whose body
-    /// carries the witness is exploited at `High`; a clean exit whose body lacks it
-    /// is not-exploitable at `High`; any other code, or an unclean exit, is `Low`
-    /// (value `false`) so it lands Inconclusive under the default gate, never a
-    /// confident "not exploitable" (RK-002, CLAUDE.md row 6). Mutation: ignore the
-    /// `redirected` argument -> a redirected witness body reads as a confident
-    /// exploit -> the with-witness redirect assertion fails; restrict the downgrade
-    /// to `redirected && body.contains(marker)` -> a redirected marker-less 200
-    /// reads as a confident "not exploitable" from another host's page (row 6) ->
-    /// the no-witness redirect assertion fails; give the abnormal arm `High` -> a
-    /// connect failure reads as a confident clean -> the Low assertions fail (the
-    /// row-6 guard); give clean-no-witness `Low` -> the fixed-target PASS path (#50
-    /// beta) can never reach a confident Pass -> that assertion fails; drop the
-    /// `body.contains` guard -> a clean 200 with no flag reads as exploited -> fails.
+    /// Guard: `classify_http_witness` is the body-marker wrapper over
+    /// [`classify_witness_shared`]. Its own responsibility is to reduce the body to
+    /// the witness boolean (`body.contains(marker)`) and forward `state` and
+    /// `redirected` unchanged; the full fail-closed mapping is owned and tested by
+    /// `classify_witness_shared_maps_fail_closed`. At a clean exit, a body carrying
+    /// the marker is exploited/High and a body lacking it is not-exploitable/High
+    /// (so `body.contains` drives the signal); a followed redirect with the marker
+    /// still present downgrades to Low (so `redirected` is forwarded, not dropped).
+    /// Mutations: drop the `body.contains` guard (hardcode `witnessed`) -> the
+    /// present/absent pair no longer differ -> one fails; hardcode `redirected` to
+    /// `false` -> the redirected marker body reads true/High -> that assertion fails.
     #[test]
     fn classify_http_witness_reads_the_body_and_fails_closed() {
-        use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
+        use bollard::models::ContainerStateStatusEnum::EXITED;
         let state = |status, code| ContainerState {
             status,
             exit_code: code,
@@ -2850,8 +2826,9 @@ mod tests {
         assert!(!clean.value);
         assert_eq!(clean.confidence, Confidence::High);
 
-        // A followed redirect is Inconclusive even with the witness present and a
-        // clean exit: the body is not provably the scoped target's (#55).
+        // A followed redirect downgrades even with the marker in the body: this pins
+        // that the wrapper forwards `redirected` rather than dropping it (the reason
+        // the downgrade is right, #55, is the shared classifier's to assert).
         let redirected = classify_http_witness(
             &state(Some(EXITED), Some(0)),
             "label|REDSTEP_SQLI_WITNESS_7F3A\n",
@@ -2860,36 +2837,6 @@ mod tests {
         );
         assert!(!redirected.value);
         assert_eq!(redirected.confidence, Confidence::Low);
-
-        // And without the witness: a redirected clean 200 must not read as a
-        // confident "not exploitable" (that would be a confident verdict on another
-        // host's page, row 6). The downgrade is unconditional on the body.
-        let redirected_no_witness = classify_http_witness(
-            &state(Some(EXITED), Some(0)),
-            "welcome|hello\n",
-            witness,
-            true,
-        );
-        assert!(!redirected_no_witness.value);
-        assert_eq!(redirected_no_witness.confidence, Confidence::Low);
-
-        // A non-zero clean exit (HTTP error / connect failure) and an unclean exit
-        // are both inconclusive, whatever the (empty) body: value false at Low.
-        for abnormal in [
-            state(Some(EXITED), Some(1)),   // wget error (connect/HTTP)
-            state(Some(EXITED), Some(137)), // killed
-            state(Some(EXITED), None),      // no code
-            state(Some(CREATED), Some(0)),  // never ran
-        ] {
-            let obs = classify_http_witness(&abnormal, "", witness, false);
-            assert!(!obs.value, "abnormal: {:?}", abnormal.status);
-            assert_eq!(
-                obs.confidence,
-                Confidence::Low,
-                "an abnormal probe is Low, not a confident not-exploitable: {:?}",
-                abnormal.status
-            );
-        }
     }
 
     /// Guard: `response_was_redirected` fires on a 3xx *status line* anywhere in
@@ -5971,39 +5918,69 @@ mod tests {
     const SSRF_TOKEN: &str = "redstep-ssrf-witness-7e1a";
     const SSRF_CONTROL_TOKEN: &str = "redstep-ssrf-control-9f2b";
 
-    /// Guard: `classify_ssrf` maps the out-of-band signal fail-closed. A clean probe
-    /// exit with the token seen at the canary is exploited/High; a clean exit with
-    /// it absent is not-exploitable/High; an abnormal exit (the coercion did not
-    /// complete) is Low even if the token was seen, because the probe did not
-    /// establish the target's behaviour (RK-002). Pure, no Docker. Mutation: give
-    /// the abnormal arm `High` -> the abnormal case fails.
+    /// Guard: `classify_witness_shared` is the one fail-closed mapping every
+    /// technique routes through (#75), so this single test pins the whole mapping
+    /// for the body-marker seam and every out-of-band caller at once: a one-sided
+    /// change to it can no longer pass. A clean exit (0) with the witness is
+    /// exploited/High; a clean exit without it is not-exploitable/High; a followed
+    /// redirect is Low even with the witness and a clean exit (the response may be
+    /// from the redirect's host, or the out-of-band coercion may never have fired,
+    /// #55); any other exit code, a kill, a missing code, or a never-run container
+    /// is Low even with the witness, because the probe did not establish the
+    /// target's behaviour and must not read as a confident "not exploitable"
+    /// (RK-002, CLAUDE.md row 6). Pure, no Docker. Mutations, each caught here: give
+    /// the abnormal arm `High` -> the abnormal cases read as a confident clean ->
+    /// fail; drop the `redirected` short-circuit -> the redirected witness reads
+    /// true/High -> fails; restrict the downgrade to `redirected && witnessed` -> the
+    /// redirected witness-less clean reads false/High -> the redirect-no-witness case
+    /// fails; drop the `witnessed` guard on the clean arm -> a clean exit without the
+    /// witness reads true -> fails.
     #[test]
-    fn classify_ssrf_reads_the_canary_and_fails_closed() {
-        use bollard::models::ContainerStateStatusEnum::EXITED;
+    fn classify_witness_shared_maps_fail_closed() {
+        use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
         let state = |status, code| ContainerState {
             status,
             exit_code: code,
             ..Default::default()
         };
-        let seen = classify_ssrf(&state(Some(EXITED), Some(0)), true, false);
+        let seen = classify_witness_shared(&state(Some(EXITED), Some(0)), true, false);
         assert!(seen.value);
         assert_eq!(seen.confidence, Confidence::High);
 
-        let clean = classify_ssrf(&state(Some(EXITED), Some(0)), false, false);
+        let clean = classify_witness_shared(&state(Some(EXITED), Some(0)), false, false);
         assert!(!clean.value);
         assert_eq!(clean.confidence, Confidence::High);
 
-        let abnormal = classify_ssrf(&state(Some(EXITED), Some(1)), true, false);
-        assert!(!abnormal.value);
-        assert_eq!(abnormal.confidence, Confidence::Low);
-
-        // A followed redirect is Low even on a clean exit with the token seen: the
-        // probe may not have reached the app's /fetch, so the coercion may not have
-        // fired. Mutation: drop the `redirected` short-circuit in classify_ssrf ->
-        // this reads true/High -> fails.
-        let redirected = classify_ssrf(&state(Some(EXITED), Some(0)), true, true);
+        // A followed redirect is Low even on a clean exit with the witness seen: the
+        // response may not be the scoped target's, so the signal does not conclude.
+        let redirected = classify_witness_shared(&state(Some(EXITED), Some(0)), true, true);
         assert!(!redirected.value);
         assert_eq!(redirected.confidence, Confidence::Low);
+
+        // And a redirected witness-less clean must not read as a confident "not
+        // exploitable": the downgrade is unconditional on the witness.
+        let redirected_no_witness =
+            classify_witness_shared(&state(Some(EXITED), Some(0)), false, true);
+        assert!(!redirected_no_witness.value);
+        assert_eq!(redirected_no_witness.confidence, Confidence::Low);
+
+        // Every abnormal probe is Low (value false) even with the witness seen: an
+        // exit code other than 0, a kill, a missing code, and a never-run container.
+        for abnormal in [
+            state(Some(EXITED), Some(1)),
+            state(Some(EXITED), Some(137)),
+            state(Some(EXITED), None),
+            state(Some(CREATED), Some(0)),
+        ] {
+            let obs = classify_witness_shared(&abnormal, true, false);
+            assert!(!obs.value, "abnormal: {:?}", abnormal.status);
+            assert_eq!(
+                obs.confidence,
+                Confidence::Low,
+                "an abnormal probe is Low, not a confident not-exploitable: {:?}",
+                abnormal.status
+            );
+        }
     }
 
     /// Guard: `validate_ssrf_token` fails closed on a token that is empty, too
