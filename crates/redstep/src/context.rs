@@ -344,7 +344,7 @@ impl TestContext {
         let draft_ref = self.record_draft(draft);
         // Only an executed injection earns the domain diagnostic; its text asserts
         // the injection ran, which holds iff the marker was observed.
-        let diagnostic = observation.value.then(|| sqli_diagnostic(marker));
+        let diagnostic = gated_diagnostic(observation.value, || sqli_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -392,9 +392,8 @@ impl TestContext {
         let draft_ref = self.record_draft(draft);
         // Only an executed command earns the domain diagnostic; its text asserts a
         // command ran, true iff the marker (the command's output) was observed.
-        let diagnostic = observation
-            .value
-            .then(|| command_injection_diagnostic(marker));
+        let diagnostic =
+            gated_diagnostic(observation.value, || command_injection_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -443,7 +442,7 @@ impl TestContext {
         // Only an evaluated expression earns the domain diagnostic; its text asserts
         // the template was evaluated, which holds iff the marker (the seeded secret)
         // was observed.
-        let diagnostic = observation.value.then(|| ssti_diagnostic(marker));
+        let diagnostic = gated_diagnostic(observation.value, || ssti_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -495,7 +494,7 @@ impl TestContext {
         let draft_ref = self.record_draft(draft);
         // Only a traversal that read the sentinel earns the domain diagnostic; its
         // text asserts a file outside the web root was read, true iff observed.
-        let diagnostic = observation.value.then(|| path_traversal_diagnostic(marker));
+        let diagnostic = gated_diagnostic(observation.value, || path_traversal_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -569,7 +568,7 @@ impl TestContext {
         let draft_ref = self.record_draft(draft);
         // Only an object actually read across the boundary earns the diagnostic; its
         // text asserts another user's object was served, true iff observed.
-        let diagnostic = observation.value.then(|| idor_diagnostic(marker));
+        let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -633,7 +632,7 @@ impl TestContext {
         let draft_ref = self.record_draft(draft);
         // Only a coercion that actually reached the canary earns the diagnostic;
         // its text asserts the server reached an internal host, true iff observed.
-        let diagnostic = observation.value.then(|| ssrf_diagnostic(canary_alias));
+        let diagnostic = gated_diagnostic(observation.value, || ssrf_diagnostic(canary_alias));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -652,6 +651,20 @@ impl TestContext {
         drafts.push(draft);
         DraftRef::new(index)
     }
+}
+
+/// Attach a domain diagnostic only to an observed exploit. The ADR-0009 cause is
+/// carried iff the capability actually witnessed the technique (`observed`), so a
+/// clean non-exploit never carries one; `make` is called only then. Every vantage
+/// check routes its diagnostic through this one gate, so the "always attach"
+/// mutation lives here and a single offline test
+/// (`gated_diagnostic_attaches_only_to_an_observed_exploit`) stands for all of them.
+/// Before this, the gate (`observation.value.then(..)`) was inlined per method and
+/// guarded only by each Docker-gated flags test, so the mutation shipped green
+/// off-Docker (#88; #85/#90 reviews). Pure, no lab. The capability-stamping half of
+/// that same gap needs the method to run offline and is deferred to #94 (M3).
+fn gated_diagnostic(observed: bool, make: impl FnOnce() -> Diagnostic) -> Option<Diagnostic> {
+    observed.then(make)
 }
 
 /// The ADR-0009 domain diagnostic for a successful SQL injection: the cause names
@@ -1257,6 +1270,31 @@ mod tests {
             matches!(result, Err(Error::LabUnavailable { .. })),
             "exploit_sqli_from_vantage without a vantage must fail closed (got Ok: {})",
             result.is_ok()
+        );
+    }
+
+    /// Guard: the shared diagnostic gate attaches a diagnostic only to an observed
+    /// exploit, and does not evaluate the constructor on a clean result. Every
+    /// vantage check (sqli, command injection, ssti, path traversal, idor, ssrf)
+    /// routes its diagnostic through `gated_diagnostic`, so this one offline test
+    /// stands for all six: the "always attach" mutation lives in the helper, not in
+    /// the methods, and before #88 that mutation shipped green off-Docker because the
+    /// only guard was each Docker-gated flags test. Mutation: change the helper's
+    /// `observed.then(make)` to `Some(make())` -> the not-observed case returns `Some`
+    /// and runs the panicking constructor -> this fails.
+    #[test]
+    fn gated_diagnostic_attaches_only_to_an_observed_exploit() {
+        assert!(
+            gated_diagnostic(false, || panic!(
+                "the constructor must not run on a clean result"
+            ))
+            .is_none(),
+            "a non-exploit carries no diagnostic"
+        );
+        assert_eq!(
+            gated_diagnostic(true, || sqli_diagnostic("M")),
+            Some(sqli_diagnostic("M")),
+            "an observed exploit carries the constructed diagnostic"
         );
     }
 
