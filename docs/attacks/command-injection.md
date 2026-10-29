@@ -5,7 +5,7 @@ attack: [T1190]
 owasp: [A03:2021-Injection]
 cwe: [CWE-78]
 targets: [web]
-capability: http_cmdi_vantage
+capability: [http_cmdi_vantage, http_blind_cmdi_vantage]
 ---
 
 # OS Command Injection
@@ -30,28 +30,52 @@ callback, never the payload appearing in the body.
 
 ## How redstep exercises it
 
-Implemented in-band as `http_cmdi_vantage` (`exploit_command_injection_from_vantage`),
-a caller over the shared HTTP witness seam, like the SQL injection check. The target is
-a dedicated playground fixture, `redstep/cmdi`, because the other fixtures' runtime is
-distroless and cannot run a shell; its `GET /exec?cmd=` builds a shell command from the
-input on the mvp build and runs it with an argument vector (no shell) on the fixed one.
-The probe injects `;cat` of a sentinel file the image bakes in, and the witness is that
-file's body appearing in the response (read by `classify_http_witness`), which is the
-injected command's OUTPUT, never the injected bytes: the seam refuses a marker that
-appears in the request path, so a reflected path cannot forge it. The blind,
-out-of-band variant (the injected command calls back to the in-lab canary,
-[ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)) is a
-follow-up, not yet built.
+redstep exercises command injection over two witness channels against one dedicated
+playground fixture, `redstep/cmdi` (a separate target because the other fixtures'
+runtime is distroless and cannot run a shell). Its `GET /exec?cmd=` builds a shell
+command from the input on the mvp build and runs it with an argument vector (no shell)
+on the fixed one, so the same payload is exploitable against mvp and inert against
+fixed.
+
+The **in-band** channel, `http_cmdi_vantage` (`exploit_command_injection_from_vantage`),
+is a caller over the shared HTTP witness seam, like the SQL injection check. The probe
+injects `;cat` of a sentinel file the image bakes in, and the witness is that file's body
+appearing in the response (read by `classify_http_witness`), which is the injected
+command's OUTPUT, never the injected bytes: the seam refuses a marker that appears in the
+request path, so a reflected path cannot forge it.
+
+The **blind, out-of-band** channel, `http_blind_cmdi_vantage`
+(`exploit_blind_command_injection_from_vantage`), handles the case where the endpoint runs
+the command but returns no output. The probe injects a `curl` that makes the target call
+back to an in-lab canary at `http://<canary>:<port>/<token>`, and the per-probe token appearing in
+the canary's container logs is the witness, observed OUT-OF-BAND
+([ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)), never in the
+target's own response. It reuses the SSRF canary mechanism; the one difference from the SSRF
+check is that the coercion is a command injection at `/exec`, not a URL parameter. Time-based
+blind detection (a deliberate delay with no callback) is a separate, later technique.
 
 ## What a verdict means
 
-A `Fail` (High) means an injected command executed: the baked sentinel, which only a
-successful `cat` could return, came back in the response. A `Pass` (not-exploitable,
-High) means this payload did not execute. A followed redirect or an abnormal probe is
-`Inconclusive`. A confident "not exploitable" proves only that this payload and quoting
-did not break out of the command, not that every shell context is safe, and it does not
-cover the blind case, which has no in-response output and awaits the out-of-band variant
-([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+A `Fail` (High) means an injected command executed. In-band, that witness is the baked
+sentinel, which only a successful `cat` could return, coming back in the response; blind,
+it is the per-probe token reaching the in-lab canary, so the target ran a command that made
+an outbound request even though its response carried nothing. A `Pass` (not-exploitable,
+High) means this payload did not execute: in-band, the sentinel did not come back; blind,
+the token did not reach the canary. A followed redirect or an abnormal probe is
+`Inconclusive`. A confident "not exploitable" proves only that this payload and quoting did
+not break out of the command, not that every shell context is safe. The blind channel is
+weaker still, and in a way the in-band channel is not: its witness is a callback the target
+makes with its own tools, so a blind "not exploitable" presupposes both that the endpoint
+actually ran a command and that the target has a reachable outbound HTTP client (a `curl`).
+A target that is genuinely command-injectable but has no outbound client, or whose injected
+command errored before the callback, produces the same "no callback" as a secure one, and
+this single-probe check cannot tell them apart. So a blind "not exploitable" must be read as
+"this callback did not fire", not "not injectable", and beside a positive control that the
+canary records on the lab. Closing that gap in the capability (corroborating that the
+coercion fired, and varying the callback tool) is the deferred ADR-0010 follow-up it shares
+with SSRF, widened by the external-client dependency
+([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md),
+[ADR-0023](../adr/0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md)).
 
 ## Confinement
 

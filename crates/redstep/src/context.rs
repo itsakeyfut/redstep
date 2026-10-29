@@ -30,8 +30,8 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
-    HTTP_SSTI_VANTAGE, LabNetwork, http_witness_exploit_from, ssrf_exploit_from, ssrf_token,
-    tcp_reachable_from,
+    HTTP_SSTI_VANTAGE, LabNetwork, blind_cmdi_exploit_from, http_witness_exploit_from,
+    ssrf_exploit_from, ssrf_token, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -640,6 +640,76 @@ impl TestContext {
         })
     }
 
+    /// The lab-wired BLIND OS command injection check (#87): the out-of-band twin
+    /// of [`exploit_command_injection_from_vantage`](Self::exploit_command_injection_from_vantage).
+    /// Where the in-band check witnesses the injected command's OUTPUT in the
+    /// probe's own response, a blind injection returns no output, so this coerces
+    /// the target to run an injected command that calls back to the in-lab canary
+    /// and witnesses the per-probe token in the canary's logs, OUT-OF-BAND, exactly
+    /// as [`exploit_ssrf_from_vantage`](Self::exploit_ssrf_from_vantage) does
+    /// (`blind_cmdi_exploit_from`, ADR-0023). `canary_alias`/`canary_port` are where
+    /// the injected command is steered, and `canary_container` is the container
+    /// whose logs are read for the token. An exploit is observed at `High`, a clean
+    /// non-exploit at `High`, and an abnormal probe at `Low` (ADR-0010, RK-002). The
+    /// diagnostic is carried only when the callback fired (`observation.value`),
+    /// like the siblings.
+    ///
+    /// Like the SSRF check, a confident "not exploitable" means only that THIS
+    /// injection did not reach the canary, not that the app is safe, so it MUST be
+    /// paired with a positive control that the canary records on the lab (a direct
+    /// hit); enforcing that corroboration in the capability is deferred under
+    /// ADR-0010's model. The blind channel widens that gap past SSRF's: the callback
+    /// is made by the target's OWN tools, so a "not exploitable" here also presupposes
+    /// the target has a reachable outbound HTTP client (a `curl`) and that the command
+    /// ran at all. A genuinely injectable target with no such client reads identical to
+    /// a safe one, which is why a blind negative is "this callback did not fire", not
+    /// "not injectable" (see the catalog entry and the deferred follow-up). Errors with
+    /// [`Error::LabUnavailable`] on a context with no
+    /// lab bound, or [`Error::InvalidTarget`] if the canary coordinates would not
+    /// assemble a safe coercion (a weak token, or an alias carrying CR/LF).
+    ///
+    /// The attack this runs, and what a verdict about it means, are the catalog
+    /// entry `docs/attacks/command-injection.md`.
+    pub async fn exploit_blind_command_injection_from_vantage(
+        &self,
+        app: &ScopedTarget,
+        canary_alias: &str,
+        canary_port: u16,
+        canary_container: &str,
+    ) -> Result<Recorded<bool>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; exploit_blind_command_injection_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        // Mint a fresh, unique per-probe token here, not from the caller: this
+        // callback must be distinguishable and a caller cannot pass a weak or
+        // forgeable one. The out-of-band token helper is shared with SSRF.
+        let token = ssrf_token();
+        let (observation, draft) = blind_cmdi_exploit_from(
+            &binding.docker,
+            &binding.vantage_network,
+            app,
+            canary_alias,
+            canary_port,
+            canary_container,
+            &token,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+        .await?;
+        let draft_ref = self.record_draft(draft);
+        // Only an injection that actually reached the canary earns the diagnostic;
+        // its text asserts the target ran an injected command that called out, true
+        // iff observed.
+        let diagnostic = gated_diagnostic(observation.value, || {
+            blind_command_injection_diagnostic(canary_alias)
+        });
+        Ok(Recorded {
+            observation,
+            draft_ref,
+            diagnostic,
+        })
+    }
+
     /// Push one evidence draft into the sink and return its per-test reference.
     /// Borrow / push / drop, with no await across the borrow. The draft's per-test
     /// index is its position in the sink, which the runner offsets by the test's
@@ -695,6 +765,28 @@ fn command_injection_diagnostic(marker: &str) -> Diagnostic {
         probable_cause: format!(
             "the response returned {marker:?}, the output of a command the request injected, \
              so request input reached an OS shell and the command executed"
+        ),
+        remediation: "run the program with an argument vector (no shell) and validate the \
+             input against an expected shape, so request input cannot inject a command"
+            .to_owned(),
+    }
+}
+
+/// The ADR-0009 domain diagnostic for a successful BLIND OS command injection: the
+/// cause names the in-lab host the target called back to, which proves request
+/// input ran an OS command that made an outbound request even though the response
+/// carried no command output; the remediation is the same arg-vector-and-validate
+/// fix as the in-band case. A distinct diagnostic from
+/// [`command_injection_diagnostic`] because the witness is a canary callback, not a
+/// returned marker. Framework-emitted, not author-written (ADR-0009). Pure, so the
+/// text is guarded without Docker
+/// (`blind_command_injection_diagnostic_names_the_callback_and_the_fix`).
+fn blind_command_injection_diagnostic(canary_alias: &str) -> Diagnostic {
+    Diagnostic {
+        probable_cause: format!(
+            "the target called back to the in-lab host {canary_alias:?} with the injected token, \
+             so request input ran an OS command that made an outbound request (blind command \
+             injection: the command executed but returned no output in the response)"
         ),
         remediation: "run the program with an argument vector (no shell) and validate the \
              input against an expected shape, so request input cannot inject a command"
@@ -1503,6 +1595,55 @@ mod tests {
         assert!(
             d.probable_cause.contains("CMDI42") && d.probable_cause.contains("shell"),
             "the cause names the marker and that input reached a shell: {:?}",
+            d.probable_cause
+        );
+        assert!(
+            d.remediation.contains("argument vector"),
+            "the remediation names the argument-vector fix: {:?}",
+            d.remediation
+        );
+    }
+
+    /// Guard: `exploit_blind_command_injection_from_vantage` on a context with no lab
+    /// bound fails closed with `LabUnavailable`, like its siblings (no daemon needed).
+    /// Mutation: unwrap `self.lab` instead of the `ok_or_else` -> the `None` case
+    /// panics -> this (expecting an `Err`) fails.
+    #[test]
+    fn exploit_blind_command_injection_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("cmdi:8083")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("cmdi:8083").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.exploit_blind_command_injection_from_vantage(
+            &target,
+            "canary",
+            8082,
+            "ignored-container",
+        ));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "exploit_blind_command_injection_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: the blind command-injection domain diagnostic names the in-lab host the
+    /// target called back to (the out-of-band witness) and that no output was returned,
+    /// and names the argument-vector fix, so a reader gets ADR-0009 actionable guidance
+    /// distinct from the in-band cause. Pure, no Docker. Mutation: drop the host or
+    /// "outbound request" from the cause, or change "argument vector" in the
+    /// remediation -> the matching assertion fails.
+    #[test]
+    fn blind_command_injection_diagnostic_names_the_callback_and_the_fix() {
+        let d = blind_command_injection_diagnostic("canary");
+        assert!(
+            d.probable_cause.contains("canary") && d.probable_cause.contains("outbound request"),
+            "the cause names the callback host and that it made an outbound request: {:?}",
             d.probable_cause
         );
         assert!(

