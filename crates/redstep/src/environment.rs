@@ -378,8 +378,9 @@ impl EnvironmentBuilder {
                     )));
                 }
                 gateway_pairs.push((from.clone(), to.clone()));
+                let mut ports_seen: Vec<u16> = Vec::new();
                 for spec in &allow {
-                    let Some((workload, _port)) = parse_allow_spec(spec) else {
+                    let Some((workload, port)) = parse_allow_spec(spec) else {
                         return Err(invalid(format!(
                             "gateway boundary {from:?} -> {to:?} allow spec {spec:?} is not a \
                              valid workload:port (a workload name, a colon, a port 1-65535)"
@@ -402,6 +403,20 @@ impl EnvironmentBuilder {
                         }
                         Some(_) => {}
                     }
+                    // One gateway mediates on a single address, so its proxy keys on
+                    // port alone: two specs on the same port (whatever the workload)
+                    // would collide on one listener, and a connection to either name
+                    // would reach one backend, over-permitting the other. Refuse it
+                    // so port -> workload stays injective (ADR-0024's single-address
+                    // limitation). This also rejects an identical spec given twice.
+                    if ports_seen.contains(&port) {
+                        return Err(invalid(format!(
+                            "gateway boundary {from:?} -> {to:?} has two allow specs on port \
+                             {port}; one gateway address cannot distinguish them, so a port may \
+                             appear once"
+                        )));
+                    }
+                    ports_seen.push(port);
                 }
             } else if !allow.is_empty() {
                 // A membership-only boundary cannot enforce a port-level allow, so
@@ -737,6 +752,38 @@ mod tests {
         assert!(
             matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("second gateway boundary") && reason.contains("collide")),
             "a second gateway on the same pair: {result:?}"
+        );
+    }
+
+    /// Guard: a gateway boundary whose `allow` names two specs on the same port is
+    /// refused, because one gateway mediates on a single address and cannot tell
+    /// the two workloads apart on that port (ADR-0024), so a connection to either
+    /// name would reach one backend and over-permit the other. An identical spec
+    /// given twice is refused the same way. Mutation: drop the `ports_seen` check
+    /// in `build` -> the same-port specs build -> this fails.
+    #[test]
+    fn a_gateway_allow_with_a_repeated_port_is_refused() {
+        let base = || {
+            Environment::builder()
+                .segment("dmz")
+                .segment("internal")
+                .vantage("dmz")
+                .service("api", "busybox:1", "internal")
+                .service("web", "busybox:1", "internal")
+        };
+        let two_workloads = base()
+            .gateway_boundary("dmz", "internal", &["api:8080", "web:8080"])
+            .build();
+        assert!(
+            matches!(&two_workloads, Err(Error::InvalidEnvironment { reason }) if reason.contains("port 8080") && reason.contains("once")),
+            "two workloads on one port: {two_workloads:?}"
+        );
+        let identical = base()
+            .gateway_boundary("dmz", "internal", &["api:8080", "api:8080"])
+            .build();
+        assert!(
+            matches!(&identical, Err(Error::InvalidEnvironment { reason }) if reason.contains("port 8080")),
+            "an identical spec twice: {identical:?}"
         );
     }
 

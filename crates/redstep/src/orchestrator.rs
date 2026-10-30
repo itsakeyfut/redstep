@@ -251,6 +251,59 @@ async fn container_ip_on(docker: &Docker, container: &str, network: &str) -> Res
         })
 }
 
+/// The names of the networks a container is attached to.
+async fn container_networks(docker: &Docker, container: &str) -> Result<Vec<String>> {
+    let info = docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .map_err(lab_unavailable)?;
+    Ok(info
+        .network_settings
+        .and_then(|s| s.networks)
+        .map(|m| m.into_keys().collect())
+        .unwrap_or_default())
+}
+
+/// Decide a `to`-workload's structural isolation for a gateway boundary from the
+/// networks it is attached to: it must be on its own `to` segment network and
+/// NOT on the `from` network. The prober-based self-check cannot test an allowed
+/// workload by name, because that name is aliased to the gateway (ADR-0024), so
+/// this structural check is what catches a `to`-workload wrongly dual-homed onto
+/// `from` -- which would expose its non-allowed ports directly, bypassing the
+/// proxy (a false "contained", F-SEC1) -- and the case where it is missing from
+/// its own network. It restores, for a gateway boundary, the defense-in-depth
+/// layer the ICMP membership check gives a plain boundary (ADR-0006). Pure, so
+/// it is unit-tested without Docker.
+///
+/// The guard is `to_workload_isolation_rejects_a_from_attachment`.
+fn to_workload_isolation(
+    attached: &[String],
+    from_net: &str,
+    to_net: &str,
+    from: &str,
+    to: &str,
+    workload: &str,
+) -> Result<()> {
+    if !attached.iter().any(|n| n == to_net) {
+        return Err(Error::LabUnavailable {
+            reason: format!(
+                "gateway self-check: {to} workload {workload:?} is not on its own segment \
+                 network; the lab is malformed, so the boundary cannot be certified"
+            ),
+        });
+    }
+    if attached.iter().any(|n| n == from_net) {
+        return Err(Error::BoundaryViolated {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// The container command for a workload, by kind (#46). A `Standin` runs
 /// `sleep 3600` to stay alive and inspectable (its image, e.g. busybox, would
 /// otherwise exit at once); a `Service` runs its own command, where `None`
@@ -803,6 +856,29 @@ pub async fn boundary_self_check(
     lab: &RunningLab,
 ) -> Result<()> {
     pull_image(docker, PROBE_IMAGE).await?;
+    // Structural membership for every gateway boundary before the prober-based
+    // check: an allowed workload is aliased to the gateway, so a probe cannot test
+    // it by name, and only an inspect catches it wrongly dual-homed onto `from`
+    // (F-SEC1, restoring for a gateway boundary the layer ICMP gives a plain one).
+    for boundary in env.boundaries().iter().filter(|b| b.is_gateway_mediated()) {
+        let from_net = segment_network(lab, boundary.from())?;
+        let to_net = segment_network(lab, boundary.to())?;
+        for target in lab
+            .containers()
+            .iter()
+            .filter(|c| c.segment() == boundary.to())
+        {
+            let attached = container_networks(docker, target.name()).await?;
+            to_workload_isolation(
+                &attached,
+                from_net,
+                to_net,
+                boundary.from(),
+                boundary.to(),
+                target.workload(),
+            )?;
+        }
+    }
     check_boundaries(
         env,
         lab,
@@ -3281,6 +3357,39 @@ mod tests {
             ]),
             "socat TCP-LISTEN:8080,fork,reuseaddr TCP:172.19.0.2:8080 & \
              socat TCP-LISTEN:80,fork,reuseaddr TCP:172.19.0.3:80 & wait"
+        );
+    }
+
+    /// Guard: `to_workload_isolation` accepts a `to`-workload on its own segment
+    /// network only, reads a `from`-network attachment as a boundary violation
+    /// (the workload is dual-homed onto `from`, bypassing the gateway: F-SEC1),
+    /// and reads a missing own-network attachment as a malformed lab. Mutations:
+    /// drop the `from_net` attachment check -> the dual-homed case returns `Ok`
+    /// -> this fails; drop the `to_net` check -> the off-its-own-network case
+    /// returns `Ok` -> this fails.
+    #[test]
+    fn to_workload_isolation_rejects_a_from_attachment() {
+        let isolated = ["n-internal".to_owned()];
+        assert!(
+            to_workload_isolation(&isolated, "n-dmz", "n-internal", "dmz", "internal", "api")
+                .is_ok(),
+            "a workload on its own segment only is isolated"
+        );
+        let dual_homed = ["n-internal".to_owned(), "n-dmz".to_owned()];
+        assert!(
+            matches!(
+                to_workload_isolation(&dual_homed, "n-dmz", "n-internal", "dmz", "internal", "api"),
+                Err(Error::BoundaryViolated { from, to }) if from == "dmz" && to == "internal"
+            ),
+            "a workload also on `from` is a violation"
+        );
+        let elsewhere = ["n-other".to_owned()];
+        assert!(
+            matches!(
+                to_workload_isolation(&elsewhere, "n-dmz", "n-internal", "dmz", "internal", "api"),
+                Err(Error::LabUnavailable { .. })
+            ),
+            "a workload off its own network is a malformed lab"
         );
     }
 
