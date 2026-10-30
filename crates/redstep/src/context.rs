@@ -30,8 +30,9 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
-    HTTP_SSTI_VANTAGE, LabNetwork, blind_cmdi_exploit_from, http_witness_exploit_from,
-    ssrf_exploit_from, ssrf_token, tcp_reachable_from,
+    HTTP_SSTI_VANTAGE, LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE,
+    blind_cmdi_exploit_from, http_witness_exploit_from, ssrf_exploit_from, ssrf_token,
+    tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -284,6 +285,7 @@ impl TestContext {
             &binding.vantage_network,
             target,
             DEFAULT_CONNECT_TIMEOUT,
+            TCP_CONNECT_VANTAGE,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -292,6 +294,56 @@ impl TestContext {
             draft_ref,
             diagnostic: None,
         })
+    }
+
+    /// Enumerate which of `targets` the attacker's vantage can reach, as network
+    /// service discovery (ATT&CK T1046, `docs/attacks/network-service-discovery.md`):
+    /// the blast-radius measurement expressed as a catalogued technique. It probes
+    /// each target from the vantage with the same reachability primitive as
+    /// [`connect_from_vantage`](Self::connect_from_vantage), records one evidence draft per target stamped
+    /// `network_service_discovery_vantage` (attributed to the vantage, not the host),
+    /// and returns the per-target [`Recorded`] results in the order of `targets`
+    /// (so `results[i]` is `targets[i]`).
+    ///
+    /// Each target keeps its OWN confidence: a completed connect is reachable at
+    /// `High`, an explicit refusal is not-reachable at `High`, and a timeout or a
+    /// probe-side/local error is `Low` (never a confident "not reachable", RK-002).
+    /// This is why the result is a per-target vector and not one aggregate
+    /// observation: a single `Observation` carries one `Confidence`, so a mixed set
+    /// (one target reached, another a probe-side failure) would collapse to one
+    /// confidence and could read a weak signal as confident, a row-6 risk (#111).
+    /// The v0.4.0 nmap adapter is the fuller version of this technique (ADR-0007);
+    /// the per-target shape here is the precedent it follows.
+    ///
+    /// Errors with [`Error::LabUnavailable`] on a context with no lab bound: there
+    /// is no vantage to act from. An empty `targets` returns an empty vector.
+    pub async fn discover_services_from_vantage(
+        &self,
+        targets: &[ScopedTarget],
+    ) -> Result<Vec<Recorded<bool>>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; \
+                     discover_services_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let mut discovered = Vec::with_capacity(targets.len());
+        for target in targets {
+            let (observation, draft) = tcp_reachable_from(
+                &binding.docker,
+                &binding.vantage_network,
+                target,
+                DEFAULT_CONNECT_TIMEOUT,
+                NETWORK_SERVICE_DISCOVERY_VANTAGE,
+            )
+            .await?;
+            let draft_ref = self.record_draft(draft);
+            discovered.push(Recorded {
+                observation,
+                draft_ref,
+                diagnostic: None,
+            });
+        }
+        Ok(discovered)
     }
 
     /// Attempt a SQL injection against `target` from the attacker's vantage and

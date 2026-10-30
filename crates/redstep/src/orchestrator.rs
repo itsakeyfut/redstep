@@ -887,6 +887,7 @@ pub(crate) async fn tcp_reachable_from(
     vantage: &LabNetwork,
     target: &ScopedTarget,
     timeout: Duration,
+    capability: &'static str,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
     // Whole seconds for `nc -w`; record this applied value, not the requested
     // `timeout`, so the reproduction restates what actually ran.
@@ -909,6 +910,7 @@ pub(crate) async fn tcp_reachable_from(
 
     let spec = format!("{host}:{port}");
     let draft = vantage_draft(
+        capability,
         vantage.segment(),
         spec,
         &observation,
@@ -925,6 +927,7 @@ pub(crate) async fn tcp_reachable_from(
 /// `NodeRef`) and the reproduction params: ADR-0004 keeps the reproduction
 /// self-contained, the same reason `capability` and `target` sit on both.
 fn vantage_draft(
+    capability: &'static str,
     segment: &str,
     target_spec: String,
     observation: &Observation<bool>,
@@ -932,7 +935,7 @@ fn vantage_draft(
     applied: Duration,
 ) -> EvidenceDraft {
     EvidenceDraft {
-        capability: "tcp_connect_vantage",
+        capability,
         target: target_spec.clone(),
         intensity: Intensity::Safe,
         observed: serde_json::Value::Bool(observation.value),
@@ -942,7 +945,7 @@ fn vantage_draft(
             segment: segment.to_owned(),
         }),
         reproduction: Reproduction {
-            capability: "tcp_connect_vantage".to_owned(),
+            capability: capability.to_owned(),
             target: target_spec,
             params: serde_json::json!({
                 "timeout_ms": applied.as_millis() as u64,
@@ -960,6 +963,13 @@ fn vantage_draft(
 /// is on its own path and is parsed by `parse_ssrf_witness`), so the name lives in
 /// one place rather than being retyped at each site.
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
+/// The single-target TCP reachability probe and the multi-target network-service
+/// discovery (#111, ATT&CK T1046) share one probe (`tcp_reachable_from`) and differ
+/// only in the technique they are attributed to, so the capability is a parameter
+/// of the probe rather than hardcoded. A connect probe stays `tcp_connect_vantage`
+/// so its canonical JSON is unchanged (RK-003); discovery stamps its own name.
+pub(crate) const TCP_CONNECT_VANTAGE: &str = "tcp_connect_vantage";
+pub(crate) const NETWORK_SERVICE_DISCOVERY_VANTAGE: &str = "network_service_discovery_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";
@@ -1445,7 +1455,7 @@ pub(crate) async fn replay_vantage_probe(
     // mirroring run_in_lab (a teardown failure warns, it does not mask the
     // observation).
     let probed = match vantage_network(&lab, &segment) {
-        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout)
+        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout, TCP_CONNECT_VANTAGE)
             .await
             .map(|(observation, _draft)| observation),
         Err(e) => Err(e),
@@ -3682,12 +3692,22 @@ mod tests {
                 .build();
             let target = scope.resolve(&spec).expect("in scope");
 
-            let same_net =
-                tcp_reachable_from(&docker, &net("a", &net_a), &target, Duration::from_secs(2))
-                    .await;
-            let cross_net =
-                tcp_reachable_from(&docker, &net("b", &net_b), &target, Duration::from_secs(2))
-                    .await;
+            let same_net = tcp_reachable_from(
+                &docker,
+                &net("a", &net_a),
+                &target,
+                Duration::from_secs(2),
+                TCP_CONNECT_VANTAGE,
+            )
+            .await;
+            let cross_net = tcp_reachable_from(
+                &docker,
+                &net("b", &net_b),
+                &target,
+                Duration::from_secs(2),
+                TCP_CONNECT_VANTAGE,
+            )
+            .await;
 
             // Clean up before asserting so a failed assertion does not leak.
             let _ = docker
@@ -3800,7 +3820,14 @@ mod tests {
             let target = crate::scope::Scope::from_environment(&env)
                 .resolve(&format!("svc:{port}"))
                 .expect("svc is in scope");
-            let probe = tcp_reachable_from(&docker, &edge, &target, Duration::from_secs(3)).await;
+            let probe = tcp_reachable_from(
+                &docker,
+                &edge,
+                &target,
+                Duration::from_secs(3),
+                TCP_CONNECT_VANTAGE,
+            )
+            .await;
             let _ = lab.teardown().await;
 
             let (observation, _draft) = probe.expect("the probe ran");
@@ -4758,6 +4785,7 @@ mod tests {
             confidence: Confidence::High,
         };
         let draft = vantage_draft(
+            TCP_CONNECT_VANTAGE,
             "internet",
             "db:5432".to_owned(),
             &observation,
@@ -4796,6 +4824,7 @@ mod tests {
             confidence: Confidence::Low,
         };
         let draft = vantage_draft(
+            TCP_CONNECT_VANTAGE,
             "internet",
             "db:5432".to_owned(),
             &observation,
@@ -4809,6 +4838,36 @@ mod tests {
         assert_eq!(draft.summary, "unreachable");
         assert_eq!(draft.reproduction.capability, "tcp_connect_vantage");
         assert_eq!(draft.reproduction.target, "db:5432");
+    }
+
+    /// Guard: `vantage_draft` stamps the capability it is GIVEN into both the
+    /// draft's `capability` and its `reproduction.capability`, so a single-target
+    /// connect (`tcp_connect_vantage`) and network service discovery
+    /// (`network_service_discovery_vantage`, #111) record under their own
+    /// techniques though they share the probe. The connect string is also pinned so
+    /// its canonical JSON stays fixed (RK-003). Pure, no Docker. Mutation: hardcode
+    /// either `capability` field back to a literal in `vantage_draft` -> the
+    /// discovery case reads the wrong technique -> this fails (the Docker discovery
+    /// test asserts the returned observation, not the draft's recorded capability,
+    /// so it cannot catch a mis-stamp).
+    #[test]
+    fn vantage_draft_stamps_the_given_capability() {
+        let observation = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        for capability in [TCP_CONNECT_VANTAGE, NETWORK_SERVICE_DISCOVERY_VANTAGE] {
+            let draft = vantage_draft(
+                capability,
+                "dmz",
+                "web:80".to_owned(),
+                &observation,
+                "reachable",
+                Duration::from_millis(2_000),
+            );
+            assert_eq!(draft.capability, capability);
+            assert_eq!(draft.reproduction.capability, capability);
+        }
     }
 
     /// Guard: a witness whose replay inputs cannot be read is rejected rather
@@ -5647,10 +5706,15 @@ mod tests {
             let scoped = Scope::from_environment(&env)
                 .resolve("db:5432")
                 .expect("db is in scope");
-            let (recorded, draft) =
-                tcp_reachable_from(&docker, internet, &scoped, Duration::from_secs(2))
-                    .await
-                    .expect("the probe ran");
+            let (recorded, draft) = tcp_reachable_from(
+                &docker,
+                internet,
+                &scoped,
+                Duration::from_secs(2),
+                TCP_CONNECT_VANTAGE,
+            )
+            .await
+            .expect("the probe ran");
             lab.teardown().await.expect("teardown after recording");
 
             // Replay from the recorded witness and check it reproduces.

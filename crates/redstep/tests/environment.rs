@@ -602,3 +602,72 @@ fn assume_breach_dmz_declares_the_internal_boundary() {
         "db runs a real listener, so the containment probe tests a reachable service, not a dead port"
     );
 }
+
+/// Guard (Docker): network service discovery from the assume-breach DMZ vantage
+/// (#111, ATT&CK T1046). `discover_services_from_vantage` over `web:80` (in the
+/// vantage's own `dmz` segment, listening) and `db:5432` (in `internal`, across
+/// the boundary) enumerates per-target reachability: `web` is reachable at `High`,
+/// `db` is not. So the enumeration distinguishes a service the foothold reaches
+/// from one the boundary contains, each attributed to the vantage with its own
+/// confidence. Mutation: point the first target across the boundary, or stop the
+/// `web` listener -> the `web` reachable assertion fails; stamp the wrong
+/// capability in `vantage_draft` -> the offline
+/// `vantage_draft_stamps_the_given_capability` fails. Driven through the real
+/// `bring_up`.
+#[test]
+fn discovery_from_the_dmz_vantage_enumerates_reachability() {
+    if !linux_docker_available() {
+        eprintln!(
+            "skipping discovery_from_the_dmz_vantage_enumerates_reachability: no Linux Docker daemon"
+        );
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = assume_breach_dmz();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the assume-breach DMZ lab");
+
+        // Enumerate from the DMZ vantage, over the same lab-bound context the runner
+        // builds (the vantage segment's network and the environment scope). Captured
+        // as a `Result` so teardown runs whatever it returns.
+        let discovered = {
+            let scope = Scope::from_environment(&env);
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == env.vantage_segment())
+                .cloned()
+                .expect("the dmz vantage network is in the running lab");
+            let ctx = TestContext::new_in_lab(scope, docker.clone(), vantage);
+            let targets = vec![
+                ctx.resolve("web:80")
+                    .expect("web:80 resolves in the lab scope"),
+                ctx.resolve("db:5432")
+                    .expect("db:5432 resolves in the lab scope"),
+            ];
+            ctx.discover_services_from_vantage(&targets).await
+        };
+
+        let _ = lab.teardown().await;
+
+        let discovered = discovered.expect("the discovery enumeration runs");
+        assert_eq!(discovered.len(), 2, "one result per target, in input order");
+        // web:80 is in the vantage's own dmz segment and listening, so reachable.
+        assert!(
+            discovered[0].observation.value,
+            "web:80 is reachable from the dmz foothold (its own segment)"
+        );
+        assert_eq!(
+            discovered[0].observation.confidence,
+            Confidence::High,
+            "a reached listener is High-confidence"
+        );
+        // db:5432 is in internal, across the dmz -> internal boundary, so contained.
+        assert!(
+            !discovered[1].observation.value,
+            "db:5432 is contained from the dmz foothold (across the boundary)"
+        );
+    });
+}
