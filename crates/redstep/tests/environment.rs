@@ -349,6 +349,130 @@ fn gateway_mediates_a_declared_inter_segment_path() {
     });
 }
 
+/// A gateway-ENFORCED topology (#114): `dmz -> internal` enforced by a gateway
+/// allowing `api:8080` and `web:80`. Every target runs a real listener so the
+/// reachability checks are non-vacuous (RK-008): `api` listens on 8080 (allowed)
+/// AND 5432 (a served-but-denied port), `web` on 80 (allowed), and `db` on 5432
+/// (`db` is a non-allowed workload that nonetheless serves a port). So "api:5432
+/// unreachable" and "db:5432 unreachable" turn on the gateway blocking them, not
+/// on a dead port.
+fn gateway_enforced_topology() -> Environment {
+    // A listener loop per port, backgrounded, so one container serves several
+    // ports and stays up (busybox's default command would exit at once).
+    let listen = |ports: &[&str]| -> Vec<String> {
+        let loops = ports
+            .iter()
+            .map(|p| format!("while true; do nc -l -p {p} >/dev/null 2>&1; done &"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        vec!["sh".to_owned(), "-c".to_owned(), format!("{loops} wait")]
+    };
+    let api_cmd = listen(&["8080", "5432"]);
+    let web_cmd = listen(&["80"]);
+    let db_cmd = listen(&["5432"]);
+    Environment::builder()
+        .segment("dmz")
+        .segment("internal")
+        .standin("foot", STANDIN_IMAGE, "dmz")
+        .service_cmd(
+            "api",
+            STANDIN_IMAGE,
+            "internal",
+            &api_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .service_cmd(
+            "web",
+            STANDIN_IMAGE,
+            "internal",
+            &web_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .service_cmd(
+            "db",
+            STANDIN_IMAGE,
+            "internal",
+            &db_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .vantage("dmz")
+        .gateway_boundary("dmz", "internal", &["api:8080", "web:80"])
+        .build()
+        .expect("the gateway-enforced topology is valid")
+}
+
+/// Guard: the gateway enforces the port boundary (#114). The self-check certifies
+/// the lab (allowed paths reachable through the gateway, non-allowed workloads
+/// not), and from the DMZ vantage the real reachability capability sees: the
+/// allowed `api:8080` and `web:80` reachable; the served-but-denied `api:5432`
+/// unreachable (the gateway proxies only 8080 for `api`); and the non-allowed
+/// `db:5432` unreachable (db is not aliased on the gateway). `api:5432` and
+/// `db:5432` are served, so their unreachability is the boundary, not a dead port
+/// (RK-008). The lab tests default-skip; opt in with `REDSTEP_RUN_DOCKER_TESTS`
+/// (RK-013/014), and the per-element decision logic (RK-009) and `gateway_cmd`
+/// are pinned offline in `orchestrator.rs`. Mutations: open `api:5432` in
+/// `gateway_cmd` (an extra listener) -> `api:5432` becomes reachable -> the
+/// denied-port assertion fails; drop the gateway branch in `check_boundaries` (or
+/// a socat listener) -> the self-check or the allowed-path assertions fail.
+#[test]
+fn gateway_enforces_the_port_boundary() {
+    if !linux_docker_available() {
+        eprintln!("skipping gateway_enforces_the_port_boundary: no Linux Docker daemon");
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = gateway_enforced_topology();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the gateway-enforced lab");
+
+        // The self-check certifies the enforced boundary: allowed paths reachable
+        // through the gateway (positive control), non-allowed workloads not.
+        let self_check = boundary_self_check(&docker, &env, &lab).await;
+
+        // The real reachability capability, from the DMZ vantage, observes the
+        // enforcement: allowed ports reachable, the served-but-denied port and the
+        // non-allowed workload not. Captured so teardown runs on whatever returns.
+        let discovered = {
+            let scope = Scope::from_environment(&env);
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == env.vantage_segment())
+                .cloned()
+                .expect("the dmz vantage network is in the running lab");
+            let ctx = TestContext::new_in_lab(scope, docker.clone(), vantage);
+            let targets = vec![
+                ctx.resolve("api:8080").expect("api:8080 resolves"),
+                ctx.resolve("web:80").expect("web:80 resolves"),
+                ctx.resolve("api:5432").expect("api:5432 resolves"),
+                ctx.resolve("db:5432").expect("db:5432 resolves"),
+            ];
+            ctx.discover_services_from_vantage(&targets).await
+        };
+
+        let _ = lab.teardown().await;
+
+        self_check.expect("the self-check certifies the enforced boundary");
+        let discovered = discovered.expect("the enumeration runs");
+        let reachable = |i: usize| discovered[i].1.observation.value;
+        assert!(
+            reachable(0),
+            "api:8080 is allowed, so reachable via the gateway"
+        );
+        assert!(
+            reachable(1),
+            "web:80 is allowed, so reachable via the gateway"
+        );
+        assert!(
+            !reachable(2),
+            "api:5432 is a served-but-denied port, so blocked by the gateway"
+        );
+        assert!(
+            !reachable(3),
+            "db:5432 is a non-allowed workload, so blocked by the gateway"
+        );
+    });
+}
+
 /// Guard: the boundary self-check passes over a correctly-isolated MVP lab, so a
 /// run could proceed. The happy-path companion to the refusal below.
 #[test]

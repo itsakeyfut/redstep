@@ -446,8 +446,11 @@ impl EnvironmentBuilder {
 /// non-canonical form that parses here would be carried through verbatim. Only
 /// ASCII digits, no leading zero, are accepted.
 ///
-/// The guard is `parse_allow_spec_reads_workload_and_port`.
-fn parse_allow_spec(spec: &str) -> Option<(&str, u16)> {
+/// The guard is `parse_allow_spec_reads_workload_and_port`. `pub(crate)` so the
+/// orchestrator reads the same `(workload, port)` the model validated, to build
+/// the gateway's proxy listeners and to drive the port-level self-check (#114):
+/// the two must agree on what a spec means, so they share the one parser.
+pub(crate) fn parse_allow_spec(spec: &str) -> Option<(&str, u16)> {
     let (workload, port) = spec.rsplit_once(':')?;
     if workload.is_empty() {
         return None;
