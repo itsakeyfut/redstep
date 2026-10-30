@@ -144,6 +144,24 @@ fn assume_breach_dmz() -> Environment {
         .expect("the assume-breach DMZ topology is valid")
 }
 
+/// A gateway-mediated topology (#113): a `dmz` foothold segment, an `internal`
+/// segment with a `web` stand-in, and a `dmz -> internal` boundary enforced by a
+/// firewall gateway permitting `web:80`. At v0.3.0 the gateway is a structural
+/// mediator (dual-homed on both segment networks, running no `nft` and no
+/// forwarding), so this still carries no cross-segment path; the port rules that
+/// would open `web:80` and the self-check that verifies them are #114.
+fn gateway_topology() -> Environment {
+    Environment::builder()
+        .segment("dmz")
+        .segment("internal")
+        .standin("foot", STANDIN_IMAGE, "dmz")
+        .standin("web", STANDIN_IMAGE, "internal")
+        .vantage("dmz")
+        .gateway_boundary("dmz", "internal", &["web:80"])
+        .build()
+        .expect("the gateway topology is valid")
+}
+
 /// Guard: bringing up the MVP lab creates one network per segment, each
 /// egress-less (`internal: true`), and one container per workload attached to
 /// its own segment's network only (never the default bridge, which would re-add
@@ -211,6 +229,109 @@ fn brings_up_and_tears_down_the_mvp_lab() {
             lab.networks().iter().map(|n| n.name().to_owned()).collect();
         lab.teardown().await.expect("teardown removes every object");
         for net in &network_names {
+            assert!(
+                docker
+                    .inspect_network(net, None::<InspectNetworkOptions>)
+                    .await
+                    .is_err(),
+                "network {net} should be gone after teardown"
+            );
+        }
+    });
+}
+
+/// Guard: a gateway-mediated topology brings up with the gateway container
+/// dual-homed on EXACTLY its two segment networks (both egress-less), is
+/// self-check-clean (no cross-segment path, fail-closed by construction at
+/// v0.3.0), and tears down so the gateway container and both networks are gone.
+/// This is #113's acceptance criterion 1 at the Docker level, checked by this
+/// run's OWN object names, never a global count (RK-010). It is a STRUCTURAL
+/// inspect, not a reachability claim: #113 wires no forwarding, so the
+/// behavioural reachable/blocked proof (positive control, per-port) is #114's
+/// self-check (RK-008). The lab tests default-skip; opt in with
+/// `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), so on a bare gate runner this guard
+/// does not run and the model-level guards in `environment.rs` carry criteria
+/// 2/3. Mutations: drop the `connect_network` in `provision` so the gateway is on
+/// one network, or let it also join the default bridge -> the exact-two-networks
+/// assertion fails; drop the gateway from `remove_all` -> the gone-after-teardown
+/// assertion fails.
+#[test]
+fn gateway_mediates_a_declared_inter_segment_path() {
+    if !linux_docker_available() {
+        eprintln!(
+            "skipping gateway_mediates_a_declared_inter_segment_path: no Linux Docker daemon"
+        );
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = gateway_topology();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the gateway topology");
+
+        assert_eq!(lab.gateways().len(), 1, "one gateway per gateway boundary");
+        let gateway = &lab.gateways()[0];
+        assert_eq!(gateway.from(), "dmz");
+        assert_eq!(gateway.to(), "internal");
+
+        // Fail-closed by construction: no forwarding, so the self-check finds the
+        // internal `web` unreachable from the dmz foothold (with its own positive
+        // control in `internal`) and the topology certifies isolated.
+        boundary_self_check(&docker, &env, &lab)
+            .await
+            .expect("the gateway topology is self-check-clean (no cross-segment path yet)");
+
+        // The gateway is attached to EXACTLY its two segment networks, both
+        // egress-less, and nothing else (never the default bridge).
+        let net_for = |segment: &str| {
+            lab.networks()
+                .iter()
+                .find(|n| n.segment() == segment)
+                .unwrap_or_else(|| panic!("no network for segment {segment}"))
+                .name()
+                .to_owned()
+        };
+        let dmz_net = net_for("dmz");
+        let internal_net = net_for("internal");
+        let info = docker
+            .inspect_container(gateway.name(), None::<InspectContainerOptions>)
+            .await
+            .unwrap_or_else(|e| panic!("gateway {} should exist: {e}", gateway.name()));
+        let mut attached: Vec<String> = info
+            .network_settings
+            .and_then(|s| s.networks)
+            .map(|m| m.into_keys().collect())
+            .unwrap_or_default();
+        attached.sort();
+        let mut expected = vec![dmz_net.clone(), internal_net.clone()];
+        expected.sort();
+        assert_eq!(
+            attached, expected,
+            "the gateway must be dual-homed on exactly its two segment networks"
+        );
+        for net in [&dmz_net, &internal_net] {
+            let ninfo = docker
+                .inspect_network(net, None::<InspectNetworkOptions>)
+                .await
+                .unwrap_or_else(|e| panic!("network {net} should exist: {e}"));
+            assert_eq!(
+                ninfo.internal,
+                Some(true),
+                "network {net} must be egress-less"
+            );
+        }
+
+        let gateway_name = gateway.name().to_owned();
+        lab.teardown().await.expect("teardown removes every object");
+        assert!(
+            docker
+                .inspect_container(&gateway_name, None::<InspectContainerOptions>)
+                .await
+                .is_err(),
+            "gateway container {gateway_name} should be gone after teardown"
+        );
+        for net in [&dmz_net, &internal_net] {
             assert!(
                 docker
                     .inspect_network(net, None::<InspectNetworkOptions>)
