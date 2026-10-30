@@ -169,7 +169,9 @@ fn gateway_topology() -> Environment {
 /// in `bring_up` -> the `internal == Some(true)` assertion fails; attach a
 /// container to the wrong segment's network, or also to the bridge -> the
 /// exact-network assertion fails; make `teardown` skip its removals -> the
-/// post-teardown `inspect_network` assertion fails.
+/// post-teardown `inspect_network` assertion fails; make `provision`'s gateway
+/// filter admit every boundary (`.filter(|_| true)`) -> the MVP's plain boundary
+/// spawns a gateway and the `gateways().is_empty()` assertion fails.
 #[test]
 fn brings_up_and_tears_down_the_mvp_lab() {
     if !linux_docker_available() {
@@ -184,6 +186,10 @@ fn brings_up_and_tears_down_the_mvp_lab() {
 
         assert_eq!(lab.networks().len(), 2, "one network per segment");
         assert_eq!(lab.containers().len(), 3, "one container per workload");
+        assert!(
+            lab.gateways().is_empty(),
+            "the MVP's only boundary is membership-only, so no gateway is brought up"
+        );
 
         // Every lab network exists and is egress-less.
         for net in lab.networks() {

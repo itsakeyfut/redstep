@@ -543,10 +543,14 @@ mod tests {
     }
 
     /// Guard: the MVP environment validates and carries its topology back field
-    /// for field. The happy-path fixture the rejection tests start from.
-    /// Mutation: have `vantage_segment` return `segments[0].name()` -> this
-    /// fails, because the fixture's vantage is not its first segment; swap
-    /// `Workload::image` and `segment` bodies -> the db assertions fail.
+    /// for field, and its `.boundary` reads as not gateway-mediated (the false
+    /// direction of `is_gateway_mediated`, which `bring_up`'s gateway filter
+    /// depends on: a plain boundary reading `true` would spawn a spurious
+    /// gateway). Mutation: have `vantage_segment` return `segments[0].name()` ->
+    /// this fails, because the fixture's vantage is not its first segment; swap
+    /// `Workload::image` and `segment` bodies -> the db assertions fail; make
+    /// `is_gateway_mediated` return `true` -> the `!is_gateway_mediated` assertion
+    /// fails.
     #[test]
     fn mvp_environment_builds() {
         let env = mvp().build().expect("the MVP topology is valid");
@@ -572,6 +576,10 @@ mod tests {
         assert!(
             boundary.allow().is_empty(),
             "the internet -> internal path is blocked"
+        );
+        assert!(
+            !boundary.is_gateway_mediated(),
+            "a plain boundary is not gateway-mediated"
         );
     }
 
