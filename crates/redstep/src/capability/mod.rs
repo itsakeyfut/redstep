@@ -23,11 +23,15 @@
 //! token minted for one capability cannot drive another's `execute` (`E0308`),
 //! and a non-`Safe` capability cannot obtain a token at all. The in-container
 //! vantage path (`connect_from_vantage` and the `exploit_*_from_vantage` family,
-//! `context.rs`) is gated the same way by a separate `VantageCleared` proof,
-//! which clears `Safe` and `Controlled` (confined by lab isolation, ADR-0006
-//! layers 1-2) and refuses `Aggressive`, whose layer-3 isolation proof is not
-//! built. This unit builds the native side; the tool adapters and the
-//! `Aggressive` rung are later units.
+//! `context.rs`) is gated by a separate `VantageCleared` proof, required by type
+//! so nothing runs ungated; it is a weaker binding than the host token, not the
+//! same one. `VantageCleared::issue` clears `Safe` and `Controlled` (confined by
+//! lab isolation, ADR-0006 layers 1-2) and refuses a *stated* `Aggressive`, but
+//! the proof carries no intensity, so the level is the caller's stated value, not
+//! derived from the action: a mislabelled seam is not a compile error. Binding the
+//! vantage intensity by type lands with the v0.4.0 Aggressive adapters (#123).
+//! This unit builds the native side; the tool adapters and the `Aggressive` rung
+//! are later units.
 
 pub mod tcp_connect;
 
@@ -82,21 +86,29 @@ mod intensity_gate {
     }
 
     /// Proof that the intensity gate cleared an in-container action to run on the
-    /// attacker's vantage (#44). A separate proof from [`IntensityCleared`]
-    /// because the vantage path is not a [`Capability`] (a host-runnable
-    /// reachability check would be a vacuous PASS, RK-008) and its
-    /// intensity ceiling differs: lab isolation (ADR-0006 layers 1-2) confines
-    /// `Controlled`, so `issue` clears `Safe` and `Controlled` and refuses only
-    /// `Aggressive`, whose layer-3 isolation proof is not built. Its field is
-    /// private and `issue` is crate-private, so only this crate mints one. It
-    /// stays crate-internal: the external `compile_fail` guard for "the
-    /// in-container seam cannot run ungated" arrives when that seam is made public
-    /// (the v0.4.0 adapters).
+    /// attacker's vantage (#44). A separate proof from [`IntensityCleared`] for two
+    /// reasons. First, the vantage path is not a [`Capability`] (a host-runnable
+    /// reachability check would be a vacuous PASS, RK-008), so it cannot carry the
+    /// capability-bound host token. Second, its ceiling differs: the host path runs
+    /// in-process with a route to everything, so it is `Safe`-only, whereas the
+    /// vantage path runs inside the egress-less lab (ADR-0006 layers 1-2), which
+    /// confines `Controlled`; `issue` therefore clears `Safe` and `Controlled` and
+    /// refuses `Aggressive`, whose layer-3 isolation proof is not built.
+    ///
+    /// Unlike the host token, this proof is NOT bound to the action: it carries no
+    /// intensity and `issue` validates a value the caller states, not one derived
+    /// from the seam, so a seam mislabelled at its call site is not a compile error
+    /// (unreachable today, where every vantage intensity is `Safe` or `Controlled`
+    /// and both clear). Binding the vantage intensity by type is #123, due with the
+    /// v0.4.0 Aggressive adapters. Its field is private and `issue` is crate-private,
+    /// so only this crate mints one; the external `compile_fail` guard for "the
+    /// in-container seam cannot run ungated" also arrives when that seam is public.
     pub(crate) struct VantageCleared(());
 
     impl VantageCleared {
         /// The intensity gate for the in-container vantage path. Clears `Safe` and
         /// `Controlled` (lab-confined, ADR-0006 layers 1-2); refuses `Aggressive`.
+        /// `intensity` is the caller's stated level, not the action's own (#123).
         pub(crate) fn issue(intensity: Intensity) -> Result<Self> {
             if intensity == Intensity::Aggressive {
                 return Err(Error::IntensityRefused { got: intensity });
@@ -164,8 +176,9 @@ pub trait Capability: sealed::Sealed + Sized {
     /// A stable identifier for the evidence record, e.g. `"tcp_connect"`.
     fn name(&self) -> &'static str;
 
-    /// The force this capability applies. The gate refuses anything but `Safe`
-    /// in the current build.
+    /// The force this capability applies. The host gate refuses anything but
+    /// `Safe` in the current build (the in-container vantage gate also clears
+    /// `Controlled`; see `VantageCleared`).
     fn intensity(&self) -> Intensity;
 
     /// Act against the held target, returning the observation and a draft of the

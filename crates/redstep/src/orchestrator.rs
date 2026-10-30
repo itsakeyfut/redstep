@@ -1770,10 +1770,14 @@ fn classify_http_witness(
 /// The intensity is `Controlled`, not `Safe`: these are Level 2 controlled attack
 /// simulations (docs/specs/levels-safety-and-principles.md), not a Level 1 safe
 /// check like the `tcp_connect_vantage` reconnaissance probe. The seam requires a
-/// `VantageCleared` proof by type (#44), which the caller mints for `Controlled`;
-/// lab isolation (ADR-0006 layers 1-2) confines it, and an `Aggressive` adapter on
-/// this seam would be refused at the gate (its layer-3 proof is not built). The
-/// honest label is what the gate reads.
+/// `VantageCleared` proof by type, so it cannot run ungated (#44); the caller mints
+/// it for `Controlled`, which lab isolation (ADR-0006 layers 1-2) confines. The
+/// proof does not bind the action's intensity: the minted level is the caller's
+/// stated value, not derived from the seam, so a mislabel is not a compile error,
+/// and `VantageCleared::issue` refuses only a stated `Aggressive`. Binding the
+/// vantage intensity by type (so a higher-intensity seam cannot be cleared by a
+/// lower-intensity proof) lands with the v0.4.0 Aggressive adapters (#123). The
+/// `intensity` recorded below is the seam's own honest label.
 // allow(too_many_arguments): mirrors `http_witness_exploit_from`'s inputs to build
 // the draft from them; the same reasoning applies.
 #[allow(clippy::too_many_arguments)]

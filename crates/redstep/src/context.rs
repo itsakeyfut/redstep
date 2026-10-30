@@ -274,9 +274,10 @@ impl TestContext {
     /// capability from the vantage" waits on the v0.4.0 tool adapters, which shape
     /// the in-container seam (one capability in the MVP, as in #27). That seam does
     /// not go through the host [`run`](Self::run) gate; it carries its own, the
-    /// `VantageCleared` proof `tcp_reachable_from` requires by type (#44), minted
-    /// here for `Safe`. The HTTP/coercion exploit seams mint it for `Controlled`;
-    /// an `Aggressive` adapter on this path would be refused at the gate.
+    /// `VantageCleared` proof `tcp_reachable_from` requires by type so it cannot
+    /// run ungated (#44), minted here for `Safe`. The HTTP/coercion exploit seams
+    /// mint it for `Controlled`. The proof does not bind the action's intensity by
+    /// type (the level is the caller's stated value); doing so is #123.
     ///
     /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
     /// against this context's own `scope`: a target's scope provenance is not yet
