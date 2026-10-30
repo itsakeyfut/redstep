@@ -19,8 +19,8 @@ use bollard::models::NetworkConnectRequest;
 use bollard::query_parameters::{InspectContainerOptions, InspectNetworkOptions};
 
 use redstep::{
-    Confidence, Environment, Error, RunError, TestContext, boundary_self_check, bring_up, report,
-    run_in_lab, run_in_running_lab,
+    Confidence, Environment, Error, RunError, Scope, TestContext, boundary_self_check, bring_up,
+    report, run_in_lab, run_in_running_lab,
 };
 
 /// A tiny pinned image for the stand-in workloads (#18 proves orchestration, not
@@ -88,6 +88,38 @@ fn mvp() -> Environment {
         .boundary("internet", "internal", &[])
         .build()
         .expect("the MVP topology is valid")
+}
+
+/// An assume-breach topology: the attacker's foothold is a taken DMZ host
+/// (`vantage("dmz")`), a listening `web` sits in the DMZ, and `api`/`db` are in
+/// `internal` with the `dmz` -> `internal` path blocked by a membership boundary.
+/// It is the assume-breach twin of `mvp()`'s external vantage (#96, ADR-0017): the
+/// foothold reaches its own segment but is contained from internal. The port-level
+/// firewall boundary is a separate sub of #95 and deliberately not used here; this
+/// containment rests on the membership boundary and the self-check.
+fn assume_breach_dmz() -> Environment {
+    Environment::builder()
+        .segment("dmz")
+        .segment("internal")
+        // A listening DMZ host, so the foothold's same-segment reach is a real
+        // High-confidence positive control: busybox's default command would exit
+        // and leave nothing to connect to, which would read as unreachable.
+        .service_cmd(
+            "web",
+            STANDIN_IMAGE,
+            "dmz",
+            &[
+                "sh",
+                "-c",
+                "while true; do nc -l -p 80 >/dev/null 2>&1; done",
+            ],
+        )
+        .standin("api", STANDIN_IMAGE, "internal")
+        .standin("db", STANDIN_IMAGE, "internal")
+        .vantage("dmz")
+        .boundary("dmz", "internal", &[])
+        .build()
+        .expect("the assume-breach DMZ topology is valid")
 }
 
 /// Guard: bringing up the MVP lab creates one network per segment, each
@@ -379,6 +411,118 @@ fn a_connected_lab_is_refused_before_any_test_runs() {
         assert!(
             matches!(&result, Err(RunError::Lab(Error::BoundaryViolated { from, to })) if from == "internet" && to == "internal"),
             "a connected forbidden pair must refuse the run before any test, got {result:?}"
+        );
+    });
+}
+
+/// The assume-breach containment test: from a taken DMZ foothold, the internal
+/// database must not be reachable, so the blast radius of a DMZ compromise stops
+/// at the `dmz`/`internal` boundary. `db` is `false` at `Low` (busybox `nc`
+/// cannot prove a port closed), so it opts down to `min_confidence(Low)`, exactly
+/// like the external demo; the `High` certification that the boundary holds is the
+/// self-check the run runs first (ADR-0011), not this probe. Registered by the
+/// macro and run only via the lab-wired runner. It also runs against `mvp()` in
+/// this binary, where `db` is equally unreachable from the `internet` vantage, so
+/// it passes there too and does not disturb `run_in_lab_passes_the_boundary_demo`.
+#[redstep::security_test]
+async fn dmz_foothold_cannot_reach_db(ctx: &TestContext) -> redstep::Result<()> {
+    let target = ctx.resolve("db:5432")?;
+    let recorded = ctx.connect_from_vantage(&target).await?;
+    ctx.expect(&recorded)
+        .min_confidence(Confidence::Low)
+        .to_be(false);
+    Ok(())
+}
+
+/// Guard (Docker): an assume-breach DMZ foothold is contained from the internal
+/// segment, realizing and guarding ADR-0017's assume-breach vantage (#96). Over
+/// one brought-up `assume_breach_dmz()` lab:
+///
+/// 1. the run passes the boundary self-check and `dmz_foothold_cannot_reach_db`
+///    verdicts `Pass` (db unreachable from the DMZ vantage), and the report exit
+///    code is 0;
+/// 2. POSITIVE CONTROL: the same foothold DOES reach the DMZ `web:80` listener at
+///    `High`, so "cannot reach db" is a real boundary rather than a dead probe or
+///    a missing `nc` (RK-008). The control is a direct `connect_from_vantage`
+///    against the still-running lab, not a `#[security_test]`: reaching one's own
+///    segment is not a finding, and a registered test asserting reachability would
+///    also run against `mvp()` (where `web` is not reachable from `internet`) and
+///    break the external demo guard.
+///
+/// Mutations: move the vantage to `internal`, or drop the `dmz` -> `internal`
+/// boundary in `assume_breach_dmz()` -> the foothold reaches db -> the containment
+/// leg's `Pass` assertion fails; drop the `web` `service_cmd` listener -> the
+/// positive control reads unreachable -> the control assertion fails; break the
+/// `dmz` -> `internal` isolation -> the self-check refuses the run -> the
+/// `outcome.expect` fails.
+#[test]
+fn assume_breach_dmz_foothold_is_contained() {
+    if !linux_docker_available() {
+        eprintln!("skipping assume_breach_dmz_foothold_is_contained: no Linux Docker daemon");
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = assume_breach_dmz();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the assume-breach DMZ lab");
+
+        // Legs 1 + the self-check: gate on the self-check, then run the registered
+        // tests from the DMZ vantage. Held until after the positive control so the
+        // lab is still up for the direct probe (a direct caller owns teardown).
+        let outcome = run_in_running_lab(&docker, &env, &lab).await;
+
+        // Leg 2, the positive control: a direct probe of the DMZ `web:80` listener
+        // from the same vantage, built exactly as `run_in_running_lab` builds a
+        // test's context (the vantage segment's network and the environment scope).
+        let scope = Scope::from_environment(&env);
+        let vantage = lab
+            .networks()
+            .iter()
+            .find(|n| n.segment() == env.vantage_segment())
+            .cloned()
+            .expect("the dmz vantage network is in the running lab");
+        let control_ctx = TestContext::new_in_lab(scope, docker.clone(), vantage);
+        let web = control_ctx
+            .resolve("web:80")
+            .expect("web:80 resolves in the lab scope");
+        let control = control_ctx
+            .connect_from_vantage(&web)
+            .await
+            .expect("the positive-control probe runs");
+
+        let _ = lab.teardown().await;
+
+        // Leg 1: the run passed the self-check (so it is `Ok`) and the containment
+        // test passed, and no registered test failed.
+        let summary = outcome.expect("the assume-breach run passes the self-check and runs");
+        let run = summary
+            .runs
+            .iter()
+            .find(|r| r.name.ends_with("dmz_foothold_cannot_reach_db"))
+            .expect("the containment test ran");
+        assert_eq!(
+            run.verdict,
+            redstep::Verdict::Pass,
+            "db is unreachable from the DMZ foothold, so containment holds: {run:?}"
+        );
+        assert_eq!(
+            report::build(&summary).exit_code,
+            0,
+            "every test passes against the assume-breach lab"
+        );
+
+        // Leg 2: the foothold really can reach its own segment's listener, so the
+        // containment above is a real boundary and not a dead probe.
+        assert!(
+            control.observation.value,
+            "positive control: the DMZ foothold reaches web:80, so 'cannot reach db' is a real boundary"
+        );
+        assert_eq!(
+            control.observation.confidence,
+            Confidence::High,
+            "a reached listener is a High-confidence positive control"
         );
     });
 }
