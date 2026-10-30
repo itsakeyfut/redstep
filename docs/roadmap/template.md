@@ -80,8 +80,9 @@ to follow as they are revised.
 ## Work
 
 <!-- How the work is tracked. The GitHub milestone of the same version holds the
-     sub-issues; link it, and optionally list the headline issues. This file is the
-     narrative (why, what); the milestone is the issue list (which). -->
+     issues and their breakdown; link it and stop there. This file is the narrative
+     (why, what) and does not carry specific issue numbers, which churn as the work
+     is cut; the milestone is the issue list (which). -->
 
 - GitHub milestone: `v0.0.0`
 
