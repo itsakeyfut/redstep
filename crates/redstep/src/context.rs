@@ -23,11 +23,12 @@ use std::time::Duration;
 
 use bollard::Docker;
 
-use crate::capability::{Capability, IntensityCleared};
+use crate::capability::{Capability, IntensityCleared, VantageCleared};
 use crate::environment::Environment;
 use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
+use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
@@ -206,16 +207,17 @@ impl TestContext {
     /// Run a capability and return its [`Recorded`] result, recording one
     /// evidence draft.
     ///
-    /// This is the gate seam: it calls `IntensityCleared::issue`, which refuses
-    /// anything but `Safe` (the authorization and isolation proof the higher
-    /// rungs require are not built yet, See ADR-0006), and the resulting
-    /// [`IntensityCleared`] is what `Capability::execute` requires. `execute`
-    /// cannot be reached without a token, and nothing outside the crate can mint
-    /// one or implement a capability, so the gate is compiler-held against
-    /// external code. In-crate, that `run` mints the token from the capability's
-    /// *own* intensity is this seam's convention, not a compiler fact (the token
-    /// is not bound to the capability); it is guarded by the refusal tests below,
-    /// and binding it is deferred to the first non-`Safe` capability (#9).
+    /// This is the gate seam: it calls `IntensityCleared::issue(&capability)`,
+    /// which refuses anything but `Safe` (the authorization and isolation proof
+    /// the higher rungs require are not built yet, See ADR-0006), and the
+    /// resulting `IntensityCleared<C>` is what `Capability::execute` requires.
+    /// `execute` cannot be reached without a token, nothing outside the crate can
+    /// mint one or implement a capability, and the token is bound to the
+    /// capability it cleared (a token minted for another capability does not
+    /// type-check, `E0308`), so the gate is compiler-held both outside the crate
+    /// and in (#44): a different in-crate caller cannot mint a `Safe` token and
+    /// hand it to a non-`Safe` capability. The refusal tests below guard the
+    /// `Safe`-only check itself.
     ///
     /// On a successful execution the capability's [`EvidenceDraft`] is recorded in
     /// the evidence sink and `run` returns a [`Recorded`] that carries the
@@ -240,9 +242,9 @@ impl TestContext {
     /// type, not run a `Capability` host-side and let it stand in for a vantage
     /// observation.
     pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
-        // The gate: `issue` mints the token only for a `Safe` capability, and
-        // `execute` cannot be called without it.
-        let authorized = IntensityCleared::issue(capability.intensity())?;
+        // The gate: `issue` mints the token only for a `Safe` capability, bound to
+        // this very capability, and `execute` cannot be called without it.
+        let authorized = IntensityCleared::issue(&capability)?;
         let (observation, draft) = capability.execute(authorized).await?;
         let draft_ref = self.record_draft(draft);
         Ok(Recorded {
@@ -269,13 +271,12 @@ impl TestContext {
     ///
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound (a
     /// host run): there is no vantage to act from. Generalizing to "run any
-    /// capability from the vantage" waits on the v0.4.0 tool adapters, which shape the
-    /// in-container seam (one capability in the MVP, as in #27). That seam does
-    /// not go through the [`run`](Self::run) intensity gate (it mints no
-    /// [`IntensityCleared`]); it is `Safe` by
-    /// construction today (busybox `nc`), but it is the path where v0.4.0's
-    /// Controlled/Aggressive adapters will live, so v0.3.0 must require the gate token
-    /// here too (#9's deferred full-gate work).
+    /// capability from the vantage" waits on the v0.4.0 tool adapters, which shape
+    /// the in-container seam (one capability in the MVP, as in #27). That seam does
+    /// not go through the host [`run`](Self::run) gate; it carries its own, the
+    /// `VantageCleared` proof `tcp_reachable_from` requires by type (#44), minted
+    /// here for `Safe`. The HTTP/coercion exploit seams mint it for `Controlled`;
+    /// an `Aggressive` adapter on this path would be refused at the gate.
     ///
     /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
     /// against this context's own `scope`: a target's scope provenance is not yet
@@ -288,12 +289,15 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; connect_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Safe reconnaissance probe (#44).
+        let cleared = VantageCleared::issue(Intensity::Safe)?;
         let (observation, draft) = tcp_reachable_from(
             &binding.docker,
             &binding.vantage_network,
             target,
             DEFAULT_CONNECT_TIMEOUT,
             TCP_CONNECT_VANTAGE,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -345,6 +349,9 @@ impl TestContext {
                      discover_services_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: Safe reconnaissance probes (#44). One proof
+        // covers the enumeration (the seam borrows it).
+        let cleared = VantageCleared::issue(Intensity::Safe)?;
         let mut discovered = Vec::with_capacity(targets.len());
         for target in targets {
             let (observation, draft) = tcp_reachable_from(
@@ -353,6 +360,7 @@ impl TestContext {
                 target,
                 DEFAULT_CONNECT_TIMEOUT,
                 NETWORK_SERVICE_DISCOVERY_VANTAGE,
+                &cleared,
             )
             .await?;
             let draft_ref = self.record_draft(draft);
@@ -483,6 +491,9 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_sqli_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
+        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -492,6 +503,7 @@ impl TestContext {
             marker,
             &[],
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -531,6 +543,9 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_command_injection_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
+        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -540,6 +555,7 @@ impl TestContext {
             marker,
             &[],
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -580,6 +596,9 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_ssti_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
+        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -589,6 +608,7 @@ impl TestContext {
             marker,
             &[],
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -633,6 +653,9 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_path_traversal_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
+        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -642,6 +665,7 @@ impl TestContext {
             marker,
             &[],
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -707,6 +731,9 @@ impl TestContext {
             reason: "no attacker vantage is bound to this run; exploit_idor_from_vantage needs a lab (run_in_lab)"
                 .to_owned(),
         })?;
+        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
+        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = http_witness_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -716,6 +743,7 @@ impl TestContext {
             marker,
             request_headers,
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -771,6 +799,8 @@ impl TestContext {
         // coercion's canary callback must be distinguishable and a caller cannot
         // pass a weak or forgeable one.
         let token = ssrf_token();
+        // The in-container gate: a Controlled coercion (#44), lab-confined.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = ssrf_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -780,6 +810,7 @@ impl TestContext {
             canary_container,
             &token,
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -838,6 +869,8 @@ impl TestContext {
         // callback must be distinguishable and a caller cannot pass a weak or
         // forgeable one. The out-of-band token helper is shared with SSRF.
         let token = ssrf_token();
+        // The in-container gate: a Controlled coercion (#44), lab-confined.
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = blind_cmdi_exploit_from(
             &binding.docker,
             &binding.vantage_network,
@@ -847,6 +880,7 @@ impl TestContext {
             canary_container,
             &token,
             DEFAULT_CONNECT_TIMEOUT,
+            &cleared,
         )
         .await?;
         let draft_ref = self.record_draft(draft);
@@ -1430,7 +1464,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _authorized: IntensityCleared,
+            _authorized: IntensityCleared<Self>,
         ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
@@ -1453,7 +1487,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _authorized: IntensityCleared,
+            _authorized: IntensityCleared<Self>,
         ) -> Result<(Observation<()>, EvidenceDraft)> {
             panic!("a refused capability must not execute");
         }
@@ -1497,6 +1531,34 @@ mod tests {
         ));
     }
 
+    /// Guard: the vantage in-container gate clears `Safe` and `Controlled`
+    /// (confined by lab isolation, ADR-0006 layers 1-2) and refuses `Aggressive`
+    /// (its layer-3 isolation proof is not built), so the shipped `Controlled`
+    /// vantage attacks still mint a proof while an `Aggressive` adapter on the same
+    /// seam cannot (#44). Mutation: make `VantageCleared::issue` return `Ok`
+    /// unconditionally -> the `Aggressive` assertion fails; narrow it to clear only
+    /// `Safe` (`!= Safe`) -> the `Controlled` assertion fails.
+    #[test]
+    fn vantage_gate_refuses_aggressive_and_clears_controlled() {
+        assert!(
+            VantageCleared::issue(Intensity::Safe).is_ok(),
+            "a Safe reconnaissance probe is cleared"
+        );
+        assert!(
+            VantageCleared::issue(Intensity::Controlled).is_ok(),
+            "a Controlled attack is cleared: lab isolation confines it"
+        );
+        assert!(
+            matches!(
+                VantageCleared::issue(Intensity::Aggressive),
+                Err(Error::IntensityRefused {
+                    got: Intensity::Aggressive
+                })
+            ),
+            "Aggressive is refused: its layer-3 isolation proof is not built"
+        );
+    }
+
     /// A Safe stub capability that observes a reachable target, for the run path.
     struct AlwaysReachable;
     impl crate::capability::sealed::Sealed for AlwaysReachable {}
@@ -1510,7 +1572,7 @@ mod tests {
         }
         async fn execute(
             &self,
-            _authorized: IntensityCleared,
+            _authorized: IntensityCleared<Self>,
         ) -> Result<(Observation<bool>, EvidenceDraft)> {
             Ok((
                 Observation {

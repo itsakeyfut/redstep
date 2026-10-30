@@ -78,7 +78,7 @@ impl Capability for TcpConnect {
 
     async fn execute(
         &self,
-        _authorized: IntensityCleared,
+        _authorized: IntensityCleared<Self>,
     ) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
         let target = format!("{}:{}", self.target.host(), self.target.port());
         let dial = target.clone();
@@ -376,11 +376,10 @@ mod tests {
             .enable_all()
             .build()
             .expect("current-thread runtime with net builds");
+        let cap = TcpConnect::new(target);
+        let token = IntensityCleared::issue(&cap).expect("Safe is authorized");
         let (observation, draft) = rt
-            .block_on(
-                TcpConnect::new(target)
-                    .execute(IntensityCleared::issue(Intensity::Safe).expect("Safe is authorized")),
-            )
+            .block_on(cap.execute(token))
             .expect("the capability runs");
 
         assert!(observation.value, "a bound port is reachable");
