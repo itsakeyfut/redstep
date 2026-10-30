@@ -473,6 +473,155 @@ fn gateway_enforces_the_port_boundary() {
     });
 }
 
+/// A DMZ reference topology (ADR-0008, #115): internet / dmz / internal with the
+/// intended inter-segment paths gateway-enforced (#114). `web` (dmz) is reachable
+/// from internet on 80; `api` (internal) from dmz on 8080; `db` (internal, served
+/// on 5432) is in no `allow`, so it is the blocked path. The vantage is the `dmz`
+/// assume-breach foothold, so #95's blast-radius checks reuse this directly. Every
+/// workload runs a real listener so a "reachable"/"blocked" turns on the boundary,
+/// not a dead port (RK-008). This is the v0.3.0 reference-topology skeleton; the
+/// deep vulnerable apps and relays are Phase 5+ (ADR-0008).
+fn dmz_reference() -> Environment {
+    // A listener loop per port, backgrounded, so one container serves a port and
+    // stays up (busybox's default command would exit at once).
+    let listen = |ports: &[&str]| -> Vec<String> {
+        let loops = ports
+            .iter()
+            .map(|p| format!("while true; do nc -l -p {p} >/dev/null 2>&1; done &"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        vec!["sh".to_owned(), "-c".to_owned(), format!("{loops} wait")]
+    };
+    let web_cmd = listen(&["80"]);
+    let api_cmd = listen(&["8080"]);
+    let db_cmd = listen(&["5432"]);
+    Environment::builder()
+        .segment("internet")
+        .segment("dmz")
+        .segment("internal")
+        .service_cmd(
+            "web",
+            STANDIN_IMAGE,
+            "dmz",
+            &web_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .service_cmd(
+            "api",
+            STANDIN_IMAGE,
+            "internal",
+            &api_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .service_cmd(
+            "db",
+            STANDIN_IMAGE,
+            "internal",
+            &db_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .vantage("dmz")
+        .gateway_boundary("internet", "dmz", &["web:80"])
+        .gateway_boundary("dmz", "internal", &["api:8080"])
+        .build()
+        .expect("the DMZ reference topology is valid")
+}
+
+/// Guard (offline): the DMZ reference topology declares internet/dmz/internal, the
+/// `dmz` vantage, and exactly the two intended gateway paths (internet -> dmz on
+/// `web:80`, dmz -> internal on `api:8080`). This is the RK-013/014 offline anchor
+/// for the fixture: the Docker test below default-skips, so this pins the declared
+/// topology on every gate. Mutation: change a segment, the vantage, or an `allow`
+/// in `dmz_reference` -> an assertion here fails.
+#[test]
+fn dmz_reference_declares_the_intended_paths() {
+    let env = dmz_reference();
+
+    let segments: Vec<&str> = env.segments().iter().map(|s| s.name()).collect();
+    assert_eq!(segments, ["internet", "dmz", "internal"]);
+    assert_eq!(env.vantage_segment(), "dmz");
+
+    let find = |from: &str, to: &str| {
+        env.boundaries()
+            .iter()
+            .find(|b| b.from() == from && b.to() == to)
+            .unwrap_or_else(|| panic!("no boundary {from} -> {to}: {:?}", env.boundaries()))
+    };
+    assert_eq!(env.boundaries().len(), 2, "exactly the two intended paths");
+    let internet_dmz = find("internet", "dmz");
+    assert!(
+        internet_dmz.is_gateway_mediated(),
+        "internet -> dmz is gateway-mediated"
+    );
+    assert_eq!(internet_dmz.allow(), ["web:80"]);
+    let dmz_internal = find("dmz", "internal");
+    assert!(
+        dmz_internal.is_gateway_mediated(),
+        "dmz -> internal is gateway-mediated"
+    );
+    assert_eq!(dmz_internal.allow(), ["api:8080"]);
+}
+
+/// Guard: the DMZ reference topology brings up and self-checks clean -- both
+/// intended gateway paths (internet -> dmz `web:80`, dmz -> internal `api:8080`)
+/// reachable as positive controls and every undeclared path blocked, per element
+/// across both gateway boundaries (RK-008/009) -- and from the `dmz` foothold the
+/// real reachability capability sees `api:8080` reachable (the intended
+/// dmz -> internal path) and the served-but-denied `db:5432` not (RK-008: `db`
+/// serves 5432, so its unreachability is the boundary, not a dead port). The lab
+/// tests default-skip; opt in with `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), and the
+/// declared topology is pinned offline above. Mutations: drop the `api:8080` allow
+/// in `dmz_reference` -> the intended path is unreachable -> the `api` assertion
+/// fails; add `db:5432` to the `dmz -> internal` allow (leave an undeclared path
+/// open) -> `db:5432` becomes reachable from the foothold -> the `db` assertion
+/// fails.
+#[test]
+fn dmz_reference_enforces_the_intended_paths() {
+    if !linux_docker_available() {
+        eprintln!("skipping dmz_reference_enforces_the_intended_paths: no Linux Docker daemon");
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = dmz_reference();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the DMZ reference lab");
+
+        // The self-check certifies the composition: both intended paths reachable
+        // through their gateways (positive controls), undeclared paths blocked.
+        let self_check = boundary_self_check(&docker, &env, &lab).await;
+
+        // From the dmz foothold: the intended `api:8080` is reachable, the
+        // undeclared `db:5432` is not. Captured so teardown runs on whatever returns.
+        let discovered = {
+            let scope = Scope::from_environment(&env);
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == env.vantage_segment())
+                .cloned()
+                .expect("the dmz vantage network is in the running lab");
+            let ctx = TestContext::new_in_lab(scope, docker.clone(), vantage);
+            let targets = vec![
+                ctx.resolve("api:8080").expect("api:8080 resolves"),
+                ctx.resolve("db:5432").expect("db:5432 resolves"),
+            ];
+            ctx.discover_services_from_vantage(&targets).await
+        };
+
+        let _ = lab.teardown().await;
+
+        self_check.expect("the self-check certifies the DMZ reference topology");
+        let discovered = discovered.expect("the enumeration runs");
+        assert!(
+            discovered[0].1.observation.value,
+            "api:8080 is the intended dmz -> internal path, so reachable from the foothold"
+        );
+        assert!(
+            !discovered[1].1.observation.value,
+            "db:5432 is undeclared, so blocked from the dmz foothold"
+        );
+    });
+}
+
 /// Guard: the boundary self-check passes over a correctly-isolated MVP lab, so a
 /// run could proceed. The happy-path companion to the refusal below.
 #[test]
