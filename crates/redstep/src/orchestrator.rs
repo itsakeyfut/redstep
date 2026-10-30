@@ -1365,6 +1365,38 @@ fn vantage_draft(
     }
 }
 
+/// The aggregate blast-radius evidence draft (#112): the containment finding over
+/// a vantage's per-element reachability, stamped [`BLAST_RADIUS_VANTAGE`] and
+/// attributed to the vantage `segment`. `observation` is the aggregate contained
+/// value and its confidence (a `High` breach or a `Low` contained; the confident
+/// `High` "contained" certification is the boundary self-check's, #114, not this
+/// standalone report's); the `summary` names the reachable set and the boundaries
+/// that held. The target is the vantage segment, not a `host:port`, because the
+/// finding is over the whole outgoing reach, not one service. Pure, so the draft
+/// shape is testable without Docker.
+pub(crate) fn blast_radius_draft(
+    segment: &str,
+    observation: &Observation<bool>,
+    summary: String,
+) -> EvidenceDraft {
+    EvidenceDraft {
+        capability: BLAST_RADIUS_VANTAGE,
+        target: segment.to_owned(),
+        intensity: Intensity::Safe,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary,
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
+        reproduction: Reproduction {
+            capability: BLAST_RADIUS_VANTAGE.to_owned(),
+            target: segment.to_owned(),
+            params: serde_json::json!({ "vantage_segment": segment }),
+        },
+    }
+}
+
 /// The capability names of the HTTP witness techniques, as they appear in the
 /// evidence `capability` field and the canonical JSON (a published contract, so
 /// the string values are fixed). Shared by the context callers that run each check
@@ -1386,6 +1418,14 @@ pub(crate) const TCP_CONNECT_VANTAGE: &str = "tcp_connect_vantage";
 /// a hardcoded literal. The two are distinct techniques on the same mechanism: a
 /// consumer (a replay, a report, the attack graph) must not treat them as one.
 pub(crate) const NETWORK_SERVICE_DISCOVERY_VANTAGE: &str = "network_service_discovery_vantage";
+/// The capability stamped on the aggregate blast-radius finding from the vantage
+/// (#112, `blast_radius_from_vantage`): the containment verdict over the
+/// per-element reachability, distinct from the individual
+/// `NETWORK_SERVICE_DISCOVERY_VANTAGE` probes it rests on. Its own name so its
+/// canonical JSON stays byte-identical (RK-003), pinned by the offline
+/// `blast_radius_draft_mirrors_the_observation` test's literal `d.capability`
+/// assertion.
+pub(crate) const BLAST_RADIUS_VANTAGE: &str = "blast_radius_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";
@@ -5653,6 +5693,58 @@ mod tests {
             assert_eq!(draft.capability, capability);
             assert_eq!(draft.reproduction.capability, capability);
         }
+    }
+
+    /// Guard: the aggregate blast-radius draft mirrors the containment observation
+    /// and is attributed to the vantage segment, rather than hard-coding either, so
+    /// the recorded finding matches the verdict the method returns and sits under
+    /// the right node. It uses both decisive cases: a `High` breach (contained
+    /// `false`) and a `Low` contained (`true`), so a field pinned to one value
+    /// cannot pass as mirrored. The published string value is pinned literally (the
+    /// canonical JSON is a contract, RK-003). Mutation: set `observed`,
+    /// `confidence`, `target`, or `source`'s segment to a constant in
+    /// `blast_radius_draft` -> one case fails; change the `BLAST_RADIUS_VANTAGE`
+    /// const string -> the literal assertion fails (the Docker test asserts the
+    /// returned verdict, not the draft's copy, so it cannot catch this).
+    #[test]
+    fn blast_radius_draft_mirrors_the_observation() {
+        // Pin the published string VALUE (the canonical JSON is a contract, RK-003).
+        assert_eq!(BLAST_RADIUS_VANTAGE, "blast_radius_vantage");
+
+        let breach = Observation {
+            value: false,
+            confidence: Confidence::High,
+        };
+        let draft = blast_radius_draft("internal", &breach, "web:80 reachable".to_owned());
+        assert_eq!(draft.capability, "blast_radius_vantage");
+        assert_eq!(draft.target, "internal");
+        assert_eq!(draft.intensity, Intensity::Safe);
+        assert_eq!(draft.observed, serde_json::Value::Bool(false));
+        assert_eq!(draft.confidence, Confidence::High);
+        assert_eq!(draft.summary, "web:80 reachable");
+        assert_eq!(
+            draft.source,
+            Some(NodeRef::Vantage {
+                segment: "internal".to_owned()
+            }),
+            "the finding is attributed to the vantage segment"
+        );
+        assert_eq!(draft.reproduction.capability, "blast_radius_vantage");
+        assert_eq!(draft.reproduction.target, "internal");
+        assert_eq!(
+            draft.reproduction.params["vantage_segment"].as_str(),
+            Some("internal")
+        );
+
+        let contained = Observation {
+            value: true,
+            confidence: Confidence::Low,
+        };
+        let draft = blast_radius_draft("dmz", &contained, "nothing reachable".to_owned());
+        assert_eq!(draft.target, "dmz");
+        assert_eq!(draft.observed, serde_json::Value::Bool(true));
+        assert_eq!(draft.confidence, Confidence::Low);
+        assert_eq!(draft.summary, "nothing reachable");
     }
 
     /// Guard: a witness whose replay inputs cannot be read is rejected rather

@@ -45,7 +45,9 @@ mod scope;
 mod verdict;
 
 pub use capability::{Capability, IntensityCleared, TcpConnect};
-pub use context::{Expectable, ExpectationBuilder, Recorded, TestContext};
+pub use context::{
+    BlastRadius, BlastRadiusElement, Expectable, ExpectationBuilder, Recorded, TestContext,
+};
 pub use environment::{Boundary, Environment, EnvironmentBuilder, Segment, Workload, WorkloadKind};
 pub use error::{Error, Result};
 pub use evidence::{

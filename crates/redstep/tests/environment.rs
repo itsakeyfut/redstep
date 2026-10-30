@@ -622,6 +622,107 @@ fn dmz_reference_enforces_the_intended_paths() {
     });
 }
 
+/// Guard: the blast-radius report from the dmz foothold over the reference
+/// topology (#112) gives the reachable set per element, attributed to the vantage,
+/// and a containment verdict that is a `High` breach or a `Low` contained. The
+/// intended `api:8080` is reachable; the forbidden `db:8080` is not (the boundary
+/// held); so `contained` is true at `Low` -> Inconclusive, because the standalone
+/// report cannot certify a confident "contained" (the confident certification is
+/// the boundary self-check's, #114, not this report's; see `aggregate_containment`
+/// in `context.rs`). The per-element probes are recorded as
+/// `network_service_discovery_vantage` drafts and the aggregate finding as a
+/// `blast_radius_vantage` draft, both attributed to the dmz vantage (RK-011: the
+/// recorded aggregate mirrors the observation, so the evidence cannot launder a
+/// different value). `api` and `db` both serve a port in `dmz_reference`, so
+/// reachable/blocked turns on the boundary, not a dead port (RK-008). The lab
+/// tests default-skip; opt in with `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), and the
+/// aggregation and the per-element enumeration are pinned offline in `context.rs`.
+/// Mutation: add `db:8080` to the `dmz -> internal` allow -> `db` becomes reachable
+/// -> `contained` is a `High` false (a breach, so the oracle Fails).
+#[test]
+fn blast_radius_from_the_dmz_vantage() {
+    if !linux_docker_available() {
+        eprintln!("skipping blast_radius_from_the_dmz_vantage: no Linux Docker daemon");
+        return;
+    }
+    runtime().block_on(async {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let env = dmz_reference();
+        let lab = bring_up(&docker, &env)
+            .await
+            .expect("bring up the DMZ reference lab");
+
+        let (report, drafts) = {
+            let scope = Scope::from_environment(&env);
+            let vantage = lab
+                .networks()
+                .iter()
+                .find(|n| n.segment() == env.vantage_segment())
+                .cloned()
+                .expect("the dmz vantage network is in the running lab");
+            let ctx = TestContext::new_in_lab(scope, docker.clone(), vantage);
+            let report = ctx.blast_radius_from_vantage(&env).await;
+            (report, ctx.take_evidence_drafts())
+        };
+
+        let _ = lab.teardown().await;
+
+        let report = report.expect("the blast-radius report runs");
+
+        // The containment verdict: contained, but Low, so the oracle's default-High
+        // gate lands it Inconclusive. A standalone report cannot certify a confident
+        // "contained"; that is the self-check's job (#114).
+        assert!(
+            report.contained.observation.value,
+            "no forbidden path was reachable, so the foothold is contained"
+        );
+        assert_eq!(
+            report.contained.observation.confidence,
+            Confidence::Low,
+            "a standalone contained is Low (Inconclusive), not a confident verdict"
+        );
+
+        // The reachable set, per element: the intended api:8080 reached, the
+        // forbidden db:8080 not.
+        let element = |host: &str| {
+            report
+                .elements
+                .iter()
+                .find(|e| e.target.host() == host)
+                .unwrap_or_else(|| panic!("a blast-radius element for {host}"))
+        };
+        let api = element("api");
+        assert!(api.intended, "api:8080 is the intended path");
+        assert!(api.reachable.observation.value, "api:8080 is reachable");
+        let db = element("db");
+        assert!(!db.intended, "db is a forbidden path");
+        assert!(
+            !db.reachable.observation.value,
+            "db is not reachable from the foothold"
+        );
+
+        // The aggregate finding is recorded as vantage-attributed evidence that
+        // mirrors the verdict (RK-011), beside the per-element discovery drafts.
+        let aggregate = drafts
+            .iter()
+            .find(|d| d.capability == "blast_radius_vantage")
+            .expect("an aggregate blast_radius_vantage draft is recorded");
+        assert_eq!(aggregate.observed, serde_json::Value::Bool(true));
+        assert_eq!(aggregate.confidence, Confidence::Low);
+        assert!(
+            matches!(&aggregate.source, Some(redstep::NodeRef::Vantage { segment }) if segment == "dmz"),
+            "the finding is attributed to the dmz vantage: {:?}",
+            aggregate.source
+        );
+        assert!(
+            drafts
+                .iter()
+                .any(|d| d.capability == "network_service_discovery_vantage"),
+            "the per-element probes are recorded as discovery drafts"
+        );
+    });
+}
+
 /// Guard: the boundary self-check passes over a correctly-isolated MVP lab, so a
 /// run could proceed. The happy-path companion to the refusal below.
 #[test]
