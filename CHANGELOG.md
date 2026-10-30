@@ -9,6 +9,56 @@ compatibility rule.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-30
+
+Native Web/API security checks. The single SQL-injection technique from v0.1.0
+becomes a shared app-security seam, and the common Web/API techniques are built
+on it, each as a real exploit -> capture -> fix -> replay loop against your own
+app, recorded with ATT&CK/OWASP tags. It also adds the out-of-band canary channel
+that makes a server-side-only success observable.
+
+### Added
+
+- Native path-traversal check, extracting a shared HTTP witness seam from the
+  SQL-injection check so every body-marker technique runs one probe, marker
+  witness, and scope path ([#63](https://github.com/itsakeyfut/redstep/issues/63)).
+- Native IDOR / broken-access-control check ([#64](https://github.com/itsakeyfut/redstep/issues/64)).
+- Native SSRF check, witnessed out-of-band by an in-lab canary that records a
+  coerced callback and attributes the finding to the app rather than the canary
+  ([#65](https://github.com/itsakeyfut/redstep/issues/65), ADR-0023).
+- Native OS command injection check ([#85](https://github.com/itsakeyfut/redstep/issues/85)),
+  and a blind, out-of-band variant whose success is a server-side callback to the
+  canary rather than anything in the probe's own response
+  ([#87](https://github.com/itsakeyfut/redstep/issues/87)).
+- Native server-side template injection (SSTI) check ([#90](https://github.com/itsakeyfut/redstep/issues/90)).
+- Each native check runs the full exploit -> capture -> fix -> replay loop against
+  the playground, paired with a positive control that the fixed target still
+  performs its benign function ([#66](https://github.com/itsakeyfut/redstep/issues/66)).
+- An ATT&CK/OWASP attack catalog under `docs/attacks/`, naming each technique, its
+  tags, and the capability that exercises it (ADR-0016).
+
+### Changed
+
+- Consolidated the body-marker and out-of-band witness classifiers into one
+  fail-closed classifier, with a reusable canary-log poll primitive, so the
+  verdict mapping the project most needs to protect lives in one place
+  ([#75](https://github.com/itsakeyfut/redstep/issues/75)).
+- The Docker-gated lab tests default-skip locally and are opted in by CI, so a
+  routine local run creates no lab containers
+  ([#98](https://github.com/itsakeyfut/redstep/issues/98)).
+
+### Fixed
+
+- The command-injection fix-replay positive control no longer passes over a
+  broken endpoint ([#91](https://github.com/itsakeyfut/redstep/issues/91)).
+
+### Internal
+
+- Offline guards for the diagnostic gate and the draft capability across every
+  native check, and a drifted cross-boundary constant fails a pure test rather
+  than only a self-skipping Docker one
+  ([#88](https://github.com/itsakeyfut/redstep/issues/88)).
+
 ## [0.1.0] - 2026-10-16
 
 Initial release: the attack-to-prevention vertical slice. redstep drives a real
@@ -46,5 +96,6 @@ what succeeded, and proves that a fix closes it.
   plus a Linux leg that builds the playground images so the Docker-gated lab tests
   run instead of self-skipping.
 
-[Unreleased]: https://github.com/itsakeyfut/redstep/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/itsakeyfut/redstep/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/itsakeyfut/redstep/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/itsakeyfut/redstep/releases/tag/v0.1.0

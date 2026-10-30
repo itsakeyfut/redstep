@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "redstep"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bollard",
  "futures-util",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "redstep-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
