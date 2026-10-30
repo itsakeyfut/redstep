@@ -61,8 +61,12 @@ sentinel, which only a successful `cat` could return, coming back in the respons
 it is the per-probe token reaching the in-lab canary, so the target ran a command that made
 an outbound request even though its response carried nothing. A `Pass` (not-exploitable,
 High) means this payload did not execute: in-band, the sentinel did not come back; blind,
-the token did not reach the canary. A followed redirect or an abnormal probe is
-`Inconclusive`. A confident "not exploitable" proves only that this payload and quoting did
+the token did not reach the canary. A followed redirect or an abnormal probe exit is
+`Inconclusive` by channel: in-band it downgrades even with the sentinel present (a
+redirected body may be another host's), but blind, the per-probe token in the canary's
+logs proves the target ran the command regardless of the outer probe's fate, so a blind
+hit stays a confident `Fail` on a redirect or an abnormal exit, and only a token-absent
+redirect/abnormal is `Inconclusive`. A confident "not exploitable" proves only that this payload and quoting did
 not break out of the command, not that every shell context is safe. The blind channel is
 weaker still, and in a way the in-band channel is not: its witness is a callback the target
 makes with its own tools, so a blind "not exploitable" presupposes both that the endpoint

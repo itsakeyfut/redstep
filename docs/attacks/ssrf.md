@@ -52,8 +52,12 @@ A `Fail` (High) means the per-probe token reached the canary, so the app was
 coerced into the request; the `ssrf_diagnostic` names the internal host reached and
 prescribes an outbound allowlist that refuses internal or private targets
 ([ADR-0009](../adr/0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md)).
-A `Pass` (not-exploitable, High) means this coercion did not reach the canary; a
-followed redirect or an abnormal probe is `Inconclusive`
+A `Pass` (not-exploitable, High) means this coercion did not reach the canary. A
+followed redirect or an abnormal probe exit is `Inconclusive` only when the token
+was NOT seen: the per-probe token in the canary's logs proves the app reached the
+canary regardless of what became of the outer probe, so a hit stays a confident
+`Fail` even on a redirect or an abnormal exit, while a token-absent redirect/abnormal
+is not a confident "not exploitable" (the coercion may never have fired)
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
 A confident "not exploitable" does NOT prove the app is safe: a coercion that never
 fired (the app erred before fetching, or ignored the URL) also reaches the canary
