@@ -1365,6 +1365,37 @@ fn vantage_draft(
     }
 }
 
+/// The aggregate blast-radius evidence draft (#112): the containment finding over
+/// a vantage's per-element reachability, stamped [`BLAST_RADIUS_VANTAGE`] and
+/// attributed to the vantage `segment`. `observation` is the aggregate contained
+/// value and its confidence (High only when a positive control backs it); the
+/// `summary` names the reachable set and the boundaries that held. The target is
+/// the vantage segment, not a `host:port`, because the finding is over the whole
+/// outgoing reach, not one service. Pure, so the draft shape is testable without
+/// Docker.
+pub(crate) fn blast_radius_draft(
+    segment: &str,
+    observation: &Observation<bool>,
+    summary: String,
+) -> EvidenceDraft {
+    EvidenceDraft {
+        capability: BLAST_RADIUS_VANTAGE,
+        target: segment.to_owned(),
+        intensity: Intensity::Safe,
+        observed: serde_json::Value::Bool(observation.value),
+        confidence: observation.confidence,
+        summary,
+        source: Some(NodeRef::Vantage {
+            segment: segment.to_owned(),
+        }),
+        reproduction: Reproduction {
+            capability: BLAST_RADIUS_VANTAGE.to_owned(),
+            target: segment.to_owned(),
+            params: serde_json::json!({ "vantage_segment": segment }),
+        },
+    }
+}
+
 /// The capability names of the HTTP witness techniques, as they appear in the
 /// evidence `capability` field and the canonical JSON (a published contract, so
 /// the string values are fixed). Shared by the context callers that run each check
@@ -1386,6 +1417,13 @@ pub(crate) const TCP_CONNECT_VANTAGE: &str = "tcp_connect_vantage";
 /// a hardcoded literal. The two are distinct techniques on the same mechanism: a
 /// consumer (a replay, a report, the attack graph) must not treat them as one.
 pub(crate) const NETWORK_SERVICE_DISCOVERY_VANTAGE: &str = "network_service_discovery_vantage";
+/// The capability stamped on the aggregate blast-radius finding from the vantage
+/// (#112, `blast_radius_from_vantage`): the containment verdict over the
+/// per-element reachability, distinct from the individual
+/// `NETWORK_SERVICE_DISCOVERY_VANTAGE` probes it rests on. Its own name so its
+/// canonical JSON stays byte-identical (RK-003), pinned by the Docker test's
+/// `record.capability` assertion.
+pub(crate) const BLAST_RADIUS_VANTAGE: &str = "blast_radius_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
 pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";

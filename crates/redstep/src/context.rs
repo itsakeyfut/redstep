@@ -24,6 +24,7 @@ use std::time::Duration;
 use bollard::Docker;
 
 use crate::capability::{Capability, IntensityCleared};
+use crate::environment::Environment;
 use crate::error::{Error, Result};
 use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
@@ -31,8 +32,8 @@ use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
     HTTP_SSTI_VANTAGE, LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE,
-    blind_cmdi_exploit_from, http_witness_exploit_from, ssrf_exploit_from, ssrf_token,
-    tcp_reachable_from,
+    blast_radius_draft, blind_cmdi_exploit_from, http_witness_exploit_from, ssrf_exploit_from,
+    ssrf_token, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -365,6 +366,79 @@ impl TestContext {
             ));
         }
         Ok(discovered)
+    }
+
+    /// Report the blast radius reachable from the assume-breach vantage: which of
+    /// the declared boundaries' members the foothold reaches and which boundaries
+    /// held, per element (every member, not a sample; RK-009), as a containment
+    /// finding attributed to the vantage (ADR-0011/ADR-0012, #112).
+    ///
+    /// It reads the outgoing boundaries of the vantage segment from `env` and
+    /// enumerates every member: each allowed `workload:port` is an intended path (a
+    /// positive control that must be reachable), and each `to`-segment workload not
+    /// named in the `allow` is a forbidden path (it must be unreachable), probed on
+    /// each allowed port. It probes every target from the vantage with
+    /// [`discover_services_from_vantage`](Self::discover_services_from_vantage),
+    /// which records one vantage-attributed draft per target and aborts fail-closed
+    /// on an abnormal probe; it then records one aggregate `blast_radius_vantage`
+    /// draft and returns the per-element detail with the aggregate containment
+    /// [`Recorded`] a test asserts.
+    ///
+    /// The containment confidence is derived from the positive control (RK-008),
+    /// not opted down (unlike the single-target containment demos): a reachable
+    /// forbidden path is a `High` breach (a `Fail`); a clean contained is `High`
+    /// only when a positive control reached (proving the probe works, so a
+    /// not-reached is a real block, not a dead probe); a weak or absent control is
+    /// `Low`, so the oracle's default-`High` gate lands it Inconclusive rather than
+    /// a confident false "contained" (the row-6 failure to avoid; see the private
+    /// `aggregate_containment`).
+    pub async fn blast_radius_from_vantage(&self, env: &Environment) -> Result<BlastRadius> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; \
+                     blast_radius_from_vantage needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let vantage_segment = binding.vantage_network.segment().to_owned();
+
+        // Enumerate every member of the vantage's outgoing boundaries (RK-009);
+        // the pure planner carries the intended flag beside each spec so a result
+        // is never relinked by position, and so the completeness is testable
+        // offline. Resolve each through the scope gate (a declared workload host).
+        let plan = plan_blast_radius(env, &vantage_segment);
+        let mut targets: Vec<ScopedTarget> = Vec::with_capacity(plan.len());
+        for (spec, _) in &plan {
+            targets.push(self.scope.resolve(spec)?);
+        }
+        let discovered = self.discover_services_from_vantage(&targets).await?;
+
+        // Pair each probed result (its target paired in, RK-018) with the intended
+        // flag from the one plan both derive from, in order.
+        let elements: Vec<BlastRadiusElement> = plan
+            .iter()
+            .zip(discovered)
+            .map(|((_, intended), (target, reachable))| BlastRadiusElement {
+                target,
+                intended: *intended,
+                reachable,
+            })
+            .collect();
+
+        let classified: Vec<(bool, Observation<bool>)> = elements
+            .iter()
+            .map(|e| (e.intended, e.reachable.observation.clone()))
+            .collect();
+        let contained = aggregate_containment(&classified);
+        let summary = blast_radius_summary(&elements);
+        let draft_ref =
+            self.record_draft(blast_radius_draft(&vantage_segment, &contained, summary));
+        Ok(BlastRadius {
+            elements,
+            contained: Recorded {
+                observation: contained,
+                draft_ref,
+                diagnostic: None,
+            },
+        })
     }
 
     /// Attempt a SQL injection against `target` from the attacker's vantage and
@@ -796,6 +870,137 @@ impl TestContext {
     }
 }
 
+/// One target's reachability from the vantage in a blast-radius report (#112),
+/// with how the topology classified it. The target is paired in, not positional
+/// (RK-018), so filtering or reordering the report cannot misalign a result with
+/// the wrong target.
+pub struct BlastRadiusElement {
+    /// The target probed, as the scope resolved it.
+    pub target: ScopedTarget,
+    /// True for an intended (allowed) path, the positive control; false for a
+    /// forbidden path that must be unreachable.
+    pub intended: bool,
+    /// Whether the vantage reached it, and how much to trust that.
+    pub reachable: Recorded<bool>,
+}
+
+/// The blast-radius report from the assume-breach vantage (#112): the per-element
+/// reachability and the aggregate containment finding.
+pub struct BlastRadius {
+    /// Every member probed, in enumeration order (RK-009). The reachable set is the
+    /// elements whose `reachable` is true; the boundaries that held are the
+    /// forbidden (`!intended`) elements whose `reachable` is false.
+    pub elements: Vec<BlastRadiusElement>,
+    /// The aggregate containment: `true` when no forbidden path was reachable, at
+    /// `High` only when a positive control backs it (see
+    /// [`blast_radius_from_vantage`](TestContext::blast_radius_from_vantage)). A
+    /// test asserts `ctx.expect(&report.contained).to_be(true)`.
+    pub contained: Recorded<bool>,
+}
+
+/// Plan the targets a blast-radius report probes from `vantage_segment`, each with
+/// its intended flag (#112). For every outgoing boundary of the vantage segment,
+/// every allowed `workload:port` is an intended path (a positive control), and
+/// every `to`-segment workload not named in the allow is a forbidden path, one
+/// entry per distinct allowed port of that boundary. Enumerating *every* member
+/// (not a sample) is the RK-009 property; keeping it pure (specs, not resolved
+/// targets or probes) is what lets that completeness be tested offline. A
+/// membership boundary (empty allow) contributes nothing: no allowed port to probe
+/// a forbidden workload on, and no intended path, which is the self-check's domain
+/// (#114), not the gateway-reach measurement.
+///
+/// The guard is `plan_blast_radius_enumerates_every_member`.
+fn plan_blast_radius(env: &Environment, vantage_segment: &str) -> Vec<(String, bool)> {
+    let mut planned: Vec<(String, bool)> = Vec::new();
+    for boundary in env
+        .boundaries()
+        .iter()
+        .filter(|b| b.from() == vantage_segment)
+    {
+        let allowed: Vec<(&str, u16)> = boundary
+            .allow()
+            .iter()
+            .filter_map(|s| crate::environment::parse_allow_spec(s))
+            .collect();
+        for spec in boundary.allow() {
+            planned.push((spec.clone(), true));
+        }
+        let allowed_ports: Vec<u16> = {
+            let mut ports: Vec<u16> = allowed.iter().map(|(_, port)| *port).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            ports
+        };
+        for workload in env
+            .workloads()
+            .iter()
+            .filter(|w| w.segment() == boundary.to())
+        {
+            if allowed.iter().any(|(w, _)| *w == workload.name()) {
+                continue;
+            }
+            for port in &allowed_ports {
+                planned.push((format!("{}:{port}", workload.name()), false));
+            }
+        }
+    }
+    planned
+}
+
+/// Aggregate a vantage's per-element reachability into a containment observation
+/// (#112). Each element is `(intended, reachability)`. A reachable forbidden path
+/// is a breach: not contained at `High` (a reachable probe is `High`), so the test
+/// Fails. Otherwise contained, at `High` only when there is at least one intended
+/// path and every intended path reached, so a not-reached forbidden path is a real
+/// block rather than a dead probe (RK-008); a weak or absent positive control is
+/// `Low`, so the oracle's default-`High` gate lands a not-fully-proven "contained"
+/// Inconclusive rather than a confident false "contained" (RK-002, the row-6
+/// failure to avoid). Pure, so the rule is unit-tested offline.
+///
+/// The guard is `aggregate_containment_rests_on_a_positive_control`.
+fn aggregate_containment(elements: &[(bool, Observation<bool>)]) -> Observation<bool> {
+    let breach = elements
+        .iter()
+        .any(|(intended, obs)| !intended && obs.value);
+    if breach {
+        return Observation {
+            value: false,
+            confidence: Confidence::High,
+        };
+    }
+    let mut controls = elements.iter().filter(|(intended, _)| *intended).peekable();
+    let control_backed = controls.peek().is_some() && controls.all(|(_, obs)| obs.value);
+    Observation {
+        value: true,
+        confidence: if control_backed {
+            Confidence::High
+        } else {
+            Confidence::Low
+        },
+    }
+}
+
+/// A one-line summary of a blast-radius report for the aggregate evidence draft:
+/// the reachable set and the forbidden paths that held.
+fn blast_radius_summary(elements: &[BlastRadiusElement]) -> String {
+    let spec = |e: &BlastRadiusElement| format!("{}:{}", e.target.host(), e.target.port());
+    let reached: Vec<String> = elements
+        .iter()
+        .filter(|e| e.reachable.observation.value)
+        .map(spec)
+        .collect();
+    let held: Vec<String> = elements
+        .iter()
+        .filter(|e| !e.intended && !e.reachable.observation.value)
+        .map(spec)
+        .collect();
+    format!(
+        "reached [{}]; boundaries held [{}]",
+        reached.join(", "),
+        held.join(", ")
+    )
+}
+
 /// Attach a domain diagnostic only to an observed exploit. The ADR-0009 cause is
 /// carried iff the capability actually witnessed the technique (`observed`), so a
 /// clean non-exploit never carries one; `make` is called only then. Every vantage
@@ -1089,6 +1294,108 @@ mod tests {
     use super::*;
     use crate::intensity::Intensity;
     use crate::observation::Confidence;
+
+    /// Guard: the blast-radius containment aggregation rests on a positive control
+    /// (#112, the row-6 failure to avoid). A reachable forbidden path is a breach:
+    /// not contained at `High` (a `Fail`). A clean contained is `High` only when
+    /// there is an intended path and every intended path reached (RK-008); a weak
+    /// control (an intended path not reached) or no control at all is `Low`, so the
+    /// default-`High` oracle gate lands it Inconclusive, never a confident false
+    /// "contained" (RK-002). Mutations: make the no-breach confidence always `High`
+    /// (drop the `control_backed` gate) -> the weak-control and no-control cases
+    /// read `High` -> fails; drop the breach check -> the breach case reads
+    /// contained -> fails; drop the non-empty-controls check -> the no-control case
+    /// reads `High` -> fails.
+    #[test]
+    fn aggregate_containment_rests_on_a_positive_control() {
+        let reached = Observation {
+            value: true,
+            confidence: Confidence::High,
+        };
+        let not_reached = Observation {
+            value: false,
+            confidence: Confidence::Low,
+        };
+
+        // A forbidden path reachable: a breach, High (so the test Fails).
+        let breach = aggregate_containment(&[(true, reached.clone()), (false, reached.clone())]);
+        assert!(!breach.value, "a reachable forbidden path is not contained");
+        assert_eq!(
+            breach.confidence,
+            Confidence::High,
+            "a breach is High-detectable"
+        );
+
+        // Control reached, forbidden not: contained, High (so the test Passes).
+        let backed =
+            aggregate_containment(&[(true, reached.clone()), (false, not_reached.clone())]);
+        assert!(backed.value);
+        assert_eq!(
+            backed.confidence,
+            Confidence::High,
+            "a positive control makes the not-reached a real block"
+        );
+
+        // A control that did NOT reach (weak positive control): contained but Low,
+        // so the default gate lands it Inconclusive, not a confident contained.
+        let weak =
+            aggregate_containment(&[(true, not_reached.clone()), (false, not_reached.clone())]);
+        assert!(weak.value);
+        assert_eq!(
+            weak.confidence,
+            Confidence::Low,
+            "a weak positive control cannot certify contained"
+        );
+
+        // No positive control at all (only forbidden paths probed): Low.
+        let no_control = aggregate_containment(&[(false, not_reached.clone())]);
+        assert!(no_control.value);
+        assert_eq!(
+            no_control.confidence,
+            Confidence::Low,
+            "with no positive control a not-reached might be a dead probe"
+        );
+    }
+
+    /// Guard: the blast-radius planner enumerates EVERY member of the vantage's
+    /// outgoing boundaries, not a sample (#112, RK-009): the allowed path as an
+    /// intended control, and every non-allowed `to`-workload on the allowed port as
+    /// forbidden. `db` and `cache` are both forbidden, so a planner that stopped at
+    /// the first would miss one. Mutation: `.take(1)` the `to`-workload loop in
+    /// `plan_blast_radius` -> the non-first forbidden workload is unplanned -> its
+    /// assertion fails.
+    #[test]
+    fn plan_blast_radius_enumerates_every_member() {
+        let env = Environment::builder()
+            .segment("dmz")
+            .segment("internal")
+            .vantage("dmz")
+            .standin("foot", "busybox:1", "dmz")
+            .service("api", "busybox:1", "internal")
+            .standin("db", "busybox:1", "internal")
+            .standin("cache", "busybox:1", "internal")
+            .gateway_boundary("dmz", "internal", &["api:8080"])
+            .build()
+            .expect("a valid dmz -> internal gateway topology");
+
+        let plan = plan_blast_radius(&env, "dmz");
+        assert!(
+            plan.contains(&("api:8080".to_owned(), true)),
+            "the allowed api:8080 is the intended control: {plan:?}"
+        );
+        assert!(
+            plan.contains(&("db:8080".to_owned(), false)),
+            "db (not allowed) is forbidden on the allowed port: {plan:?}"
+        );
+        assert!(
+            plan.contains(&("cache:8080".to_owned(), false)),
+            "cache (the non-first non-allowed workload) is also planned (RK-009): {plan:?}"
+        );
+        assert!(
+            !plan.contains(&("api:8080".to_owned(), false)),
+            "an allowed workload is not also a forbidden entry: {plan:?}"
+        );
+    }
 
     /// A capability that is not `Safe` and panics if executed, so a test can
     /// prove the intensity gate refuses it before it runs.
