@@ -11,10 +11,13 @@
 //! the default bridge, which would re-add egress), aliased by its workload name
 //! so a scope-resolved host like `db` is reachable in the lab by that name.
 //!
-//! The MVP realises the membership-only model (ADR-0011): a boundary is
-//! separate networks with no connection between them, and a non-empty `allow` is
-//! refused upstream, so no cross-segment path is wired here; the firewall
-//! gateway for port-level boundaries is Phase 4 / v0.3.0.
+//! A membership-only boundary (ADR-0011) is separate networks with no connection
+//! between them, and a non-empty `allow` on one is refused upstream. A
+//! gateway-mediated boundary adds a firewall-gateway container dual-homed on both
+//! segment networks (#113): at v0.3.0 it is a *structural* mediator that runs no
+//! `nft` and enables no forwarding, so the two segments still carry no
+//! cross-segment path (fail-closed by construction). The port rules that act on
+//! its `allow`, and the TCP-to-port self-check that verifies them, are #114.
 //!
 //! This unit stands the lab up, tears it down, and verifies isolation before a
 //! run. It makes no test verdict. That the egress-less flag is set is checked
@@ -37,7 +40,7 @@ use std::collections::HashMap;
 use bollard::Docker;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, EndpointSettings,
-    HealthStatusEnum, NetworkCreateRequest, NetworkingConfig,
+    HealthStatusEnum, NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig,
 };
 use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
@@ -99,7 +102,37 @@ impl LabContainer {
     }
 }
 
-/// A running lab: the Docker networks and containers a [`bring_up`] created.
+/// A firewall-gateway container bridging two segments (ADR-0011, #113), paired
+/// with the boundary it mediates. At v0.3.0 it is a structural mediator:
+/// dual-homed on the `from` and `to` segment networks and running no rules.
+/// #114's port/east-west self-check reads `from`/`to`/`name` to apply and verify
+/// the rules on it.
+#[derive(Debug, Clone)]
+pub struct LabGateway {
+    from: String,
+    to: String,
+    name: String,
+}
+
+impl LabGateway {
+    /// The segment the mediated boundary leads from.
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// The segment the mediated boundary leads to.
+    pub fn to(&self) -> &str {
+        &self.to
+    }
+
+    /// The Docker container name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A running lab: the Docker networks, workload containers, and firewall-gateway
+/// containers a [`bring_up`] created.
 ///
 /// The normal path is the explicit async [`teardown`](RunningLab::teardown).
 /// `Drop` is the backstop for a forgotten teardown or a panic: it removes what
@@ -110,6 +143,7 @@ pub struct RunningLab {
     docker: Docker,
     networks: Vec<LabNetwork>,
     containers: Vec<LabContainer>,
+    gateways: Vec<LabGateway>,
     torn_down: bool,
 }
 
@@ -147,6 +181,23 @@ fn container_name(run_id: &str, workload: &str) -> String {
     format!("{run_id}-{workload}")
 }
 
+/// The gateway container's name for a boundary in this run. The `from` and `to`
+/// segments are joined with `_`, which a valid lab name can never contain (only
+/// lowercase letters, digits, and interior hyphens): that keeps a gateway name
+/// disjoint from every workload container name (`{run}-{workload}`, so a workload
+/// `gw-a-b` cannot collide with the `a -> b` gateway) and unambiguous between
+/// `a-b -> c` and `a -> b-c`, which a hyphen separator would conflate.
+fn gateway_name(run_id: &str, from: &str, to: &str) -> String {
+    format!("{run_id}-gw-{from}_{to}")
+}
+
+/// The firewall-gateway container's image. At v0.3.0 (#113) the gateway is a
+/// structural mediator that runs no `nft`, so it is a liveness stand-in: busybox
+/// kept alive by `sleep`, exactly as a [`WorkloadKind::Standin`] is. #114 (the
+/// port/east-west enforcement) swaps this for an nftables image, grants the
+/// NET_ADMIN the rules need, and applies them.
+const GATEWAY_IMAGE: &str = "busybox:1.37";
+
 /// The container command for a workload, by kind (#46). A `Standin` runs
 /// `sleep 3600` to stay alive and inspectable (its image, e.g. busybox, would
 /// otherwise exit at once); a `Service` runs its own command, where `None`
@@ -170,6 +221,7 @@ pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> 
         docker: docker.clone(),
         networks: Vec::new(),
         containers: Vec::new(),
+        gateways: Vec::new(),
         torn_down: false,
     };
 
@@ -178,7 +230,9 @@ pub async fn bring_up(docker: &Docker, env: &Environment) -> Result<RunningLab> 
         Err(e) => {
             // Tear down the partial lab before surfacing the error; report a
             // cleanup failure rather than hiding it under the original error.
-            if let Err(cleanup) = remove_all(docker, &lab.containers, &lab.networks).await {
+            if let Err(cleanup) =
+                remove_all(docker, &lab.containers, &lab.gateways, &lab.networks).await
+            {
                 eprintln!("redstep: cleanup after a failed bring-up also failed: {cleanup}");
             }
             lab.torn_down = true;
@@ -299,6 +353,11 @@ async fn provision(
             ensure_image(docker, workload.image()).await?;
         }
     }
+    // The gateway image too, if any boundary is gateway-mediated (it may already
+    // be in `ensured` if a workload shares it).
+    if env.boundaries().iter().any(|b| b.is_gateway_mediated()) && ensured.insert(GATEWAY_IMAGE) {
+        ensure_image(docker, GATEWAY_IMAGE).await?;
+    }
 
     for segment in env.segments() {
         let name = network_name(run_id, segment.name());
@@ -360,11 +419,79 @@ async fn provision(
             .map_err(lab_unavailable)?;
     }
 
+    // Bring up one gateway container per gateway-mediated boundary (ADR-0011,
+    // #113). It is dual-homed on the `from` and `to` segment networks and nothing
+    // else, so by design it is the only container bridging the two segments and
+    // any future cross-segment path must pass through it. It is created on the
+    // `from` network via
+    // networking_config (never the default bridge, which would re-add egress),
+    // then connected to the `to` network; both are lab networks created
+    // `internal: true`, so ADR-0006 layer 1 (egress-less) holds and the gateway
+    // has no route out. At v0.3.0 it runs `sleep` and no rules, and no forwarding
+    // is enabled, so no traffic crosses: the path is fail-closed by construction
+    // until #114 wires forwarding and the port rules. The gateway is framework
+    // infrastructure, not a workload, so it never enters the scope allowlist
+    // (`Scope::from_environment` reads workloads only). It is pushed to
+    // `lab.gateways` before it is connected or started, so a failure after create
+    // tears it down with the rest.
+    for boundary in env.boundaries().iter().filter(|b| b.is_gateway_mediated()) {
+        let gname = gateway_name(run_id, boundary.from(), boundary.to());
+        let from_net = network_name(run_id, boundary.from());
+        let to_net = network_name(run_id, boundary.to());
+        let endpoints = HashMap::from([(from_net, EndpointSettings::default())]);
+        docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(gname.clone()),
+                    ..Default::default()
+                }),
+                ContainerCreateBody {
+                    image: Some(GATEWAY_IMAGE.to_owned()),
+                    // A liveness stand-in: busybox kept alive by `sleep`. It runs
+                    // no `nft` at v0.3.0 (see `GATEWAY_IMAGE`).
+                    cmd: Some(vec!["sleep".to_owned(), "3600".to_owned()]),
+                    networking_config: Some(NetworkingConfig {
+                        endpoints_config: Some(endpoints),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(lab_unavailable)?;
+        lab.gateways.push(LabGateway {
+            from: boundary.from().to_owned(),
+            to: boundary.to().to_owned(),
+            name: gname.clone(),
+        });
+        docker
+            .connect_network(
+                &to_net,
+                NetworkConnectRequest {
+                    container: gname.clone(),
+                    // No alias: nothing resolves the gateway by name at v0.3.0
+                    // (no forwarding), and #114 adds one if the rules need it.
+                    endpoint_config: None,
+                },
+            )
+            .await
+            .map_err(lab_unavailable)?;
+        docker
+            .start_container(
+                &gname,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(lab_unavailable)?;
+    }
+
     // Wait until every workload reports healthy before returning, so a probe
     // after bring-up is meaningful rather than racing a slow-start real image
     // (#47). A stand-in declares no HEALTHCHECK and is ready at once, so the
     // boundary demo is unchanged. On failure this propagates as `Err`, which
-    // `bring_up` tears the partial lab down on.
+    // `bring_up` tears the partial lab down on. The gateway is not awaited: it is
+    // a no-HEALTHCHECK busybox stand-in whose liveness is a successful `start`
+    // (the same guarantee a `Standin` workload gets), and #114 revisits this when
+    // it swaps in an nftables image that runs rules.
     await_readiness(
         &lab.containers,
         &DockerHealthPoller { docker },
@@ -487,18 +614,27 @@ async fn await_readiness<P: HealthPoller>(
     })
 }
 
-/// Remove every listed container (forced) then every listed network, best
-/// effort: keep going past a failure and return the first error, if any.
+/// Remove every listed container and gateway (forced) then every listed network,
+/// best effort: keep going past a failure and return the first error, if any. The
+/// containers and gateways go before the networks because a network with an
+/// attached container cannot be removed; force-removing the containers (the
+/// gateway among them, which disconnects it from both its networks) clears that.
 async fn remove_all(
     docker: &Docker,
     containers: &[LabContainer],
+    gateways: &[LabGateway],
     networks: &[LabNetwork],
 ) -> Result<()> {
     let mut first_err: Option<Error> = None;
-    for c in containers {
+    // Containers and gateway containers alike are force-removed first.
+    for name in containers
+        .iter()
+        .map(LabContainer::name)
+        .chain(gateways.iter().map(LabGateway::name))
+    {
         if let Err(e) = docker
             .remove_container(
-                c.name(),
+                name,
                 Some(RemoveContainerOptions {
                     force: true,
                     ..Default::default()
@@ -534,11 +670,15 @@ trait Prober {
 }
 
 /// Verify every declared-forbidden path is actually blocked, before any test
-/// runs (ADR-0011 step 4). For each boundary (an empty `allow` means the path
-/// is blocked, and a non-empty one is refused at build) and *every* workload in
-/// the `to` segment, a probe in the `from` segment must fail to reach the
-/// workload while a positive-control probe in the `to` segment reaches it, so a
-/// broken probe cannot read as isolation.
+/// runs (ADR-0011 step 4). For each boundary and *every* workload in the `to`
+/// segment, a probe in the `from` segment must fail to reach the workload while a
+/// positive-control probe in the `to` segment reaches it, so a broken probe
+/// cannot read as isolation. Every boundary is treated as fully forbidden here,
+/// a gateway-mediated one included: at v0.3.0 the gateway is a structural
+/// mediator that forwards nothing (#113), so its `to`-workloads are unreachable
+/// from `from` and the check passes. The port-level self-check, which must verify
+/// that a gateway's declared `allow` *is* reachable while everything else is not,
+/// is #114 and replaces this logic for a gateway boundary.
 ///
 /// `Ok(())` only when every declared boundary that has a `to`-workload is
 /// verified blocked. A reachable forbidden path is [`Error::BoundaryViolated`];
@@ -550,8 +690,8 @@ trait Prober {
 /// container name, which Docker's embedded DNS resolves only for peers on the
 /// same network, so it detects a workload wrongly attached to the `from` network
 /// (the MVP's all-or-nothing boundary) and needs no listener. It does not verify
-/// a routed or port-level boundary: the firewall gateway (ADR-0011, Phase 4 /
-/// v0.3.0) adds those and will need a TCP-to-port probe, not name-based ICMP.
+/// a routed or port-level boundary: that is the firewall gateway's own self-check
+/// (ADR-0011, #114), which will need a TCP-to-port probe, not name-based ICMP.
 ///
 /// The lab-wired runner gates on this before any test ([`run_in_running_lab`](crate::run_in_running_lab),
 /// #28): a failure is returned as `RunError::Lab` and no test runs. A caller that
@@ -2283,7 +2423,13 @@ impl RunningLab {
         &self.containers
     }
 
-    /// Remove every container and network this lab created. The normal,
+    /// The firewall-gateway containers this lab created, one per gateway-mediated
+    /// boundary (#113). Empty for a membership-only topology.
+    pub fn gateways(&self) -> &[LabGateway] {
+        &self.gateways
+    }
+
+    /// Remove every container, gateway, and network this lab created. The normal,
     /// error-surfacing teardown path.
     ///
     /// `torn_down` is set whether or not `remove_all` succeeded, but only once
@@ -2294,7 +2440,13 @@ impl RunningLab {
     /// called, or its future dropped (cancelled) before `torn_down` was set (the
     /// `Drop` impl).
     pub async fn teardown(mut self) -> Result<()> {
-        let result = remove_all(&self.docker, &self.containers, &self.networks).await;
+        let result = remove_all(
+            &self.docker,
+            &self.containers,
+            &self.gateways,
+            &self.networks,
+        )
+        .await;
         self.torn_down = true;
         result
     }
@@ -2315,6 +2467,7 @@ impl Drop for RunningLab {
         // runtime, and join it. Best effort: warn, never panic.
         let docker = self.docker.clone();
         let containers = std::mem::take(&mut self.containers);
+        let gateways = std::mem::take(&mut self.gateways);
         let networks = std::mem::take(&mut self.networks);
         let ok = std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -2323,7 +2476,7 @@ impl Drop for RunningLab {
             else {
                 return false;
             };
-            rt.block_on(remove_all(&docker, &containers, &networks))
+            rt.block_on(remove_all(&docker, &containers, &gateways, &networks))
                 .is_ok()
         })
         .join()
@@ -2364,6 +2517,31 @@ mod tests {
         );
     }
 
+    /// Guard: `gateway_name` joins the segments with `_` so a gateway name is
+    /// disjoint from every workload container name and unambiguous between
+    /// `a-b -> c` and `a -> b-c`. This is the offline teeth for the naming (the
+    /// dual-home itself is Docker-gated): a workload `gw-a-b` and the `a -> b`
+    /// gateway must not take the same container name, and the two hyphenated
+    /// pairs must differ. Mutation: change the `_` separator back to `-` in
+    /// `gateway_name` -> the workload-collision assertion and the ambiguity
+    /// assertion both fail.
+    #[test]
+    fn gateway_name_is_disjoint_and_unambiguous() {
+        let run = "redstep-abc-0";
+        // A workload named like the gateway does not collide with it.
+        assert_ne!(
+            gateway_name(run, "a", "b"),
+            container_name(run, "gw-a-b"),
+            "a gateway name must not equal a workload container name"
+        );
+        // `a-b -> c` and `a -> b-c` are distinct gateways.
+        assert_ne!(
+            gateway_name(run, "a-b", "c"),
+            gateway_name(run, "a", "b-c"),
+            "hyphenated segment pairs must not be conflated"
+        );
+    }
+
     /// Guard: dropping a `RunningLab` without calling `teardown`, from inside an
     /// active tokio runtime, does not panic (the backstop runs on a dedicated
     /// thread). Mutation: replace the `std::thread::spawn(...).join()` with a
@@ -2382,6 +2560,7 @@ mod tests {
                 docker,
                 networks: Vec::new(),
                 containers: Vec::new(),
+                gateways: Vec::new(),
                 torn_down: false,
             };
             drop(lab);
@@ -2588,6 +2767,7 @@ mod tests {
             docker: Docker::connect_with_local_defaults().expect("lazy connect"),
             networks,
             containers,
+            gateways: Vec::new(),
             torn_down: true,
         }
     }

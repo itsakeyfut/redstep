@@ -83,15 +83,20 @@ impl Workload {
 /// permitted `workload:port` specs (ADR-0003's shape); an empty `allow` means
 /// the path is blocked, which is the MVP's `internet -> internal`.
 ///
-/// Nothing enforces a port-level `allow` yet: the MVP's boundaries are
-/// membership-only (ADR-0011), so [`EnvironmentBuilder::build`] refuses a
-/// non-empty one rather than hold a permission the lab cannot keep. The field
-/// stays for the firewall gateway (ADR-0011, v0.3.0) that will enforce it.
+/// A plain boundary ([`EnvironmentBuilder::boundary`]) is membership-only
+/// (ADR-0011): there is no mechanism to enforce a port-level `allow`, so
+/// [`EnvironmentBuilder::build`] refuses a non-empty one rather than hold a
+/// permission the lab cannot keep (RK-005). A gateway-mediated boundary
+/// ([`EnvironmentBuilder::gateway_boundary`]) declares a firewall gateway to
+/// enforce it, so it may carry a validated `allow`; at v0.3.0 the gateway is a
+/// structural mediator (#113) and the port rules that act on `allow`, with the
+/// self-check that verifies them, are #114.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
     from: String,
     to: String,
     allow: Vec<String>,
+    gateway: bool,
 }
 
 impl Boundary {
@@ -108,6 +113,13 @@ impl Boundary {
     /// The permitted `workload:port` specs; empty means the path is blocked.
     pub fn allow(&self) -> &[String] {
         &self.allow
+    }
+
+    /// Whether a firewall gateway mediates this boundary (ADR-0011). A plain
+    /// boundary is membership-only and carries an empty `allow`; a
+    /// gateway-mediated one may carry a validated `allow` the gateway enforces.
+    pub fn is_gateway_mediated(&self) -> bool {
+        self.gateway
     }
 }
 
@@ -163,7 +175,7 @@ impl Environment {
 pub struct EnvironmentBuilder {
     segments: Vec<String>,
     workloads: Vec<(String, String, String, WorkloadKind)>,
-    boundaries: Vec<(String, String, Vec<String>)>,
+    boundaries: Vec<(String, String, Vec<String>, bool)>,
     vantage: Option<String>,
 }
 
@@ -218,13 +230,32 @@ impl EnvironmentBuilder {
         self
     }
 
-    /// Declare a boundary from `from` to `to` permitting `allow` (empty blocks
-    /// the path; a non-empty `allow` is refused until the firewall gateway, see
-    /// [`build`](Self::build)).
+    /// Declare a membership-only boundary from `from` to `to` permitting `allow`
+    /// (empty blocks the path). A non-empty `allow` is refused at
+    /// [`build`](Self::build), because nothing enforces a port-level permission on
+    /// a membership-only boundary (RK-005); use
+    /// [`gateway_boundary`](Self::gateway_boundary) for a gateway-enforced allow.
     pub fn boundary(mut self, from: &str, to: &str, allow: &[&str]) -> Self {
         let allow = allow.iter().map(|spec| (*spec).to_owned()).collect();
         self.boundaries
-            .push((from.to_owned(), to.to_owned(), allow));
+            .push((from.to_owned(), to.to_owned(), allow, false));
+        self
+    }
+
+    /// Declare a boundary from `from` to `to` enforced by a firewall gateway,
+    /// permitting `allow` (`workload:port` specs; an empty `allow` opens nothing,
+    /// though the gateway is still brought up for the boundary). Unlike
+    /// [`boundary`](Self::boundary) this may carry a non-empty `allow`: a
+    /// gateway is declared to enforce it (ADR-0011). At v0.3.0 the gateway is a
+    /// structural mediator, a container dual-homed on both segment networks
+    /// (#113); the port rules that act on `allow` and the self-check that verifies
+    /// them are #114. [`build`](Self::build) refuses an `allow` the gateway cannot
+    /// enforce (a self-loop, a malformed spec, or a workload that is not declared
+    /// or not in the `to` segment).
+    pub fn gateway_boundary(mut self, from: &str, to: &str, allow: &[&str]) -> Self {
+        let allow = allow.iter().map(|spec| (*spec).to_owned()).collect();
+        self.boundaries
+            .push((from.to_owned(), to.to_owned(), allow, true));
         self
     }
 
@@ -237,9 +268,11 @@ impl EnvironmentBuilder {
     /// Validate the topology and build the environment. Every reference must
     /// name a declared segment, names must be unique, the vantage segment must
     /// be set and declared, every segment and workload name must be a valid lab
-    /// name (see `is_valid_lab_name`), and every boundary's `allow`
-    /// must be empty (the membership-only MVP cannot enforce a port-level allow,
-    /// so the model refuses one fail-closed); otherwise
+    /// name (see `is_valid_lab_name`), a plain boundary's `allow` must be empty
+    /// (nothing enforces a port-level allow without a gateway, so the model
+    /// refuses one fail-closed, RK-005), and a gateway boundary's `allow` must be
+    /// one the gateway can enforce (distinct segments, each spec a `workload:port`
+    /// naming a declared workload in the `to` segment); otherwise
     /// [`Error::InvalidEnvironment`].
     pub fn build(self) -> Result<Environment> {
         let invalid = |reason: String| Error::InvalidEnvironment { reason };
@@ -308,7 +341,13 @@ impl EnvironmentBuilder {
         }
 
         let mut boundaries: Vec<Boundary> = Vec::new();
-        for (from, to, allow) in self.boundaries {
+        // The `(from, to)` pairs that already carry a gateway, so a second gateway
+        // boundary on the same pair is refused here rather than failing at
+        // bring-up: two gateways for one pair take the same container name and
+        // collide (a 409), so the valid-by-construction `Environment` must not
+        // admit the pair twice.
+        let mut gateway_pairs: Vec<(String, String)> = Vec::new();
+        for (from, to, allow, gateway) in self.boundaries {
             if !declared(&from) {
                 return Err(invalid(format!(
                     "boundary leads from undeclared segment {from:?}"
@@ -319,14 +358,68 @@ impl EnvironmentBuilder {
                     "boundary leads to undeclared segment {to:?}"
                 )));
             }
-            if !allow.is_empty() {
+            if gateway {
+                // A gateway boundary may carry an `allow`, but only one the gateway
+                // can actually enforce: it bridges two distinct segments, and each
+                // spec must name a declared workload in the `to` segment on a valid
+                // port. An opening the gateway cannot hold is refused, not built
+                // (RK-005): a topology that reads as allowed while nothing holds the
+                // line is this project's off-scale failure turned into a value.
+                if from == to {
+                    return Err(invalid(format!(
+                        "gateway boundary {from:?} -> {to:?} bridges a segment to itself; \
+                         a gateway mediates a path between two distinct segments"
+                    )));
+                }
+                if gateway_pairs.iter().any(|(f, t)| f == &from && t == &to) {
+                    return Err(invalid(format!(
+                        "a second gateway boundary {from:?} -> {to:?} is declared; one pair \
+                         takes one gateway, so the duplicate would collide at bring-up"
+                    )));
+                }
+                gateway_pairs.push((from.clone(), to.clone()));
+                for spec in &allow {
+                    let Some((workload, _port)) = parse_allow_spec(spec) else {
+                        return Err(invalid(format!(
+                            "gateway boundary {from:?} -> {to:?} allow spec {spec:?} is not a \
+                             valid workload:port (a workload name, a colon, a port 1-65535)"
+                        )));
+                    };
+                    match workloads.iter().find(|w| w.name == workload) {
+                        None => {
+                            return Err(invalid(format!(
+                                "gateway boundary {from:?} -> {to:?} allow spec {spec:?} names \
+                                 workload {workload:?}, which is not declared"
+                            )));
+                        }
+                        Some(w) if w.segment != to => {
+                            return Err(invalid(format!(
+                                "gateway boundary {from:?} -> {to:?} allow spec {spec:?} names \
+                                 workload {workload:?} in segment {seg:?}, not the boundary's \
+                                 {to:?} segment",
+                                seg = w.segment
+                            )));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            } else if !allow.is_empty() {
+                // A membership-only boundary cannot enforce a port-level allow, so
+                // the model refuses one fail-closed rather than hold a permission
+                // the lab cannot keep (RK-005). Use `.gateway_boundary` for a
+                // gateway-enforced allow.
                 return Err(invalid(format!(
                     "boundary {from:?} -> {to:?} carries a port-level allow {allow:?}, \
-                     but the membership-only MVP cannot enforce one; allow must be empty \
-                     until the firewall gateway (ADR-0011, v0.3.0)"
+                     but a membership-only boundary cannot enforce one; use a gateway \
+                     boundary, or leave allow empty (ADR-0011, RK-005)"
                 )));
             }
-            boundaries.push(Boundary { from, to, allow });
+            boundaries.push(Boundary {
+                from,
+                to,
+                allow,
+                gateway,
+            });
         }
 
         let segments = segments.into_iter().map(|name| Segment { name }).collect();
@@ -337,6 +430,39 @@ impl EnvironmentBuilder {
             vantage,
         })
     }
+}
+
+/// Split a gateway boundary's `allow` spec `"workload:port"` into its workload
+/// name and port, or `None` if it is not that shape: it must have a `:`, a
+/// non-empty workload name, and a canonical port in `1..=65535`. Whether the
+/// workload is declared and sits in the boundary's `to` segment is checked by
+/// [`EnvironmentBuilder::build`], which has the workload list; this is the pure
+/// syntactic half, unit-tested without it. A workload name is a valid lab name
+/// and so carries no `:`, so the last `:` separates the port.
+///
+/// The port is parsed by hand rather than by `u16::from_str`, which would also
+/// accept a leading `+` (`"+80"`) and leading zeros (`"080"`): the spec is
+/// stored raw for the enforcement sub-issue to render into a firewall rule, so a
+/// non-canonical form that parses here would be carried through verbatim. Only
+/// ASCII digits, no leading zero, are accepted.
+///
+/// The guard is `parse_allow_spec_reads_workload_and_port`.
+fn parse_allow_spec(spec: &str) -> Option<(&str, u16)> {
+    let (workload, port) = spec.rsplit_once(':')?;
+    if workload.is_empty() {
+        return None;
+    }
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if port.len() > 1 && port.starts_with('0') {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((workload, port))
 }
 
 /// Whether `name` is a valid lab name: a DNS-label-like identifier of at most 63
@@ -442,10 +568,14 @@ mod tests {
     }
 
     /// Guard: the MVP environment validates and carries its topology back field
-    /// for field. The happy-path fixture the rejection tests start from.
-    /// Mutation: have `vantage_segment` return `segments[0].name()` -> this
-    /// fails, because the fixture's vantage is not its first segment; swap
-    /// `Workload::image` and `segment` bodies -> the db assertions fail.
+    /// for field, and its `.boundary` reads as not gateway-mediated (the false
+    /// direction of `is_gateway_mediated`, which `bring_up`'s gateway filter
+    /// depends on: a plain boundary reading `true` would spawn a spurious
+    /// gateway). Mutation: have `vantage_segment` return `segments[0].name()` ->
+    /// this fails, because the fixture's vantage is not its first segment; swap
+    /// `Workload::image` and `segment` bodies -> the db assertions fail; make
+    /// `is_gateway_mediated` return `true` -> the `!is_gateway_mediated` assertion
+    /// fails.
     #[test]
     fn mvp_environment_builds() {
         let env = mvp().build().expect("the MVP topology is valid");
@@ -472,6 +602,10 @@ mod tests {
             boundary.allow().is_empty(),
             "the internet -> internal path is blocked"
         );
+        assert!(
+            !boundary.is_gateway_mediated(),
+            "a plain boundary is not gateway-mediated"
+        );
     }
 
     /// Guard: a boundary carrying a non-empty `allow` is refused, because the
@@ -486,6 +620,164 @@ mod tests {
             matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("allow")),
             "got {result:?}"
         );
+    }
+
+    /// A gateway-boundary fixture: a `dmz` foothold segment, an `internal`
+    /// segment with a `web` service, and the attacker on `dmz`. The gateway
+    /// tests declare a `dmz -> internal` boundary on top of this.
+    fn gateway_base() -> EnvironmentBuilder {
+        Environment::builder()
+            .segment("dmz")
+            .segment("internal")
+            .vantage("dmz")
+            .standin("foot", "busybox:1", "dmz")
+            .service("web", "busybox:1", "internal")
+    }
+
+    /// Guard: a gateway-mediated boundary accepts a non-empty `allow` that the
+    /// gateway can enforce (a declared workload in the `to` segment on a valid
+    /// port), and the boundary reports itself gateway-mediated. This is #113's
+    /// acceptance criterion 1 at the model level, and the companion to the
+    /// still-refused plain boundary above (criterion 2). Mutation: make `build`
+    /// treat a gateway boundary like a plain one (refuse its allow) -> the
+    /// `expect` panics; make `gateway_boundary` push `false` (or
+    /// `is_gateway_mediated` return `false`) -> the `is_gateway_mediated`
+    /// assertion fails.
+    #[test]
+    fn a_gateway_boundary_accepts_a_validated_allow() {
+        let env = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:443"])
+            .build()
+            .expect("a gateway boundary with a valid allow builds");
+        let boundary = &env.boundaries()[0];
+        assert!(
+            boundary.is_gateway_mediated(),
+            "the boundary must report itself gateway-mediated"
+        );
+        assert_eq!(boundary.allow(), ["web:443"]);
+    }
+
+    /// Guard: a gateway boundary whose `allow` the gateway cannot enforce is
+    /// refused, not built (#113 acceptance criterion 3, RK-005): a workload not
+    /// in the `to` segment, an undeclared workload, a malformed spec, a port of
+    /// 0, a gateway bridging a segment to itself, and an unenforceable spec that
+    /// is not the first in the list. Mutations: drop the allow-spec validation
+    /// loop in `build` -> the wrong-segment, unknown, malformed, and port-0 cases
+    /// build; narrow the loop to the first spec (`allow.iter().take(1)`) -> the
+    /// valid-then-invalid case builds; drop the `from == to` check -> the
+    /// self-loop builds. Each makes this fail.
+    #[test]
+    fn a_gateway_that_cannot_enforce_is_refused() {
+        // `foot` is in `dmz`, not the boundary's `to` segment `internal`.
+        let wrong_segment = gateway_base()
+            .gateway_boundary("dmz", "internal", &["foot:80"])
+            .build();
+        assert!(
+            matches!(&wrong_segment, Err(Error::InvalidEnvironment { reason }) if reason.contains("foot") && reason.contains("segment")),
+            "workload not in the to segment: {wrong_segment:?}"
+        );
+
+        let unknown = gateway_base()
+            .gateway_boundary("dmz", "internal", &["ghost:80"])
+            .build();
+        assert!(
+            matches!(&unknown, Err(Error::InvalidEnvironment { reason }) if reason.contains("ghost") && reason.contains("not declared")),
+            "undeclared workload: {unknown:?}"
+        );
+
+        let malformed = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web"])
+            .build();
+        assert!(
+            matches!(&malformed, Err(Error::InvalidEnvironment { reason }) if reason.contains("workload:port")),
+            "a spec with no port: {malformed:?}"
+        );
+
+        let port_zero = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:0"])
+            .build();
+        assert!(
+            matches!(&port_zero, Err(Error::InvalidEnvironment { reason }) if reason.contains("workload:port")),
+            "port 0 is not a usable port: {port_zero:?}"
+        );
+
+        let self_loop = gateway_base()
+            .gateway_boundary("dmz", "dmz", &["foot:80"])
+            .build();
+        assert!(
+            matches!(&self_loop, Err(Error::InvalidEnvironment { reason }) if reason.contains("itself")),
+            "a gateway bridging a segment to itself: {self_loop:?}"
+        );
+
+        // Every spec is validated, not just the first: a valid spec followed by
+        // an unenforceable one is still refused.
+        let later_bad = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:80", "ghost:1"])
+            .build();
+        assert!(
+            matches!(&later_bad, Err(Error::InvalidEnvironment { reason }) if reason.contains("ghost") && reason.contains("not declared")),
+            "an unenforceable spec after a valid one: {later_bad:?}"
+        );
+    }
+
+    /// Guard: two gateway boundaries on the same `(from, to)` pair are refused,
+    /// because both would take the same gateway container name and collide at
+    /// bring-up, which a valid-by-construction `Environment` must not admit.
+    /// Mutation: drop the `gateway_pairs` duplicate check in `build` -> the
+    /// second gateway boundary builds -> this fails.
+    #[test]
+    fn a_duplicate_gateway_boundary_is_refused() {
+        let result = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:80"])
+            .gateway_boundary("dmz", "internal", &["web:443"])
+            .build();
+        assert!(
+            matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("second gateway boundary") && reason.contains("collide")),
+            "a second gateway on the same pair: {result:?}"
+        );
+    }
+
+    /// Guard: `parse_allow_spec` reads `workload:port` across its boundary and
+    /// non-canonical cases, and rejects everything that is not a canonical
+    /// `1..=65535` port. Mutations: drop the `port == 0` rejection -> `"web:0"`
+    /// parses -> fails; drop the empty-workload check -> `":443"` parses ->
+    /// fails; change the `port <= 65535` edge (e.g. `port == 0` to
+    /// `port <= 1 || port == 65535`) -> `"web:1"` or `"web:65535"` is wrongly
+    /// rejected -> fails; drop the ASCII-digit/leading-zero checks -> `"web:+80"`
+    /// or `"web:080"` parses -> fails; change `rsplit_once` to `split_once` ->
+    /// `"a:b:80"` reads as `None` instead of `("a:b", 80)` -> fails.
+    #[test]
+    fn parse_allow_spec_reads_workload_and_port() {
+        assert_eq!(parse_allow_spec("web:443"), Some(("web", 443)));
+        assert_eq!(parse_allow_spec("web:1"), Some(("web", 1)), "low boundary");
+        assert_eq!(
+            parse_allow_spec("web:65535"),
+            Some(("web", 65535)),
+            "high boundary"
+        );
+        // The last colon separates the port, so a workload-ish prefix with a
+        // colon keeps its colon (build then rejects it as an unknown workload).
+        assert_eq!(
+            parse_allow_spec("a:b:80"),
+            Some(("a:b", 80)),
+            "rsplit, not split"
+        );
+        assert_eq!(parse_allow_spec("web"), None, "no port");
+        assert_eq!(parse_allow_spec("web:"), None, "empty port");
+        assert_eq!(parse_allow_spec("web:0"), None, "port 0 is not usable");
+        assert_eq!(parse_allow_spec("web:65536"), None, "port past u16");
+        assert_eq!(parse_allow_spec("web:99999"), None, "port past u16");
+        assert_eq!(
+            parse_allow_spec("web:+80"),
+            None,
+            "a leading + is not canonical"
+        );
+        assert_eq!(
+            parse_allow_spec("web:080"),
+            None,
+            "a leading zero is not canonical"
+        );
+        assert_eq!(parse_allow_spec(":443"), None, "empty workload");
     }
 
     /// Guard: a boundary that leads to or from an undeclared segment is rejected

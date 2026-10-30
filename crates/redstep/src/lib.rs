@@ -54,7 +54,9 @@ pub use evidence::{
 pub use expectation::{Diagnostic, Expectation, Judgement, judge};
 pub use intensity::Intensity;
 pub use observation::{Confidence, Observation};
-pub use orchestrator::{LabContainer, LabNetwork, RunningLab, boundary_self_check, bring_up};
+pub use orchestrator::{
+    LabContainer, LabGateway, LabNetwork, RunningLab, boundary_self_check, bring_up,
+};
 pub use redstep_macros::security_test;
 pub use runner::{RunError, RunSummary, TestRun, run, run_in_lab, run_in_running_lab};
 pub use scope::{Scope, ScopeBuilder, ScopedTarget};
