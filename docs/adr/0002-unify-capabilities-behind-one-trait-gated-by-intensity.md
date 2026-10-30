@@ -35,7 +35,7 @@ The intensity gate is compiler-held *outside* the crate (#9): the `Capability` t
 ### Consequences
 
 * Good, one evidence schema and one safety device cover native and tool paths alike; the cheap checks stay cheap.
-* Bad, the `Capability` trait's in-container execution seam is not yet designed; the one MVP vantage capability is a bespoke method (`tcp_reachable_from`), and generalizing it waits for the M3 tool adapters (an interface with no caller is not invented early).
+* Bad, the `Capability` trait's in-container execution seam is not yet designed; the one MVP vantage capability is a bespoke method (`tcp_reachable_from`), and generalizing it waits for the v0.4.0 tool adapters (an interface with no caller is not invented early).
 * What would reverse this: a single kind of capability (all native, or all tool) proving sufficient. Not expected; the project needs both.
 
 ## Pros and Cons of the Options

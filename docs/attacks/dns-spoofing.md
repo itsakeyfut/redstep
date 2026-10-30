@@ -32,7 +32,7 @@ Not yet implemented (`capability: none`). On a lab segment with a resolver and c
 witness is a victim resolving a sentinel name to an in-lab attacker address, or an
 attacker address appearing in the resolver's cache. It is on-path adjacent to
 [Adversary-in-the-Middle](adversary-in-the-middle/README.md) and would land with the
-network-boundary work (roadmap M3).
+network-boundary work (roadmap v0.3.0).
 
 ## What a verdict means
 

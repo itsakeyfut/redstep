@@ -36,7 +36,7 @@ Not yet implemented (`capability: none`). On a shared lab segment the witness is
 captured authentication or a successful relay: the attacker vantage answers a victim's
 broadcast query and records the credential material or the relayed session. It needs the
 broadcast name-resolution protocols active between lab workloads and would land with the
-network-boundary work (roadmap M3).
+network-boundary work (roadmap v0.3.0).
 
 ## What a verdict means
 

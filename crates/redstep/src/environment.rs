@@ -86,7 +86,7 @@ impl Workload {
 /// Nothing enforces a port-level `allow` yet: the MVP's boundaries are
 /// membership-only (ADR-0011), so [`EnvironmentBuilder::build`] refuses a
 /// non-empty one rather than hold a permission the lab cannot keep. The field
-/// stays for the firewall gateway (ADR-0011, M3) that will enforce it.
+/// stays for the firewall gateway (ADR-0011, v0.3.0) that will enforce it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
     from: String,
@@ -323,7 +323,7 @@ impl EnvironmentBuilder {
                 return Err(invalid(format!(
                     "boundary {from:?} -> {to:?} carries a port-level allow {allow:?}, \
                      but the membership-only MVP cannot enforce one; allow must be empty \
-                     until the firewall gateway (ADR-0011, M3)"
+                     until the firewall gateway (ADR-0011, v0.3.0)"
                 )));
             }
             boundaries.push(Boundary { from, to, allow });
