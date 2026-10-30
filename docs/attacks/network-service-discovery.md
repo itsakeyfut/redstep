@@ -5,7 +5,7 @@ attack: [T1046, T1595]
 owasp: []
 cwe: []
 targets: [network]
-capability: none
+capability: network_service_discovery_vantage
 ---
 
 # Network Service Discovery
@@ -28,20 +28,30 @@ witness is the inventory itself, the services it reveals.
 
 ## How redstep exercises it
 
-Not yet implemented (`capability: none`). This is the natural home of a real tool adapter
-(`nmap`), which the roadmap defers to v0.4.0; when built it would scan the lab segment from
-the attacker vantage and the witness is the discovered open ports and service versions,
-checked against what the lab is expected to expose. The boundary self-check already
-proves reachability within a segment, so discovery extends that from one positive control
-to an enumeration.
+The native capability `network_service_discovery_vantage`
+(`TestContext::discover_services_from_vantage`) enumerates which of a declared set of
+services the attacker's vantage can reach, from an assume-breach foothold inside the lab
+(#96). It probes each target with the same reachability primitive as the single-target
+`connect_from_vantage`, and records one evidence draft per target attributed to the vantage
+(not the host). This is reachability enumeration, not port fingerprinting: it answers
+"which declared services can this foothold reach", the blast-radius measurement expressed
+as a catalogued technique. The fuller version that scans for open ports and fingerprints
+service versions is the `nmap` tool adapter, which the roadmap defers to v0.4.0
+([ADR-0007](../adr/0007-integrate-tools-as-a-plugin-with-three-role-contracts.md)).
 
 ## What a verdict means
 
-Discovery does not itself decide an exploit verdict: it produces an inventory that later
-techniques act on. Reported as an observation (the services found), not a Pass/Fail,
-unless paired with a check that a service should not have been reachable from the
-vantage, which is a scope/boundary question
-([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+Discovery does not itself decide an exploit verdict: it produces an inventory (which
+services were reachable) that later techniques and the blast-radius report act on. Each
+target is its own observation with its own confidence: a completed connect is reachable at
+`High`; any non-connect result is not-reachable at `Low`, because the busybox `nc` probe
+cannot prove a port closed and cannot tell a refusal from a timeout, so it is never a
+confident "not reachable" (RK-002,
+[ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+An abnormal probe (a container that could not run the check) aborts the enumeration
+fail-closed rather than being recorded as a result.
+It becomes a Pass/Fail only when paired with a check that a service should not have been
+reachable from the vantage, which is a scope/boundary question.
 
 ## Confinement
 
