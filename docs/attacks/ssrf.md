@@ -52,8 +52,16 @@ A `Fail` (High) means the per-probe token reached the canary, so the app was
 coerced into the request; the `ssrf_diagnostic` names the internal host reached and
 prescribes an outbound allowlist that refuses internal or private targets
 ([ADR-0009](../adr/0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md)).
-A `Pass` (not-exploitable, High) means this coercion did not reach the canary; a
-followed redirect or an abnormal probe is `Inconclusive`
+A `Pass` (not-exploitable, High) means this coercion did not reach the canary. An
+abnormal probe exit with the token seen, on a probe that did NOT follow a redirect,
+stays a confident `Fail`: with no redirect to follow, the token in the canary's logs
+is the app's own server-side request, which an abnormal exit does not un-log. A
+FOLLOWED REDIRECT is `Inconclusive` even with the token seen, because the probe
+(busybox `wget`, which follows redirects) may have followed a plain open redirect to
+the canary itself rather than the app fetching server-side; separating a self-fetching
+SSRF that also redirects is a deferred refinement
+([#126](https://github.com/itsakeyfut/redstep/issues/126)). A token-absent
+redirect/abnormal is likewise not a confident "not exploitable"
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
 A confident "not exploitable" does NOT prove the app is safe: a coercion that never
 fired (the app erred before fetching, or ignored the URL) also reaches the canary
