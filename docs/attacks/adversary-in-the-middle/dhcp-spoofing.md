@@ -33,7 +33,7 @@ configuration, so the witness is the victim routing through the attacker.
 Not yet implemented (`capability: none`). On a shared lab segment the witness is the
 victim adopting the rogue configuration and its traffic reaching the attacker vantage. It
 needs DHCP in the lab topology and would land with the network-boundary work (roadmap
-M3).
+v0.3.0).
 
 ## What a verdict means
 

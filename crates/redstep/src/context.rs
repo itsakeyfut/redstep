@@ -227,7 +227,7 @@ impl TestContext {
     /// vacuous PASS (RK-008, the confound #27/#28 exist to kill). Today the only
     /// vantage path is [`connect_from_vantage`](Self::connect_from_vantage), a
     /// bespoke method kept off this trait for exactly that reason. When vantage
-    /// execution is generalized (the M3 adapters), it must *require* the vantage by
+    /// execution is generalized (the v0.4.0 adapters), it must *require* the vantage by
     /// type, not run a `Capability` host-side and let it stand in for a vantage
     /// observation.
     pub async fn run<C: Capability>(&self, capability: C) -> Result<Recorded<C::Value>> {
@@ -260,12 +260,12 @@ impl TestContext {
     ///
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound (a
     /// host run): there is no vantage to act from. Generalizing to "run any
-    /// capability from the vantage" waits on the M3 tool adapters, which shape the
+    /// capability from the vantage" waits on the v0.4.0 tool adapters, which shape the
     /// in-container seam (one capability in the MVP, as in #27). That seam does
     /// not go through the [`run`](Self::run) intensity gate (it mints no
     /// [`IntensityCleared`]); it is `Safe` by
-    /// construction today (busybox `nc`), but it is the path where M3's
-    /// Controlled/Aggressive adapters will live, so M3 must require the gate token
+    /// construction today (busybox `nc`), but it is the path where v0.4.0's
+    /// Controlled/Aggressive adapters will live, so v0.3.0 must require the gate token
     /// here too (#9's deferred full-gate work).
     ///
     /// It trusts the `ScopedTarget`'s existing scope gate and does not re-check it
@@ -732,7 +732,7 @@ impl TestContext {
 /// Before this, the gate (`observation.value.then(..)`) was inlined per method and
 /// guarded only by each Docker-gated flags test, so the mutation shipped green
 /// off-Docker (#88; #85/#90 reviews). Pure, no lab. The capability-stamping half of
-/// that same gap needs the method to run offline and is deferred to #94 (M3).
+/// that same gap needs the method to run offline and is deferred to #94 (v0.3.0).
 fn gated_diagnostic(observed: bool, make: impl FnOnce() -> Diagnostic) -> Option<Diagnostic> {
     observed.then(make)
 }

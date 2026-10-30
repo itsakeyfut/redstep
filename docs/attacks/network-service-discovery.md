@@ -29,7 +29,7 @@ witness is the inventory itself, the services it reveals.
 ## How redstep exercises it
 
 Not yet implemented (`capability: none`). This is the natural home of a real tool adapter
-(`nmap`), which the roadmap defers to M3; when built it would scan the lab segment from
+(`nmap`), which the roadmap defers to v0.4.0; when built it would scan the lab segment from
 the attacker vantage and the witness is the discovered open ports and service versions,
 checked against what the lab is expected to expose. The boundary self-check already
 proves reachability within a segment, so discovery extends that from one positive control

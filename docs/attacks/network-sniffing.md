@@ -31,7 +31,7 @@ so the witness is sensitive content recovered from captured frames.
 Not yet implemented (`capability: none`). On a shared lab segment the witness is a
 sentinel value (a planted credential or token) sent by one workload and recovered from
 the attacker vantage's capture. It depends on the lab segment being observable from the
-vantage and would land with the network-boundary work (roadmap M3).
+vantage and would land with the network-boundary work (roadmap v0.3.0).
 
 ## What a verdict means
 

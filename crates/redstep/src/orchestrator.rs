@@ -706,7 +706,7 @@ async fn read_container_logs(docker: &Docker, container: &str) -> Result<(String
 /// redirect (#55). Returns `(state, stdout, stderr)`. The logs are read after the
 /// probe exits and before removal. This is the narrow log-capturing path #50 needs;
 /// the generalized
-/// in-container seam is v0.3.0 (mvp.md).
+/// in-container seam is v0.4.0 (mvp.md).
 async fn run_probe_capturing(
     docker: &Docker,
     network: &str,
@@ -1027,9 +1027,9 @@ pub(crate) const HTTP_BLIND_CMDI_VANTAGE: &str = "http_blind_cmdi_vantage";
 // allow(too_many_arguments): each argument is a distinct probe input (the lab
 // handle, the scoped target, the capability tag, the request path, the marker, the
 // identity headers, the timeout). This seam is the provisional M1/M2 shape of the
-// generalized in-container capability the roadmap reshapes in v0.3.0 (mvp.md); a
+// generalized in-container capability the roadmap reshapes in v0.4.0 (mvp.md); a
 // probe-inputs struct is the clean refactor at that point, so it is kept flat until
-// the v0.3.0 shape is known rather than invented now.
+// the v0.4.0 shape is known rather than invented now.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn http_witness_exploit_from(
     docker: &Docker,
@@ -1470,7 +1470,7 @@ pub(crate) async fn replay_vantage_probe(
 /// capability this build does not have cannot be replayed into the wrong technique.
 // allow(type_complexity): the parsed witness is a flat tuple of the probe inputs,
 // read positionally straight back into `http_witness_exploit_from`; a named struct
-// is the clean refactor for when v0.3.0 reshapes this seam (mvp.md), not now.
+// is the clean refactor for when v0.4.0 reshapes this seam (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_http_witness(
     witness: &Reproduction,
@@ -1625,7 +1625,7 @@ pub(crate) async fn replay_http_witness_probe(
 // allow(too_many_arguments): each argument is a distinct draft input (the segment,
 // the target spec, the coercion path, the token, the canary alias and port, the
 // observation, the timing). Parallel to `http_witness_draft`, it is kept flat until
-// the v0.3.0 probe-inputs reshape (mvp.md) rather than grouped into a struct now.
+// the v0.4.0 probe-inputs reshape (mvp.md) rather than grouped into a struct now.
 #[allow(clippy::too_many_arguments)]
 fn ssrf_draft(
     segment: &str,
@@ -1674,7 +1674,7 @@ fn ssrf_draft(
 /// port, and the applied timeout. Pure and Docker-free (parallel to
 /// `parse_http_witness`), fail-closed on a missing/ill-typed field (ADR-0022).
 // allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
-// `parse_http_witness`; a named struct is the same v0.3.0 reshape (mvp.md), not now.
+// `parse_http_witness`; a named struct is the same v0.4.0 reshape (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_ssrf_witness(
     witness: &Reproduction,
@@ -1776,7 +1776,7 @@ async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> R
 // allow(too_many_arguments): each argument is a distinct probe input (the Docker
 // handle, the vantage network, the scoped target, the canary alias/port/container,
 // the token, the timeout). Parallel to `http_witness_exploit_from`, it is the
-// provisional seam kept flat until the v0.3.0 probe-inputs reshape (mvp.md).
+// provisional seam kept flat until the v0.4.0 probe-inputs reshape (mvp.md).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ssrf_exploit_from(
     docker: &Docker,
@@ -1977,7 +1977,7 @@ fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
 /// the draft differ from the SSRF path; the witness read and its classification are
 /// the shared primitives #75 unified across the two callers.
 // allow(too_many_arguments): each argument is a distinct probe input, parallel to
-// `ssrf_exploit_from`; the probe-inputs reshape (deferred v0.3.0, mvp.md) groups them.
+// `ssrf_exploit_from`; the probe-inputs reshape (deferred v0.4.0, mvp.md) groups them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn blind_cmdi_exploit_from(
     docker: &Docker,
@@ -2048,7 +2048,7 @@ pub(crate) async fn blind_cmdi_exploit_from(
 /// inputs, ADR-0023), which #75 left as is while unifying the witness read and
 /// classifier.
 // allow(too_many_arguments): each argument is a distinct draft input, parallel to
-// `ssrf_draft`; kept flat until the deferred v0.3.0 probe-inputs reshape (mvp.md).
+// `ssrf_draft`; kept flat until the deferred v0.4.0 probe-inputs reshape (mvp.md).
 #[allow(clippy::too_many_arguments)]
 fn blind_cmdi_draft(
     segment: &str,
@@ -2106,7 +2106,7 @@ fn blind_cmdi_draft(
 /// Docker-free, fail-closed on a missing/ill-typed field or a non-blind-cmdi
 /// capability (ADR-0022).
 // allow(type_complexity): the parsed replay inputs are a flat tuple parallel to
-// `parse_ssrf_witness`; a named struct is the deferred v0.3.0 probe-inputs reshape
+// `parse_ssrf_witness`; a named struct is the deferred v0.4.0 probe-inputs reshape
 // (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_blind_cmdi_witness(

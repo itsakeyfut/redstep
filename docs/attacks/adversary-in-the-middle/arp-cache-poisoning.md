@@ -34,7 +34,7 @@ Not yet implemented (`capability: none`). It would run on a shared lab segment w
 attacker workload and victim workloads share a layer-2 network; the witness is the
 redirected traffic reaching the attacker vantage (a sentinel flow captured there). It
 depends on the lab's network giving containers a shared L2 broadcast domain, which the
-network-boundary work (roadmap M3) is where this would land.
+network-boundary work (roadmap v0.3.0) is where this would land.
 
 ## What a verdict means
 
