@@ -533,7 +533,7 @@ mod run_evidence_tests {
 
         async fn execute(
             &self,
-            _authorized: IntensityCleared,
+            _authorized: IntensityCleared<Self>,
         ) -> crate::Result<(Observation<bool>, EvidenceDraft)> {
             Ok((
                 Observation {

@@ -48,6 +48,7 @@ use bollard::query_parameters::{CreateContainerOptions, RemoveContainerOptions};
 
 use std::time::Duration;
 
+use crate::capability::VantageCleared;
 use crate::capability::tcp_connect::{ConnectOutcome, classify_connect, connect_summary};
 use crate::environment::{Environment, WorkloadKind, parse_allow_spec};
 use crate::error::{Error, Result};
@@ -1035,6 +1036,12 @@ impl Prober for DockerProber<'_> {
 /// so the gateway self-check reads a connect the same way a reachability check
 /// does. A completed connect is `true`; a clean non-connect (refused, unresolved,
 /// timeout: busybox `nc` exit 1) is `false`; any other exit is `Err`, fail-closed.
+///
+/// This is the boundary self-check's own `Safe` isolation verification, which runs
+/// before any test, not a capability or an attack action on the vantage, so it is
+/// deliberately not behind the `VantageCleared` gate (#44): the gate is for the
+/// attack seams (`tcp_reachable_from`, `http_witness_exploit_from` and the
+/// coercion seams), not the framework's own defensive probe.
 struct DockerTcpProber<'a> {
     docker: &'a Docker,
 }
@@ -1298,6 +1305,7 @@ pub(crate) async fn tcp_reachable_from(
     target: &ScopedTarget,
     timeout: Duration,
     capability: &'static str,
+    _cleared: &VantageCleared,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
     // Whole seconds for `nc -w`; record this applied value, not the requested
     // `timeout`, so the reproduction restates what actually ran.
@@ -1506,6 +1514,7 @@ pub(crate) async fn http_witness_exploit_from(
     marker: &str,
     request_headers: &[(String, String)],
     timeout: Duration,
+    _cleared: &VantageCleared,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
     validate_http_request(request_path, marker, request_headers)?;
     let secs = timeout.as_secs().max(1);
@@ -1760,11 +1769,15 @@ fn classify_http_witness(
 ///
 /// The intensity is `Controlled`, not `Safe`: these are Level 2 controlled attack
 /// simulations (docs/specs/levels-safety-and-principles.md), not a Level 1 safe
-/// check like the `tcp_connect_vantage` reconnaissance probe. The vantage seam runs
-/// them without an intensity gate today (it mints no `IntensityCleared`, like
-/// `connect_from_vantage`); isolation and scope confine them to the lab regardless,
-/// and gating this seam is the deferred v0.3.0 work (ADR-0006, context.rs). The honest
-/// label is what that future gate will read.
+/// check like the `tcp_connect_vantage` reconnaissance probe. The seam requires a
+/// `VantageCleared` proof by type, so it cannot run ungated (#44); the caller mints
+/// it for `Controlled`, which lab isolation (ADR-0006 layers 1-2) confines. The
+/// proof does not bind the action's intensity: the minted level is the caller's
+/// stated value, not derived from the seam, so a mislabel is not a compile error,
+/// and `VantageCleared::issue` refuses only a stated `Aggressive`. Binding the
+/// vantage intensity by type (so a higher-intensity seam cannot be cleared by a
+/// lower-intensity proof) lands with the v0.4.0 Aggressive adapters (#123). The
+/// `intensity` recorded below is the seam's own honest label.
 // allow(too_many_arguments): mirrors `http_witness_exploit_from`'s inputs to build
 // the draft from them; the same reasoning applies.
 #[allow(clippy::too_many_arguments)]
@@ -1927,8 +1940,11 @@ pub(crate) async fn replay_vantage_probe(
     // mirroring run_in_lab (a teardown failure warns, it does not mask the
     // observation). The probe is stamped with the witness's own capability, so a
     // discovery witness reproduces as discovery, not as a connect.
+    // The replayed probe is a Safe reconnaissance witness (a connect or a
+    // discovery), gated like the live path (#44).
+    let cleared = VantageCleared::issue(Intensity::Safe)?;
     let probed = match vantage_network(&lab, &segment) {
-        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout, capability)
+        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout, capability, &cleared)
             .await
             .map(|(observation, _draft)| observation),
         Err(e) => Err(e),
@@ -2077,6 +2093,8 @@ pub(crate) async fn replay_http_witness_probe(
     let scoped = Scope::from_environment(env).resolve(&target)?;
 
     let lab = bring_up(docker, env).await?;
+    // The replayed exploit is a Controlled attack, gated like the live path (#44).
+    let cleared = VantageCleared::issue(Intensity::Controlled)?;
     let probed = match vantage_network(&lab, &segment) {
         Ok(net) => http_witness_exploit_from(
             docker,
@@ -2087,6 +2105,7 @@ pub(crate) async fn replay_http_witness_probe(
             &marker,
             &headers,
             timeout,
+            &cleared,
         )
         .await
         .map(|(observation, _draft)| observation),
@@ -2270,6 +2289,7 @@ pub(crate) async fn ssrf_exploit_from(
     canary_container: &str,
     token: &str,
     timeout: Duration,
+    _cleared: &VantageCleared,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
     // Fail-closed on a weak token before it reaches the URL or the `contains`
     // check: an empty/short token would false-witness (an empty token makes
@@ -2392,6 +2412,8 @@ pub(crate) async fn replay_ssrf_probe(
             .ok_or_else(|| Error::LabUnavailable {
                 reason: format!("environment declares no canary workload {canary_alias:?}"),
             })?;
+        // The replayed coercion is a Controlled attack, gated like the live path (#44).
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         ssrf_exploit_from(
             docker,
             net,
@@ -2401,6 +2423,7 @@ pub(crate) async fn replay_ssrf_probe(
             canary_container,
             &token,
             timeout,
+            &cleared,
         )
         .await
         .map(|(observation, _draft)| observation)
@@ -2471,6 +2494,7 @@ pub(crate) async fn blind_cmdi_exploit_from(
     canary_container: &str,
     token: &str,
     timeout: Duration,
+    _cleared: &VantageCleared,
 ) -> Result<(Observation<bool>, EvidenceDraft)> {
     // Fail-closed on a weak token before it reaches the injected URL or the
     // `contains` check, exactly as the SSRF path: an empty/short token would
@@ -2687,6 +2711,8 @@ pub(crate) async fn replay_blind_cmdi_probe(
             .ok_or_else(|| Error::LabUnavailable {
                 reason: format!("environment declares no canary workload {canary_alias:?}"),
             })?;
+        // The replayed coercion is a Controlled attack, gated like the live path (#44).
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
         blind_cmdi_exploit_from(
             docker,
             net,
@@ -2696,6 +2722,7 @@ pub(crate) async fn replay_blind_cmdi_probe(
             canary_container,
             &token,
             timeout,
+            &cleared,
         )
         .await
         .map(|(observation, _draft)| observation)
@@ -2804,6 +2831,18 @@ impl Drop for RunningLab {
 mod tests {
     use super::*;
     use crate::observation::Confidence;
+
+    /// A vantage gate proof for a `Safe` reconnaissance probe, for the seam tests
+    /// (#44). The seams require a `VantageCleared` by type; a test mints one the
+    /// same way the live callers do.
+    fn safe_cleared() -> VantageCleared {
+        VantageCleared::issue(Intensity::Safe).expect("Safe is cleared")
+    }
+
+    /// A vantage gate proof for a `Controlled` attack, for the seam tests (#44).
+    fn controlled_cleared() -> VantageCleared {
+        VantageCleared::issue(Intensity::Controlled).expect("Controlled is cleared")
+    }
 
     /// Guard: the container command follows the workload kind (#46). A `Standin`
     /// sleeps so it stays alive and inspectable (its image would otherwise exit
@@ -3824,6 +3863,7 @@ mod tests {
                 MARKER,
                 &[],
                 Duration::from_secs(5),
+                &controlled_cleared(),
             )
             .await
             .expect("the probe ran");
@@ -4515,6 +4555,7 @@ mod tests {
                 &target,
                 Duration::from_secs(2),
                 TCP_CONNECT_VANTAGE,
+                &safe_cleared(),
             )
             .await;
             let cross_net = tcp_reachable_from(
@@ -4523,6 +4564,7 @@ mod tests {
                 &target,
                 Duration::from_secs(2),
                 TCP_CONNECT_VANTAGE,
+                &safe_cleared(),
             )
             .await;
 
@@ -4643,6 +4685,7 @@ mod tests {
                 &target,
                 Duration::from_secs(3),
                 TCP_CONNECT_VANTAGE,
+                &safe_cleared(),
             )
             .await;
             let _ = lab.teardown().await;
@@ -4920,6 +4963,7 @@ mod tests {
                 CMDI_WITNESS,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording exploit ran");
@@ -4961,6 +5005,7 @@ mod tests {
                 CMDI_BENIGN_RENDERED,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the benign /exec ran");
@@ -5221,6 +5266,7 @@ mod tests {
                 SSTI_WITNESS,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording exploit ran");
@@ -5259,6 +5305,7 @@ mod tests {
                 SSTI_BENIGN_RENDERED,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the benign /render ran");
@@ -6189,6 +6236,7 @@ mod tests {
                 SQLI_WITNESS,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording exploit ran");
@@ -6238,6 +6286,7 @@ mod tests {
                 "hello from the api",
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the benign lookup ran");
@@ -6478,6 +6527,7 @@ mod tests {
                 PATH_TRAVERSAL_WITNESS,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording traversal ran");
@@ -6521,6 +6571,7 @@ mod tests {
                 BENIGN_FILE_BODY,
                 &[],
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the benign file read ran");
@@ -6613,6 +6664,7 @@ mod tests {
                 &scoped,
                 Duration::from_secs(2),
                 TCP_CONNECT_VANTAGE,
+                &safe_cleared(),
             )
             .await
             .expect("the probe ran");
@@ -6815,6 +6867,7 @@ mod tests {
                 IDOR_WITNESS,
                 &alice_auth,
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording IDOR ran");
@@ -6857,6 +6910,7 @@ mod tests {
                 IDOR_OWN_BODY,
                 &alice_auth,
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the own-object read ran");
@@ -7407,6 +7461,7 @@ mod tests {
                 &vuln_canary,
                 SSRF_TOKEN,
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording SSRF ran");
@@ -8045,6 +8100,7 @@ mod tests {
                 &vuln_canary,
                 BLIND_CMDI_TOKEN,
                 Duration::from_millis(5_000),
+                &controlled_cleared(),
             )
             .await
             .expect("the recording blind cmdi ran");

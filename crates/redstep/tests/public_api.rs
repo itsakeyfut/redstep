@@ -104,6 +104,20 @@ async fn no_assertion_demo(_ctx: &TestContext) -> redstep::Result<()> {
     Ok(())
 }
 
+/// Compile-time guard that the host intensity-gate token is generic over the
+/// capability it clears (#44): it names `IntensityCleared<TcpConnect>` from an
+/// external crate path, so it compiles only while the token takes a capability
+/// type parameter. Revert it to a non-generic `IntensityCleared` and this target
+/// fails with "wrong number of type arguments". Never called; the signature is
+/// the assertion. (External code cannot mint the token to demonstrate the
+/// token-for-A-into-B mismatch directly, so this pins the generic surface that
+/// makes that mismatch an `E0308`.)
+#[allow(dead_code)]
+fn intensity_cleared_is_generic_over_the_capability(
+    _token: redstep::IntensityCleared<redstep::TcpConnect>,
+) {
+}
+
 /// The verdict of the discovered test whose name ends with `suffix`.
 fn verdict_of(summary: &RunSummary, suffix: &str) -> Verdict {
     summary
