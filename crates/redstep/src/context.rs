@@ -1391,6 +1391,30 @@ mod tests {
         );
     }
 
+    /// Guard: `discover_services_from_vantage` on a context with no lab bound fails
+    /// closed with `LabUnavailable`, like `connect_from_vantage`: a host run has no
+    /// vantage to enumerate from, so it errors before any Docker call (this needs no
+    /// daemon). Mutation: unwrap `self.lab` instead of the `ok_or_else` -> the `None`
+    /// case panics -> this (expecting an `Err`) fails.
+    #[test]
+    fn discover_services_from_vantage_without_a_lab_fails_closed() {
+        let ctx = TestContext::new(Scope::default());
+        let scope = Scope::builder()
+            .allow("db:5432")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("db:5432").expect("in scope");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+        let result = runtime.block_on(ctx.discover_services_from_vantage(&[target]));
+        assert!(
+            matches!(result, Err(Error::LabUnavailable { .. })),
+            "discover_services_from_vantage without a vantage must fail closed (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
     /// Guard: `exploit_sqli_from_vantage` on a context with no lab bound fails
     /// closed with `LabUnavailable` rather than panicking or acting, like
     /// `connect_from_vantage`: a host run has no vantage to inject from, so it must
