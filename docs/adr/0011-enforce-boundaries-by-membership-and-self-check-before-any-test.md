@@ -54,4 +54,4 @@ Guarded in `crates/redstep/src/orchestrator.rs`: `check_refuses_when_a_non_first
 
 ## More Information
 
-Was "Decision N" in the retired `design-decisions.md`; the membership layer and self-check settled in #18/#19, the gating in #28. Code: `crates/redstep/src/orchestrator.rs`, `crates/redstep/src/runner.rs`. Open: the firewall gateway, the self-check's port-level items, VPN boundaries. See ADR-0003 (the environment) and ADR-0006 (the isolation layer this proves).
+Was "Decision N" in the retired `design-decisions.md`; the membership layer and self-check settled in #18/#19, the gating in #28. The gateway container landed in #113 and its port-level enforcement and self-check in #114; the "nftables/iptables" mechanism named above is **refined to a TCP proxy by [ADR-0024](0024-realize-the-inter-segment-gateway-as-a-tcp-proxy.md)** (this ADR's membership base and mandatory self-check are unchanged). Code: `crates/redstep/src/orchestrator.rs`, `crates/redstep/src/runner.rs`. Open: VPN boundaries. See ADR-0003 (the environment), ADR-0006 (the isolation layer this proves), and ADR-0024 (the gateway mechanism).
