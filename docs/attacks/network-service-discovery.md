@@ -44,9 +44,12 @@ service versions is the `nmap` tool adapter, which the roadmap defers to v0.4.0
 Discovery does not itself decide an exploit verdict: it produces an inventory (which
 services were reachable) that later techniques and the blast-radius report act on. Each
 target is its own observation with its own confidence: a completed connect is reachable at
-`High`, an explicit refusal is not-reachable at `High`, and a timeout or a probe-side error
-is `Low`, never a confident "not reachable"
-([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+`High`; any non-connect result is not-reachable at `Low`, because the busybox `nc` probe
+cannot prove a port closed and cannot tell a refusal from a timeout, so it is never a
+confident "not reachable" (RK-002,
+[ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
+An abnormal probe (a container that could not run the check) aborts the enumeration
+fail-closed rather than being recorded as a result.
 It becomes a Pass/Fail only when paired with a check that a service should not have been
 reachable from the vantage, which is a scope/boundary question.
 

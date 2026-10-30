@@ -191,7 +191,14 @@ impl TestContext {
     /// [`EvidenceStore`](crate::EvidenceStore), which mints the
     /// [`Evidence`](crate::Evidence) and assigns the ids (ADR-0004). It returns
     /// drafts, not records: only the store gives a record its id and timestamp.
-    pub(crate) fn take_evidence_drafts(&self) -> Vec<EvidenceDraft> {
+    ///
+    /// `pub` so a test driving a vantage method directly (outside the runner, as
+    /// the lab-wired guards do for [`discover_services_from_vantage`](Self::discover_services_from_vantage))
+    /// can drain and assert what the method actually recorded - the technique it
+    /// stamped, the vantage it attributed to - which the returned [`Recorded`]
+    /// values do not expose (RK-011: the recorded fact is checked, not just the
+    /// returned observation).
+    pub fn take_evidence_drafts(&self) -> Vec<EvidenceDraft> {
         std::mem::take(&mut self.evidence_drafts.borrow_mut())
     }
 
@@ -248,7 +255,7 @@ impl TestContext {
     /// lab, and return its [`Recorded`] result (the same shape [`run`](Self::run)
     /// returns, so [`expect`](Self::expect) links the judgement to its evidence).
     ///
-    /// This is the lab-wired counterpart of `run` for the one MVP capability: it
+    /// This is the lab-wired counterpart of `run` for a single target: it
     /// executes from a container on the vantage network (`tcp_reachable_from`),
     /// not from the host, because the host reaches every segment and so cannot
     /// observe an inter-segment boundary (a vacuous PASS; #28, ADR-0003,
@@ -300,27 +307,38 @@ impl TestContext {
     /// service discovery (ATT&CK T1046, `docs/attacks/network-service-discovery.md`):
     /// the blast-radius measurement expressed as a catalogued technique. It probes
     /// each target from the vantage with the same reachability primitive as
-    /// [`connect_from_vantage`](Self::connect_from_vantage), records one evidence draft per target stamped
-    /// `network_service_discovery_vantage` (attributed to the vantage, not the host),
-    /// and returns the per-target [`Recorded`] results in the order of `targets`
-    /// (so `results[i]` is `targets[i]`).
+    /// [`connect_from_vantage`](Self::connect_from_vantage), records one evidence
+    /// draft per target stamped `network_service_discovery_vantage` (attributed to
+    /// the vantage, not the host), and returns `(target, result)` per target in the
+    /// order of `targets`. The target is paired INTO each result on purpose: a
+    /// caller that re-indexed `targets[i]` against a bare result vector would
+    /// misalign the moment a later variant filtered the output, and a "this service
+    /// must be contained" assertion that then read a reachable target as contained
+    /// would be a false PASS (#111). Pairing keeps target and result in lockstep by
+    /// construction.
     ///
-    /// Each target keeps its OWN confidence: a completed connect is reachable at
-    /// `High`, an explicit refusal is not-reachable at `High`, and a timeout or a
-    /// probe-side/local error is `Low` (never a confident "not reachable", RK-002).
-    /// This is why the result is a per-target vector and not one aggregate
-    /// observation: a single `Observation` carries one `Confidence`, so a mixed set
-    /// (one target reached, another a probe-side failure) would collapse to one
-    /// confidence and could read a weak signal as confident, a row-6 risk (#111).
-    /// The v0.4.0 nmap adapter is the fuller version of this technique (ADR-0007);
-    /// the per-target shape here is the precedent it follows.
+    /// Each target keeps its own confidence: a completed connect is reachable at
+    /// `High`; any non-connect result is not-reachable at `Low`, because busybox
+    /// `nc` cannot prove a port closed and so cannot tell a refusal from a timeout.
+    /// It is never a confident "not reachable" (RK-002), matching
+    /// [`connect_from_vantage`](Self::connect_from_vantage) and NOT the three-valued
+    /// host-side `classify_connect` (whose `Refused`/`High` arm the `nc` probe never
+    /// reaches). The result is a per-target vector, not one aggregate observation,
+    /// because a single `Observation` carries one `Confidence`: a mixed set of
+    /// reachable (`High`) and not-reachable (`Low`) targets would collapse to one
+    /// confidence and could read a weak signal as confident, a row-6 risk.
     ///
     /// Errors with [`Error::LabUnavailable`] on a context with no lab bound: there
-    /// is no vantage to act from. An empty `targets` returns an empty vector.
+    /// is no vantage to act from. An abnormal probe (a container that neither
+    /// connected nor cleanly failed, e.g. OOM-killed) is a lab fault, so it aborts
+    /// the whole enumeration fail-closed via `?` rather than being recorded as a
+    /// confident result; a routine refused or timed-out target is not abnormal and
+    /// lands `Low` above. With a lab bound, an empty `targets` returns an empty
+    /// vector.
     pub async fn discover_services_from_vantage(
         &self,
         targets: &[ScopedTarget],
-    ) -> Result<Vec<Recorded<bool>>> {
+    ) -> Result<Vec<(ScopedTarget, Recorded<bool>)>> {
         let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
             reason: "no attacker vantage is bound to this run; \
                      discover_services_from_vantage needs a lab (run_in_lab)"
@@ -337,11 +355,14 @@ impl TestContext {
             )
             .await?;
             let draft_ref = self.record_draft(draft);
-            discovered.push(Recorded {
-                observation,
-                draft_ref,
-                diagnostic: None,
-            });
+            discovered.push((
+                target.clone(),
+                Recorded {
+                    observation,
+                    draft_ref,
+                    diagnostic: None,
+                },
+            ));
         }
         Ok(discovered)
     }

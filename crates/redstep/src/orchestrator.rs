@@ -963,12 +963,18 @@ fn vantage_draft(
 /// is on its own path and is parsed by `parse_ssrf_witness`), so the name lives in
 /// one place rather than being retyped at each site.
 pub(crate) const HTTP_SQLI_VANTAGE: &str = "http_sqli_vantage";
-/// The single-target TCP reachability probe and the multi-target network-service
-/// discovery (#111, ATT&CK T1046) share one probe (`tcp_reachable_from`) and differ
-/// only in the technique they are attributed to, so the capability is a parameter
-/// of the probe rather than hardcoded. A connect probe stays `tcp_connect_vantage`
-/// so its canonical JSON is unchanged (RK-003); discovery stamps its own name.
+/// The capability stamped on a single-target TCP reachability probe from the
+/// vantage (`connect_from_vantage`): a boundary / segmentation check. Its own name,
+/// so its canonical JSON stays byte-identical (RK-003), pinned by the
+/// `vantage_draft_*` offline tests' literal assertions and the boundary demo's
+/// `record.capability` assertion.
 pub(crate) const TCP_CONNECT_VANTAGE: &str = "tcp_connect_vantage";
+/// The capability stamped on network service discovery (#111, ATT&CK T1046,
+/// `discover_services_from_vantage`): a multi-target reachability enumeration. It
+/// shares `tcp_reachable_from`'s probe with `TCP_CONNECT_VANTAGE` and differs only
+/// in the technique attributed, so the capability is a parameter of the probe, not
+/// a hardcoded literal. The two are distinct techniques on the same mechanism: a
+/// consumer (a replay, a report, the attack graph) must not treat them as one.
 pub(crate) const NETWORK_SERVICE_DISCOVERY_VANTAGE: &str = "network_service_discovery_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
@@ -1375,13 +1381,19 @@ fn http_witness_draft(
     }
 }
 
-/// The env-independent replay inputs parsed from a vantage witness: the segment
-/// to probe from, the target, and the applied timeout. Pure and Docker-free, so
-/// "a witness missing a field cannot replay" is a guard that runs offline,
-/// before [`replay_vantage_probe`] stands a lab up. A missing or ill-typed field
-/// is `Error::InvalidTarget`, fail-closed: a witness that cannot be read cannot
-/// be replayed, and that is not a silent default (ADR-0022, #29).
-fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Duration)> {
+/// The env-independent replay inputs parsed from a vantage witness: the technique
+/// capability, the segment to probe from, the target, and the applied timeout.
+/// Pure and Docker-free, so "a witness missing or ill-typed a field cannot replay"
+/// is a guard that runs offline, before [`replay_vantage_probe`] stands a lab up.
+/// A missing or ill-typed field is `Error::InvalidTarget`, fail-closed: a witness
+/// that cannot be read cannot be replayed, and that is not a silent default
+/// (ADR-0022, #29). The recorded `capability` is matched to a known vantage-probe
+/// technique and an unknown one is refused (as `parse_http_witness` does), so a
+/// `network_service_discovery_vantage` witness replays under its own capability
+/// rather than being silently reproduced as a `tcp_connect_vantage` probe.
+fn parse_vantage_witness(
+    witness: &Reproduction,
+) -> Result<(&'static str, String, String, Duration)> {
     let invalid = |reason: &str| Error::InvalidTarget {
         spec: witness.target.clone(),
         reason: reason.to_owned(),
@@ -1389,6 +1401,15 @@ fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Dura
     if witness.target.is_empty() {
         return Err(invalid("replay witness has an empty target"));
     }
+    let capability = match witness.capability.as_str() {
+        TCP_CONNECT_VANTAGE => TCP_CONNECT_VANTAGE,
+        NETWORK_SERVICE_DISCOVERY_VANTAGE => NETWORK_SERVICE_DISCOVERY_VANTAGE,
+        other => {
+            return Err(invalid(&format!(
+                "replay witness has an unknown vantage capability {other:?}"
+            )));
+        }
+    };
     let segment = witness
         .params
         .get("vantage_segment")
@@ -1404,6 +1425,7 @@ fn parse_vantage_witness(witness: &Reproduction) -> Result<(String, String, Dura
         .and_then(|v| v.as_u64())
         .ok_or_else(|| invalid("replay witness has no timeout_ms"))?;
     Ok((
+        capability,
         segment.to_owned(),
         witness.target.clone(),
         Duration::from_millis(timeout_ms),
@@ -1447,15 +1469,16 @@ pub(crate) async fn replay_vantage_probe(
     env: &Environment,
     witness: &Reproduction,
 ) -> Result<Observation<bool>> {
-    let (segment, target, timeout) = parse_vantage_witness(witness)?;
+    let (capability, segment, target, timeout) = parse_vantage_witness(witness)?;
     let scoped = Scope::from_environment(env).resolve(&target)?;
 
     let lab = bring_up(docker, env).await?;
     // Find the network, then probe; keep the result so teardown always runs,
     // mirroring run_in_lab (a teardown failure warns, it does not mask the
-    // observation).
+    // observation). The probe is stamped with the witness's own capability, so a
+    // discovery witness reproduces as discovery, not as a connect.
     let probed = match vantage_network(&lab, &segment) {
-        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout, TCP_CONNECT_VANTAGE)
+        Ok(net) => tcp_reachable_from(docker, net, &scoped, timeout, capability)
             .await
             .map(|(observation, _draft)| observation),
         Err(e) => Err(e),
@@ -4852,6 +4875,14 @@ mod tests {
     /// so it cannot catch a mis-stamp).
     #[test]
     fn vantage_draft_stamps_the_given_capability() {
+        // Pin the published string VALUES (the canonical JSON is a contract, RK-003):
+        // the loop below compares the draft to the const, so it would miss a typo in
+        // the const itself; these literal assertions catch that.
+        assert_eq!(TCP_CONNECT_VANTAGE, "tcp_connect_vantage");
+        assert_eq!(
+            NETWORK_SERVICE_DISCOVERY_VANTAGE,
+            "network_service_discovery_vantage"
+        );
         let observation = Observation {
             value: true,
             confidence: Confidence::High,
@@ -4872,14 +4903,17 @@ mod tests {
 
     /// Guard: a witness whose replay inputs cannot be read is rejected rather
     /// than replayed with a default (a witness that cannot be read cannot be
-    /// replayed; ADR-0022). Covers a complete witness parsing, a missing
-    /// segment, a blank/whitespace segment, a wrong-typed segment, a missing
-    /// timeout, a wrong-typed timeout, and an empty target. Mutations, each
-    /// caught by one of the `is_err` assertions: delete `.filter(..trim..)` ->
-    /// the blank-segment case passes; replace the segment `.ok_or_else(..)?`
+    /// replayed; ADR-0022). Covers a complete witness parsing (to the right
+    /// capability), a discovery witness parsing to its own capability, an unknown
+    /// capability, a missing segment, a blank/whitespace segment, a wrong-typed
+    /// segment, a missing timeout, a wrong-typed timeout, and an empty target.
+    /// Mutations, each caught by one of the assertions: delete `.filter(..trim..)`
+    /// -> the blank-segment case passes; replace the segment `.ok_or_else(..)?`
     /// with `.unwrap_or("")` -> the missing/wrong-typed cases pass; drop the
     /// `timeout_ms` `.ok_or_else(..)?` -> the missing/wrong-typed timeout cases
-    /// pass; drop the empty-target check -> the empty-target case passes.
+    /// pass; drop the empty-target check -> the empty-target case passes; replace
+    /// the capability `match` with `TCP_CONNECT_VANTAGE` -> the unknown-capability
+    /// case parses and the discovery-capability assertion reads the wrong name.
     #[test]
     fn parse_vantage_witness_rejects_an_incomplete_witness() {
         let complete = Reproduction {
@@ -4887,11 +4921,32 @@ mod tests {
             target: "db:5432".to_owned(),
             params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
         };
-        let (segment, target, timeout) =
+        let (capability, segment, target, timeout) =
             parse_vantage_witness(&complete).expect("a complete witness parses");
+        assert_eq!(capability, TCP_CONNECT_VANTAGE);
         assert_eq!(segment, "internet");
         assert_eq!(target, "db:5432");
         assert_eq!(timeout, Duration::from_millis(2_000));
+
+        // A discovery witness parses to its OWN capability (not a connect), and an
+        // unknown capability is refused rather than silently replayed as a connect.
+        let discovery = Reproduction {
+            capability: "network_service_discovery_vantage".to_owned(),
+            target: "db:5432".to_owned(),
+            params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internal" }),
+        };
+        let (discovery_cap, _, _, _) =
+            parse_vantage_witness(&discovery).expect("a discovery witness parses");
+        assert_eq!(discovery_cap, NETWORK_SERVICE_DISCOVERY_VANTAGE);
+        let unknown = Reproduction {
+            capability: "bogus_vantage".to_owned(),
+            target: "db:5432".to_owned(),
+            params: serde_json::json!({ "timeout_ms": 2_000, "vantage_segment": "internet" }),
+        };
+        assert!(
+            parse_vantage_witness(&unknown).is_err(),
+            "a witness with an unknown vantage capability cannot be replayed"
+        );
 
         // Each of these cannot be replayed and must error, not default.
         let rejected = [

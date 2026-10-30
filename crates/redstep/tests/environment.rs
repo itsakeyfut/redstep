@@ -606,14 +606,21 @@ fn assume_breach_dmz_declares_the_internal_boundary() {
 /// Guard (Docker): network service discovery from the assume-breach DMZ vantage
 /// (#111, ATT&CK T1046). `discover_services_from_vantage` over `web:80` (in the
 /// vantage's own `dmz` segment, listening) and `db:5432` (in `internal`, across
-/// the boundary) enumerates per-target reachability: `web` is reachable at `High`,
-/// `db` is not. So the enumeration distinguishes a service the foothold reaches
-/// from one the boundary contains, each attributed to the vantage with its own
-/// confidence. Mutation: point the first target across the boundary, or stop the
-/// `web` listener -> the `web` reachable assertion fails; stamp the wrong
-/// capability in `vantage_draft` -> the offline
-/// `vantage_draft_stamps_the_given_capability` fails. Driven through the real
-/// `bring_up`.
+/// the boundary) enumerates per-target reachability, paired with its target: `web`
+/// is reachable at `High`, `db` is not reachable at `Low` (busybox `nc` cannot
+/// prove a port closed), each recorded under the discovery technique. So the
+/// enumeration distinguishes a service the foothold reaches from one the boundary
+/// contains, attributed to the vantage, each with its own confidence.
+///
+/// It drains the recorded drafts and asserts the capability each bears, because
+/// that attribution (the whole point of the technique) is checked by nothing else:
+/// the offline `vantage_draft_stamps_the_given_capability` pins the pure helper's
+/// echo of a given constant, not which constant this METHOD passes, and the
+/// returned `Recorded` does not expose the capability. Mutations: have
+/// `discover_services_from_vantage` pass `TCP_CONNECT_VANTAGE` -> the drained-draft
+/// capability assertion fails; point the first target across the boundary or stop
+/// the `web` listener -> the `web` reachable assertion fails; reverse the result
+/// order -> the paired-target assertions fail. Driven through the real `bring_up`.
 #[test]
 fn discovery_from_the_dmz_vantage_enumerates_reachability() {
     if !linux_docker_available() {
@@ -631,8 +638,8 @@ fn discovery_from_the_dmz_vantage_enumerates_reachability() {
 
         // Enumerate from the DMZ vantage, over the same lab-bound context the runner
         // builds (the vantage segment's network and the environment scope). Captured
-        // as a `Result` so teardown runs whatever it returns.
-        let discovered = {
+        // (with the drafts it recorded) so teardown runs whatever it returns.
+        let (discovered, drafts) = {
             let scope = Scope::from_environment(&env);
             let vantage = lab
                 .networks()
@@ -647,27 +654,46 @@ fn discovery_from_the_dmz_vantage_enumerates_reachability() {
                 ctx.resolve("db:5432")
                     .expect("db:5432 resolves in the lab scope"),
             ];
-            ctx.discover_services_from_vantage(&targets).await
+            let discovered = ctx.discover_services_from_vantage(&targets).await;
+            (discovered, ctx.take_evidence_drafts())
         };
 
         let _ = lab.teardown().await;
 
         let discovered = discovered.expect("the discovery enumeration runs");
         assert_eq!(discovered.len(), 2, "one result per target, in input order");
+        // The target is paired into each result, in input order.
+        assert_eq!(discovered[0].0.host(), "web");
+        assert_eq!(discovered[1].0.host(), "db");
         // web:80 is in the vantage's own dmz segment and listening, so reachable.
         assert!(
-            discovered[0].observation.value,
+            discovered[0].1.observation.value,
             "web:80 is reachable from the dmz foothold (its own segment)"
         );
         assert_eq!(
-            discovered[0].observation.confidence,
+            discovered[0].1.observation.confidence,
             Confidence::High,
             "a reached listener is High-confidence"
         );
-        // db:5432 is in internal, across the dmz -> internal boundary, so contained.
+        // db:5432 is in internal, across the dmz -> internal boundary, so contained:
+        // not reachable, and at Low (never a confident closed).
         assert!(
-            !discovered[1].observation.value,
+            !discovered[1].1.observation.value,
             "db:5432 is contained from the dmz foothold (across the boundary)"
         );
+        assert_eq!(
+            discovered[1].1.observation.confidence,
+            Confidence::Low,
+            "a non-connect reads Low, not a confident closed"
+        );
+        // Every recorded draft is attributed to the discovery technique (#111's
+        // point), not to a bare connect probe.
+        assert_eq!(drafts.len(), 2, "one draft per target");
+        for draft in &drafts {
+            assert_eq!(
+                draft.capability, "network_service_discovery_vantage",
+                "discovery stamps its own technique"
+            );
+        }
     });
 }
