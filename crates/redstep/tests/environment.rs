@@ -624,20 +624,21 @@ fn dmz_reference_enforces_the_intended_paths() {
 
 /// Guard: the blast-radius report from the dmz foothold over the reference
 /// topology (#112) gives the reachable set per element, attributed to the vantage,
-/// and a containment verdict backed by a positive control. The intended
-/// `api:8080` is reachable (the control); the forbidden `db:8080` is not (the
-/// boundary held); so `contained` is true at `High` -> a confident Pass. The
-/// per-element probes are recorded as `network_service_discovery_vantage` drafts
-/// and the aggregate finding as a `blast_radius_vantage` draft, both attributed to
-/// the dmz vantage (RK-011: the recorded aggregate mirrors the observation, so the
-/// evidence cannot launder a different value). `api` and `db` both serve a port in
-/// `dmz_reference`, so reachable/blocked turns on the boundary, not a dead port
-/// (RK-008). The lab tests default-skip; opt in with `REDSTEP_RUN_DOCKER_TESTS`
-/// (RK-013/014), and the aggregation and the per-element enumeration are pinned
-/// offline in `context.rs`. Mutations: break the gateway so `api:8080` is
-/// unreachable -> the positive control is lost -> `contained` drops to `Low`
-/// (Inconclusive); add `db:8080` to the `dmz -> internal` allow -> `db` becomes
-/// reachable -> `contained` is a `High` false (a breach).
+/// and a containment verdict that is a `High` breach or a `Low` contained. The
+/// intended `api:8080` is reachable; the forbidden `db:8080` is not (the boundary
+/// held); so `contained` is true at `Low` -> Inconclusive, because the standalone
+/// report cannot certify a confident "contained" (the confident certification is
+/// the boundary self-check's, #114, not this report's; see `aggregate_containment`
+/// in `context.rs`). The per-element probes are recorded as
+/// `network_service_discovery_vantage` drafts and the aggregate finding as a
+/// `blast_radius_vantage` draft, both attributed to the dmz vantage (RK-011: the
+/// recorded aggregate mirrors the observation, so the evidence cannot launder a
+/// different value). `api` and `db` both serve a port in `dmz_reference`, so
+/// reachable/blocked turns on the boundary, not a dead port (RK-008). The lab
+/// tests default-skip; opt in with `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), and the
+/// aggregation and the per-element enumeration are pinned offline in `context.rs`.
+/// Mutation: add `db:8080` to the `dmz -> internal` allow -> `db` becomes reachable
+/// -> `contained` is a `High` false (a breach, so the oracle Fails).
 #[test]
 fn blast_radius_from_the_dmz_vantage() {
     if !linux_docker_available() {
@@ -668,16 +669,17 @@ fn blast_radius_from_the_dmz_vantage() {
 
         let report = report.expect("the blast-radius report runs");
 
-        // The containment verdict: contained, and High because the positive control
-        // (api:8080) reached, so the not-reached db is a real block.
+        // The containment verdict: contained, but Low, so the oracle's default-High
+        // gate lands it Inconclusive. A standalone report cannot certify a confident
+        // "contained"; that is the self-check's job (#114).
         assert!(
             report.contained.observation.value,
             "no forbidden path was reachable, so the foothold is contained"
         );
         assert_eq!(
             report.contained.observation.confidence,
-            Confidence::High,
-            "a reached positive control makes contained a confident verdict"
+            Confidence::Low,
+            "a standalone contained is Low (Inconclusive), not a confident verdict"
         );
 
         // The reachable set, per element: the intended api:8080 reached, the
@@ -706,7 +708,7 @@ fn blast_radius_from_the_dmz_vantage() {
             .find(|d| d.capability == "blast_radius_vantage")
             .expect("an aggregate blast_radius_vantage draft is recorded");
         assert_eq!(aggregate.observed, serde_json::Value::Bool(true));
-        assert_eq!(aggregate.confidence, Confidence::High);
+        assert_eq!(aggregate.confidence, Confidence::Low);
         assert!(
             matches!(&aggregate.source, Some(redstep::NodeRef::Vantage { segment }) if segment == "dmz"),
             "the finding is attributed to the dmz vantage: {:?}",
