@@ -144,12 +144,12 @@ fn assume_breach_dmz() -> Environment {
         .expect("the assume-breach DMZ topology is valid")
 }
 
-/// A gateway-mediated topology (#113): a `dmz` foothold segment, an `internal`
-/// segment with a `web` stand-in, and a `dmz -> internal` boundary enforced by a
-/// firewall gateway permitting `web:80`. At v0.3.0 the gateway is a structural
-/// mediator (dual-homed on both segment networks, running no `nft` and no
-/// forwarding), so this still carries no cross-segment path; the port rules that
-/// would open `web:80` and the self-check that verifies them are #114.
+/// A gateway-mediated topology: a `dmz` foothold segment, an `internal` segment
+/// with a `web` stand-in, and a `dmz -> internal` boundary enforced by a firewall
+/// gateway permitting `web:80`. The gateway is dual-homed on both segment
+/// networks and proxies `web:80` (ADR-0024). This fixture is for the structural
+/// bring-up/teardown test below; `gateway_enforces_the_port_boundary` exercises
+/// the reachability semantics with real listeners.
 fn gateway_topology() -> Environment {
     Environment::builder()
         .segment("dmz")
@@ -248,19 +248,19 @@ fn brings_up_and_tears_down_the_mvp_lab() {
 
 /// Guard: a gateway-mediated topology brings up with the gateway container
 /// dual-homed on EXACTLY its two segment networks (both egress-less), is
-/// self-check-clean (no cross-segment path, fail-closed by construction at
-/// v0.3.0), and tears down so the gateway container and both networks are gone.
-/// This is #113's acceptance criterion 1 at the Docker level, checked by this
-/// run's OWN object names, never a global count (RK-010). It is a STRUCTURAL
-/// inspect, not a reachability claim: #113 wires no forwarding, so the
-/// behavioural reachable/blocked proof (positive control, per-port) is #114's
-/// self-check (RK-008). The lab tests default-skip; opt in with
-/// `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), so on a bare gate runner this guard
-/// does not run and the model-level guards in `environment.rs` carry criteria
-/// 2/3. Mutations: drop the `connect_network` in `provision` so the gateway is on
-/// one network, or let it also join the default bridge -> the exact-two-networks
-/// assertion fails; drop the gateway from `remove_all` -> the gone-after-teardown
-/// assertion fails.
+/// self-check-clean, and tears down so the gateway container and both networks
+/// are gone. Checked by this run's OWN object names, never a global count
+/// (RK-010). This is the STRUCTURAL guard (the gateway's attachment and
+/// teardown); the reachability semantics of the proxy are
+/// `gateway_enforces_the_port_boundary`. The self-check passes here because the
+/// gateway's `socat` listener for `web:80` accepts the probe (it accepts before
+/// dialing upstream, so `web` need not actually serve 80 for the positive
+/// control to connect; ADR-0024). The lab tests default-skip; opt in with
+/// `REDSTEP_RUN_DOCKER_TESTS` (RK-013/014), so the model-level guards in
+/// `environment.rs` carry the offline criteria. Mutations: drop the
+/// `connect_network` in `provision` so the gateway is on one network, or let it
+/// also join the default bridge -> the exact-two-networks assertion fails; drop
+/// the gateway from `remove_all` -> the gone-after-teardown assertion fails.
 #[test]
 fn gateway_mediates_a_declared_inter_segment_path() {
     if !linux_docker_available() {

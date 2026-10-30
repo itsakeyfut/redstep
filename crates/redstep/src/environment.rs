@@ -87,10 +87,9 @@ impl Workload {
 /// (ADR-0011): there is no mechanism to enforce a port-level `allow`, so
 /// [`EnvironmentBuilder::build`] refuses a non-empty one rather than hold a
 /// permission the lab cannot keep (RK-005). A gateway-mediated boundary
-/// ([`EnvironmentBuilder::gateway_boundary`]) declares a firewall gateway to
-/// enforce it, so it may carry a validated `allow`; at v0.3.0 the gateway is a
-/// structural mediator (#113) and the port rules that act on `allow`, with the
-/// self-check that verifies them, are #114.
+/// ([`EnvironmentBuilder::gateway_boundary`]) declares a firewall gateway that
+/// enforces its validated `allow` as a TCP proxy (ADR-0024), opening exactly the
+/// permitted `workload:port` paths; the boundary self-check verifies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
     from: String,
@@ -245,13 +244,12 @@ impl EnvironmentBuilder {
     /// Declare a boundary from `from` to `to` enforced by a firewall gateway,
     /// permitting `allow` (`workload:port` specs; an empty `allow` opens nothing,
     /// though the gateway is still brought up for the boundary). Unlike
-    /// [`boundary`](Self::boundary) this may carry a non-empty `allow`: a
-    /// gateway is declared to enforce it (ADR-0011). At v0.3.0 the gateway is a
-    /// structural mediator, a container dual-homed on both segment networks
-    /// (#113); the port rules that act on `allow` and the self-check that verifies
-    /// them are #114. [`build`](Self::build) refuses an `allow` the gateway cannot
-    /// enforce (a self-loop, a malformed spec, or a workload that is not declared
-    /// or not in the `to` segment).
+    /// [`boundary`](Self::boundary) this may carry a non-empty `allow`: the gateway
+    /// enforces it as a TCP proxy, opening exactly those `workload:port` paths
+    /// (ADR-0011, ADR-0024). [`build`](Self::build) refuses an `allow` the gateway
+    /// cannot enforce: a self-loop, a malformed spec, a workload that is not
+    /// declared or not in the `to` segment, or two specs on the same port (one
+    /// gateway address cannot tell them apart).
     pub fn gateway_boundary(mut self, from: &str, to: &str, allow: &[&str]) -> Self {
         let allow = allow.iter().map(|spec| (*spec).to_owned()).collect();
         self.boundaries
@@ -784,6 +782,15 @@ mod tests {
         assert!(
             matches!(&identical, Err(Error::InvalidEnvironment { reason }) if reason.contains("port 8080")),
             "an identical spec twice: {identical:?}"
+        );
+        // Non-adjacent repeat (another port between): the check tracks every port
+        // seen, not just the previous one.
+        let non_adjacent = base()
+            .gateway_boundary("dmz", "internal", &["api:8080", "web:80", "api:8080"])
+            .build();
+        assert!(
+            matches!(&non_adjacent, Err(Error::InvalidEnvironment { reason }) if reason.contains("port 8080")),
+            "a non-adjacent repeated port: {non_adjacent:?}"
         );
     }
 

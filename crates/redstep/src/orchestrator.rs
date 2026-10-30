@@ -14,10 +14,12 @@
 //! A membership-only boundary (ADR-0011) is separate networks with no connection
 //! between them, and a non-empty `allow` on one is refused upstream. A
 //! gateway-mediated boundary adds a firewall-gateway container dual-homed on both
-//! segment networks (#113): at v0.3.0 it is a *structural* mediator that runs no
-//! `nft` and enables no forwarding, so the two segments still carry no
-//! cross-segment path (fail-closed by construction). The port rules that act on
-//! its `allow`, and the TCP-to-port self-check that verifies them, are #114.
+//! segment networks and enforces its `allow` as a TCP proxy (ADR-0024): on the
+//! `from` network the gateway is aliased with each allowed workload name and runs
+//! a `socat` listener per allowed `workload:port` forwarding to that workload's
+//! inspected address on the `to` network, so default-deny stays membership (no
+//! route between the segments) and the proxy is the only opening. The boundary
+//! self-check verifies it per element with a TCP-to-port probe ([`check_boundaries`]).
 //!
 //! This unit stands the lab up, tears it down, and verifies isolation before a
 //! run. It makes no test verdict. That the egress-less flag is set is checked
@@ -102,11 +104,10 @@ impl LabContainer {
     }
 }
 
-/// A firewall-gateway container bridging two segments (ADR-0011, #113), paired
-/// with the boundary it mediates. At v0.3.0 it is a structural mediator:
-/// dual-homed on the `from` and `to` segment networks and running no rules.
-/// #114's port/east-west self-check reads `from`/`to`/`name` to apply and verify
-/// the rules on it.
+/// A firewall-gateway container bridging two segments (ADR-0011, ADR-0024),
+/// paired with the boundary it mediates. It is dual-homed on the `from` and `to`
+/// segment networks and enforces the boundary's `allow` as a TCP proxy; the
+/// boundary self-check reads `from`/`to`/`name` to verify it.
 #[derive(Debug, Clone)]
 pub struct LabGateway {
     from: String,
@@ -199,9 +200,13 @@ fn gateway_name(run_id: &str, from: &str, to: &str) -> String {
 /// gateway boundary with an empty `allow` runs `sleep` on this image and opens
 /// nothing. Third-party and pulled, like [`PROBE_IMAGE`]; its blast radius is
 /// bounded by layer-1 isolation (ADR-0006), since it runs only on egress-less
-/// lab networks. Digest pinned because a `socat` image is not otherwise version
-/// stable (ADR-0019 defers general digest pinning, but this image's behaviour is
-/// load-bearing for a safety boundary).
+/// lab networks. Pinned by digest, not a tag, because the image's runtime
+/// behaviour is load-bearing for a safety boundary and `alpine/socat` publishes
+/// no stable version tag; this digest is `alpine/socat:latest` as resolved on
+/// 2026-10-30. The gateway's entrypoint is overridden to `sh` (see the
+/// `provision` loop), so the image need only carry `socat` and a shell, which
+/// this Alpine-based image does. Bumping the pin means re-resolving the tag and
+/// re-running the Docker-gated `gateway_enforces_the_port_boundary`.
 const GATEWAY_IMAGE: &str =
     "alpine/socat@sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287";
 
@@ -622,10 +627,13 @@ async fn provision(
     // after bring-up is meaningful rather than racing a slow-start real image
     // (#47). A stand-in declares no HEALTHCHECK and is ready at once, so the
     // boundary demo is unchanged. On failure this propagates as `Err`, which
-    // `bring_up` tears the partial lab down on. The gateway is not awaited: it is
-    // a no-HEALTHCHECK busybox stand-in whose liveness is a successful `start`
-    // (the same guarantee a `Standin` workload gets), and #114 revisits this when
-    // it swaps in an nftables image that runs rules.
+    // `bring_up` tears the partial lab down on. The gateway is not awaited: it
+    // declares no HEALTHCHECK, so its liveness is a successful `start` (the same
+    // guarantee a `Standin` workload gets). A `socat` listener that is not yet
+    // bound when the self-check probes it does not read as a false block: the
+    // probe carries its own bounded deadline and a non-connect reads Low /
+    // Indeterminate, and an abnormal probe is `LabUnavailable` (fail-closed), so a
+    // bind race fails the self-check closed rather than certifying a gap.
     await_readiness(
         &lab.containers,
         &DockerHealthPoller { docker },
@@ -833,7 +841,11 @@ trait TcpProber {
 ///   `workload:port` (RK-009), a probe in `from` must connect (the intended path
 ///   works); this doubles as the positive control, proving the gateway is
 ///   reachable from `from` so the non-reachable results below are real blocks
-///   (RK-008). Then for *every* `to`-segment workload not named in the `allow`,
+///   (RK-008). A connect proves the gateway *opened* the port, not that the
+///   target answers end to end: `socat` accepts the inbound before dialing
+///   upstream (ADR-0024), so this certifies the port enforcement, not the target
+///   app's health (which is `await_readiness`'s job). Then for *every*
+///   `to`-segment workload not named in the `allow`,
 ///   on every allowed port, a probe in `from` must fail to connect (a non-allowed
 ///   workload is not proxied). An intended path that does not connect is
 ///   `LabUnavailable` (the enforcement is untrustworthy); a non-allowed path that
@@ -904,7 +916,9 @@ async fn check_boundaries<P: Prober, T: TcpProber>(
 
         // A gateway boundary with a non-empty allow is a TCP proxy; everything
         // else (a plain boundary, or a gateway boundary that opens nothing) is
-        // membership-only.
+        // membership-only. `filter_map` cannot silently drop a spec here: `build`
+        // validated every spec with the same `parse_allow_spec` and is the only
+        // way to get an `Environment`, so each one parses.
         let allowed: Vec<(&str, u16)> = if boundary.is_gateway_mediated() {
             boundary
                 .allow()
@@ -3262,10 +3276,9 @@ mod tests {
     /// Guard: on a gateway boundary the self-check certifies the lab when every
     /// allowed `workload:port` connects from `from` and no non-allowed workload
     /// does. The ICMP prober is unused (the boundary is a TCP proxy). Mutation:
-    /// have the gateway branch fall through to the membership ICMP path -> the
-    /// allowed paths are never TCP-probed and the TCP prober's `connect` set is
-    /// ignored -> paired with the two failing tests below, the branch no longer
-    /// bites.
+    /// route the gateway boundary to the membership ICMP branch (`if allowed
+    /// .is_empty()` -> `if true`) -> the empty `MockProber` reaches no positive
+    /// control -> `LabUnavailable` -> this `is_ok()` assertion fails.
     #[test]
     fn gateway_check_passes_when_allowed_reachable_and_others_blocked() {
         let tcp = MockTcpProber::new()
@@ -3339,6 +3352,92 @@ mod tests {
         assert!(
             matches!(&result, Err(Error::LabUnavailable { .. })),
             "an undeterminable probe must fail closed: {result:?}"
+        );
+    }
+
+    /// Guard: an undeterminable probe in the NON-ALLOWED loop also fails closed,
+    /// not only in the positive-control loop. The intended paths connect (so the
+    /// positive control passes and we reach the non-allowed loop), and the probe
+    /// of the non-allowed `db` errors. Mutation: `await?` -> `await.unwrap_or(false)`
+    /// on the non-allowed probe (line ~969) -> the errored probe reads as "not
+    /// connected" = blocked -> `Ok` -> this fails. (A row-6 in the making: a
+    /// crashed probe to a non-allowed workload would certify the lab.)
+    #[test]
+    fn gateway_check_fails_closed_when_a_non_allowed_probe_errors() {
+        let tcp = MockTcpProber::new()
+            .connects_on("n-dmz", "api", 8080)
+            .connects_on("n-dmz", "web", 80)
+            .failing("n-dmz", "db", 8080); // db is non-allowed; its probe errors
+        let result = block_on(check_boundaries(
+            &gateway_env(),
+            &gateway_lab(),
+            &MockProber::new(),
+            &tcp,
+        ));
+        assert!(
+            matches!(&result, Err(Error::LabUnavailable { .. })),
+            "an undeterminable non-allowed probe must fail closed: {result:?}"
+        );
+    }
+
+    /// Guard: a non-allowed workload is checked on EVERY allowed port, not just
+    /// one (RK-009 across ports). `db` is made reachable only on `80`, the lower
+    /// of the two allowed ports. Mutation: probe only the highest/first allowed
+    /// port (`allowed_ports.iter().rev().take(1)` or `.take(1)` depending on sort)
+    /// -> `db:80` is missed -> `Ok` -> this fails. Paired with the `db:8080` case
+    /// above, both ports are pinned.
+    #[test]
+    fn gateway_check_refuses_a_non_allowed_workload_on_a_non_highest_port() {
+        let tcp = MockTcpProber::new()
+            .connects_on("n-dmz", "api", 8080)
+            .connects_on("n-dmz", "web", 80)
+            .connects_on("n-dmz", "db", 80); // db reachable only on the lower port
+        let result = block_on(check_boundaries(
+            &gateway_env(),
+            &gateway_lab(),
+            &MockProber::new(),
+            &tcp,
+        ));
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "dmz" && to == "internal"),
+            "a non-allowed workload reachable on a non-highest allowed port must violate: {result:?}"
+        );
+    }
+
+    /// Guard: a gateway boundary with an EMPTY allow is checked by the membership
+    /// (ICMP) branch, not waved through by the gateway branch. The gateway opens
+    /// nothing, so its `to`-workloads must be membership-isolated; here `web` is
+    /// (wrongly) reachable from `dmz` by ICMP, which must be a violation. Mutation:
+    /// exclude a gateway boundary from the membership branch (`if allowed
+    /// .is_empty()` -> `if allowed.is_empty() && !boundary.is_gateway_mediated()`)
+    /// -> the empty-allow gateway boundary loops over nothing and returns `Ok`
+    /// with no probe -> this fails.
+    #[test]
+    fn gateway_boundary_with_empty_allow_uses_membership() {
+        let env = Environment::builder()
+            .segment("dmz")
+            .segment("internal")
+            .standin("foot", "busybox:1", "dmz")
+            .standin("web", "busybox:1", "internal")
+            .vantage("dmz")
+            .gateway_boundary("dmz", "internal", &[])
+            .build()
+            .expect("an empty-allow gateway boundary is valid");
+        let lab = lab(
+            vec![net("dmz", "n-dmz"), net("internal", "n-internal")],
+            vec![
+                container("foot", "dmz", "c-foot"),
+                container("web", "internal", "c-web"),
+            ],
+        );
+        // web reaches from its own segment (positive control) AND, wrongly, from dmz.
+        let prober = MockProber::new()
+            .reach("n-internal", "c-web")
+            .reach("n-dmz", "c-web");
+        let result = block_on(check_boundaries(&env, &lab, &prober, &no_tcp()));
+        assert!(
+            matches!(&result, Err(Error::BoundaryViolated { from, to }) if from == "dmz" && to == "internal"),
+            "an empty-allow gateway boundary must be membership-checked: {result:?}"
         );
     }
 
