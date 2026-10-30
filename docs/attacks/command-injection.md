@@ -63,10 +63,12 @@ an outbound request even though its response carried nothing. A `Pass` (not-expl
 High) means this payload did not execute: in-band, the sentinel did not come back; blind,
 the token did not reach the canary. A followed redirect or an abnormal probe exit is
 `Inconclusive` by channel: in-band it downgrades even with the sentinel present (a
-redirected body may be another host's), but blind, the per-probe token in the canary's
-logs proves the target ran the command regardless of the outer probe's fate, so a blind
-hit stays a confident `Fail` on a redirect or an abnormal exit, and only a token-absent
-redirect/abnormal is `Inconclusive`. A confident "not exploitable" proves only that this payload and quoting did
+redirected body may be another host's). Blind, a NON-redirected abnormal exit with the
+token seen stays a confident `Fail` (with no redirect to follow, the canary-log token is
+the target's own callback), but a FOLLOWED REDIRECT downgrades to `Inconclusive` even
+with the token seen, because the probe may have followed an open redirect to the canary
+itself ([#126](https://github.com/itsakeyfut/redstep/issues/126)); a token-absent
+redirect/abnormal is `Inconclusive` too. A confident "not exploitable" proves only that this payload and quoting did
 not break out of the command, not that every shell context is safe. The blind channel is
 weaker still, and in a way the in-band channel is not: its witness is a callback the target
 makes with its own tools, so a blind "not exploitable" presupposes both that the endpoint

@@ -1690,10 +1690,14 @@ fn response_was_redirected(headers: &str) -> bool {
 /// boolean by the caller. `attributable` says whether that witness is provably the
 /// scoped target's independently of the probe's own response: an out-of-band token
 /// in the canary's logs is (only the target's coercion carries the fresh per-probe
-/// token), a body marker is not. A positive attributable witness is an exploit at
-/// `High` ahead of everything below, because a redirect or an abnormal exit of the
-/// outer probe cannot un-log a token the target already delivered (#103). A
-/// followed redirect otherwise forces `Low` (value `false`),
+/// token), a body marker is not. A positive attributable witness on a probe that
+/// did NOT follow a redirect is an exploit at `High` ahead of everything below: an
+/// abnormal exit cannot un-log a token the target already delivered (#103). A
+/// followed redirect still forces `Low`, even for an attributable positive witness,
+/// because busybox `wget` follows the redirect and may itself deliver the token to
+/// the canary (a plain open redirect, not a server-side fetch); #126 is the refinement
+/// that would separate a self-fetching SSRF that also redirects. A followed redirect
+/// forces `Low` (value `false`),
 /// checked before the exit code because a witnessed-and-clean probe would
 /// otherwise read `High`: the response may be from the redirect's host rather than
 /// the scoped target (so a body marker is not provably the target's), and for an
@@ -1723,16 +1727,21 @@ fn classify_witness_shared(
     attributable: bool,
 ) -> Observation<bool> {
     // An attributable witness (an out-of-band per-probe token found in the
-    // canary's own logs) proves the target acted, whatever became of the outer
-    // probe: the token cannot be the redirect host's, and a non-zero or abnormal
-    // exit of the probe container does not un-log it. So a positive attributable
-    // witness is an exploit at `High` ahead of the redirect / abnormal downgrade
-    // below (#103). The downgrade still applies when `!witnessed` (the negative
-    // out-of-band case, where a redirect may mean the coercion never fired, so a
-    // token-absent result is not a confident "not exploitable"), and to the whole
-    // body-marker path (`attributable = false`), where a redirected body may be
-    // another host's and so is not provably the scoped target's.
-    if witnessed && attributable {
+    // canary's own logs) on a probe that did NOT follow a redirect proves the
+    // target acted: with no redirect for the probe to follow, the only way the
+    // token reached the canary is the target's own server-side request, and an
+    // abnormal or non-zero exit of the probe container afterward does not un-log
+    // it. So that case is an exploit at `High` ahead of the abnormal downgrade
+    // below (#103). The `!redirected` guard is load-bearing: the coercion URL
+    // carries the token (`/fetch?url=http://canary/TOKEN`) and busybox `wget`
+    // follows redirects, so a target with a plain open redirect that reflects the
+    // `url` into `Location` makes the PROBE fetch the canary itself - the token is
+    // then not the target's server-side action, and a redirect must still downgrade
+    // (distinguishing a self-fetching SSRF that also redirects is #126). The
+    // downgrade also applies when `!witnessed` (the negative out-of-band case, a
+    // redirect may mean the coercion never fired) and to the whole body-marker path
+    // (`attributable = false`), where a redirected body may be another host's.
+    if witnessed && attributable && !redirected {
         return Observation {
             value: true,
             confidence: Confidence::High,
@@ -2350,8 +2359,10 @@ pub(crate) async fn ssrf_exploit_from(
     // The witness is out-of-band, so poll the canary's logs over the bounded
     // window, returning as soon as the token appears.
     let seen = poll_logs_for_token(docker, canary_container, token).await?;
-    // The witness is a per-probe token in the canary's logs: attributable, so a
-    // redirect or abnormal exit of the outer probe does not downgrade a hit (#103).
+    // The witness is a per-probe token in the canary's logs: attributable, so an
+    // abnormal exit of the outer probe does not downgrade a hit; a followed redirect
+    // still downgrades it, since the probe may have delivered the token itself (#103,
+    // #126).
     let observation =
         classify_witness_shared(&state, seen, response_was_redirected(&headers), true);
     let spec = format!("{}:{}", app.host(), app.port());
@@ -2557,8 +2568,10 @@ pub(crate) async fn blind_cmdi_exploit_from(
     // The witness is out-of-band, so poll the canary's logs over the bounded
     // window, returning as soon as the token appears.
     let seen = poll_logs_for_token(docker, canary_container, token).await?;
-    // The witness is a per-probe token in the canary's logs: attributable, so a
-    // redirect or abnormal exit of the outer probe does not downgrade a hit (#103).
+    // The witness is a per-probe token in the canary's logs: attributable, so an
+    // abnormal exit of the outer probe does not downgrade a hit; a followed redirect
+    // still downgrades it, since the probe may have delivered the token itself (#103,
+    // #126).
     let observation =
         classify_witness_shared(&state, seen, response_was_redirected(&headers), true);
     let spec = format!("{}:{}", app.host(), app.port());
@@ -7006,21 +7019,26 @@ mod tests {
     /// never-run container is Low in BOTH witness directions, because the probe did
     /// not establish the target's behaviour and must not read as a confident "not
     /// exploitable" (RK-002, CLAUDE.md row 6). The attributable direction (#103) is
-    /// pinned too: a positive attributable witness is `true`/`High` even on a
-    /// redirect or an abnormal exit (the canary-log token proves the hit), while an
-    /// attributable WITNESSLESS probe keeps the fail-closed `Low` on redirect/abnormal
-    /// in both those cases (RK-017). Pure, no Docker. Mutations, each caught here: give
-    /// the abnormal arm `High` -> the abnormal cases read as a confident clean ->
-    /// fail; split the abnormal arm so `_ if !witnessed => High` -> an errored
-    /// witnessless probe reads as a confident clean -> the witnessed=false abnormal
-    /// pass fails; drop the `redirected` short-circuit -> the redirected witness reads
-    /// true/High -> fails; restrict the downgrade to `redirected && witnessed` -> the
-    /// redirected witness-less clean reads false/High -> the redirect-no-witness case
-    /// fails; drop the `witnessed` guard on the clean arm -> a clean exit without the
-    /// witness reads true -> fails; drop the `if witnessed && attributable` guard ->
-    /// the attributable redirect/abnormal positive rows read false/Low -> fail; widen
-    /// it to `if attributable` (drop `witnessed`) -> the attributable witnessless
-    /// redirect/abnormal rows read true/High -> fail.
+    /// pinned too: a positive attributable witness on a NON-redirected probe is
+    /// `true`/`High` even on an abnormal exit (with no redirect to follow, the
+    /// canary-log token is the target's own server-side request), but a FOLLOWED
+    /// REDIRECT downgrades it to `Low` (the probe may have followed an open redirect
+    /// to the canary itself, #103/#126), and an attributable witnessless probe keeps
+    /// the fail-closed `Low` on redirect/abnormal (RK-017). Pure, no Docker.
+    /// Mutations, each caught here: give the abnormal arm `High` -> the abnormal
+    /// cases read as a confident clean -> fail; split the abnormal arm so
+    /// `_ if !witnessed => High` -> an errored witnessless probe reads as a confident
+    /// clean -> the witnessed=false abnormal pass fails; drop the `redirected`
+    /// short-circuit -> the redirected witness reads true/High -> fails; restrict the
+    /// downgrade to `redirected && witnessed` -> the redirected witness-less clean
+    /// reads false/High -> the redirect-no-witness case fails; drop the `witnessed`
+    /// guard on the clean arm -> a clean exit without the witness reads true -> fails;
+    /// drop the `!redirected` term from the attributable guard -> the redirected
+    /// attributable positive rows read true/High -> fail; drop the whole
+    /// `if witnessed && attributable && !redirected` guard -> the non-redirected
+    /// attributable abnormal positive rows read false/Low -> fail; drop the
+    /// `witnessed` term (`if attributable && !redirected`) -> the witnessless clean
+    /// reads true/High -> fail.
     #[test]
     fn classify_witness_shared_maps_fail_closed() {
         use bollard::models::ContainerStateStatusEnum::{CREATED, EXITED};
@@ -7082,9 +7100,11 @@ mod tests {
         }
 
         // The attributable (out-of-band) direction (#103): a positive witness is an
-        // exploit at High even on a redirect or an abnormal exit, because the token
-        // in the canary's logs cannot be the redirect host's nor un-logged by the
-        // outer probe's exit. The negative direction keeps the fail-closed downgrade.
+        // exploit at High on a NON-redirected probe even when it exits abnormally,
+        // because with no redirect to follow the token in the canary's logs is the
+        // target's own server-side request and an abnormal exit does not un-log it.
+        // A followed redirect still downgrades (the probe may have delivered the
+        // token itself, #103/#126), and the negative direction keeps the downgrade.
         let oob = |state: &ContainerState, witnessed, redirected| {
             classify_witness_shared(state, witnessed, redirected, true)
         };
@@ -7097,21 +7117,23 @@ mod tests {
         let unseen_clean = oob(&clean_ok, false, false);
         assert!(!unseen_clean.value);
         assert_eq!(unseen_clean.confidence, Confidence::High);
-        // A redirect does NOT downgrade an attributable positive witness.
+        // A followed redirect DOWNGRADES even an attributable positive witness to
+        // Inconclusive: busybox wget follows an open redirect to the canary itself,
+        // so the token is not provably the target's server-side action (#103, #126).
         let seen_redirected = oob(&clean_ok, true, true);
         assert!(
-            seen_redirected.value,
-            "an attributable witness on a redirect is still an exploit"
+            !seen_redirected.value,
+            "an attributable witness on a redirect is Inconclusive, not a confident exploit"
         );
-        assert_eq!(seen_redirected.confidence, Confidence::High);
-        // But a redirected attributable witness-ABSENT result must still be Low, not
-        // a confident "not exploitable": the coercion may never have fired.
+        assert_eq!(seen_redirected.confidence, Confidence::Low);
+        // And a redirected attributable witness-ABSENT result is Low too (the
+        // coercion may never have fired).
         let unseen_redirected = oob(&clean_ok, false, true);
         assert!(!unseen_redirected.value);
         assert_eq!(unseen_redirected.confidence, Confidence::Low);
-        // Every abnormal probe, in BOTH witness directions (RK-017): an attributable
-        // positive witness is High (the token proves the hit), an attributable
-        // witnessless probe is Low (not a confident clean).
+        // Every abnormal probe (RK-017). Not redirected: an attributable positive
+        // witness is High (the token proves the hit), a witnessless one is Low.
+        // Redirected: Low in both directions (the redirect downgrade wins).
         for abnormal in [
             state(Some(EXITED), Some(1)),
             state(Some(EXITED), Some(137)),
@@ -7121,10 +7143,17 @@ mod tests {
             let seen_abnormal = oob(&abnormal, true, false);
             assert!(
                 seen_abnormal.value,
-                "an attributable witness survives an abnormal exit: {:?}",
+                "an attributable witness survives an abnormal (non-redirected) exit: {:?}",
                 abnormal.status
             );
             assert_eq!(seen_abnormal.confidence, Confidence::High);
+            let seen_abnormal_redirected = oob(&abnormal, true, true);
+            assert!(
+                !seen_abnormal_redirected.value,
+                "a redirect downgrades even an attributable abnormal hit: {:?}",
+                abnormal.status
+            );
+            assert_eq!(seen_abnormal_redirected.confidence, Confidence::Low);
             let unseen_abnormal = oob(&abnormal, false, false);
             assert!(
                 !unseen_abnormal.value,
