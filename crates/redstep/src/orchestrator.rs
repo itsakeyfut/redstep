@@ -6096,6 +6096,63 @@ mod tests {
         );
     }
 
+    /// Guard: `ssrf_draft` mirrors the observation in the NON-exploit and the
+    /// abnormal directions, which the attribution test (only `value:true`/`High`)
+    /// does not reach; without this, the `false`/`High` and `Low` draft wiring for
+    /// SSRF is pinned only by the Docker-gated end-to-end test, so a one-line
+    /// regression to `observed`/`confidence` (e.g. recording an inconclusive probe
+    /// as a confident "not exploitable") ships green on the offline gate -- RK-011,
+    /// a false PASS laundered through the evidence record (CLAUDE.md row 6). This is
+    /// the SSRF analogue of `blind_cmdi_draft_mirrors_a_non_exploit_and_an_inconclusive_observation`
+    /// and `http_witness_draft_mirrors_the_observation_and_carries_the_witness`; SSRF
+    /// was the one out-of-band draft without it (#75). Pure, no Docker. Mutation:
+    /// freeze `confidence: observation.confidence` in `ssrf_draft` to
+    /// `Confidence::High` -> the Low case fails; freeze `observed` to `Bool(true)` ->
+    /// the non-exploit `observed` assertion fails.
+    #[test]
+    fn ssrf_draft_mirrors_a_non_exploit_and_an_inconclusive_observation() {
+        let clean = ssrf_draft(
+            "lab",
+            "api:8081".to_owned(),
+            "/fetch?url=http://canary:8082/tok",
+            "tok",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(clean.observed, serde_json::Value::Bool(false));
+        assert_eq!(clean.confidence, Confidence::High);
+        assert!(
+            clean.summary.contains("did not reach the canary"),
+            "a clean non-exploit summary: {:?}",
+            clean.summary
+        );
+        let inconclusive = ssrf_draft(
+            "lab",
+            "api:8081".to_owned(),
+            "/fetch?url=http://canary:8082/tok",
+            "tok",
+            "canary",
+            8082,
+            &Observation {
+                value: false,
+                confidence: Confidence::Low,
+            },
+            Duration::from_millis(5_000),
+        );
+        assert_eq!(inconclusive.observed, serde_json::Value::Bool(false));
+        assert_eq!(inconclusive.confidence, Confidence::Low);
+        assert!(
+            inconclusive.summary.contains("inconclusive"),
+            "an abnormal-probe summary: {:?}",
+            inconclusive.summary
+        );
+    }
+
     /// Guard: an SSRF witness round-trips through `parse_ssrf_witness`, and a
     /// witness missing any field (or carrying a non-SSRF capability) is rejected
     /// fail-closed (ADR-0022). Pure, no Docker. Mutation: drop a field's check ->
