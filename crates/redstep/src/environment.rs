@@ -243,8 +243,9 @@ impl EnvironmentBuilder {
     }
 
     /// Declare a boundary from `from` to `to` enforced by a firewall gateway,
-    /// permitting `allow` (`workload:port` specs; an empty `allow` opens nothing).
-    /// Unlike [`boundary`](Self::boundary) this may carry a non-empty `allow`: a
+    /// permitting `allow` (`workload:port` specs; an empty `allow` opens nothing,
+    /// though the gateway is still brought up for the boundary). Unlike
+    /// [`boundary`](Self::boundary) this may carry a non-empty `allow`: a
     /// gateway is declared to enforce it (ADR-0011). At v0.3.0 the gateway is a
     /// structural mediator, a container dual-homed on both segment networks
     /// (#113); the port rules that act on `allow` and the self-check that verifies
@@ -340,6 +341,12 @@ impl EnvironmentBuilder {
         }
 
         let mut boundaries: Vec<Boundary> = Vec::new();
+        // The `(from, to)` pairs that already carry a gateway, so a second gateway
+        // boundary on the same pair is refused here rather than failing at
+        // bring-up: two gateways for one pair take the same container name and
+        // collide (a 409), so the valid-by-construction `Environment` must not
+        // admit the pair twice.
+        let mut gateway_pairs: Vec<(String, String)> = Vec::new();
         for (from, to, allow, gateway) in self.boundaries {
             if !declared(&from) {
                 return Err(invalid(format!(
@@ -364,6 +371,13 @@ impl EnvironmentBuilder {
                          a gateway mediates a path between two distinct segments"
                     )));
                 }
+                if gateway_pairs.iter().any(|(f, t)| f == &from && t == &to) {
+                    return Err(invalid(format!(
+                        "a second gateway boundary {from:?} -> {to:?} is declared; one pair \
+                         takes one gateway, so the duplicate would collide at bring-up"
+                    )));
+                }
+                gateway_pairs.push((from.clone(), to.clone()));
                 for spec in &allow {
                     let Some((workload, _port)) = parse_allow_spec(spec) else {
                         return Err(invalid(format!(
@@ -420,17 +434,28 @@ impl EnvironmentBuilder {
 
 /// Split a gateway boundary's `allow` spec `"workload:port"` into its workload
 /// name and port, or `None` if it is not that shape: it must have a `:`, a
-/// non-empty workload name, and a port that parses as a non-zero `u16`
-/// (1-65535). Whether the workload is declared and sits in the boundary's `to`
-/// segment is checked by [`EnvironmentBuilder::build`], which has the workload
-/// list; this is the pure syntactic half, unit-tested without it. A workload
-/// name is a valid lab name and so carries no `:`, so the last `:` separates the
-/// port.
+/// non-empty workload name, and a canonical port in `1..=65535`. Whether the
+/// workload is declared and sits in the boundary's `to` segment is checked by
+/// [`EnvironmentBuilder::build`], which has the workload list; this is the pure
+/// syntactic half, unit-tested without it. A workload name is a valid lab name
+/// and so carries no `:`, so the last `:` separates the port.
+///
+/// The port is parsed by hand rather than by `u16::from_str`, which would also
+/// accept a leading `+` (`"+80"`) and leading zeros (`"080"`): the spec is
+/// stored raw for the enforcement sub-issue to render into a firewall rule, so a
+/// non-canonical form that parses here would be carried through verbatim. Only
+/// ASCII digits, no leading zero, are accepted.
 ///
 /// The guard is `parse_allow_spec_reads_workload_and_port`.
 fn parse_allow_spec(spec: &str) -> Option<(&str, u16)> {
     let (workload, port) = spec.rsplit_once(':')?;
     if workload.is_empty() {
+        return None;
+    }
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if port.len() > 1 && port.starts_with('0') {
         return None;
     }
     let port: u16 = port.parse().ok()?;
@@ -635,9 +660,11 @@ mod tests {
     /// Guard: a gateway boundary whose `allow` the gateway cannot enforce is
     /// refused, not built (#113 acceptance criterion 3, RK-005): a workload not
     /// in the `to` segment, an undeclared workload, a malformed spec, a port of
-    /// 0, and a gateway bridging a segment to itself. Mutation: drop the
-    /// allow-spec validation loop in `build` -> the wrong-segment, unknown,
-    /// malformed, and port-0 cases build; drop the `from == to` check -> the
+    /// 0, a gateway bridging a segment to itself, and an unenforceable spec that
+    /// is not the first in the list. Mutations: drop the allow-spec validation
+    /// loop in `build` -> the wrong-segment, unknown, malformed, and port-0 cases
+    /// build; narrow the loop to the first spec (`allow.iter().take(1)`) -> the
+    /// valid-then-invalid case builds; drop the `from == to` check -> the
     /// self-loop builds. Each makes this fail.
     #[test]
     fn a_gateway_that_cannot_enforce_is_refused() {
@@ -681,18 +708,75 @@ mod tests {
             matches!(&self_loop, Err(Error::InvalidEnvironment { reason }) if reason.contains("itself")),
             "a gateway bridging a segment to itself: {self_loop:?}"
         );
+
+        // Every spec is validated, not just the first: a valid spec followed by
+        // an unenforceable one is still refused.
+        let later_bad = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:80", "ghost:1"])
+            .build();
+        assert!(
+            matches!(&later_bad, Err(Error::InvalidEnvironment { reason }) if reason.contains("ghost") && reason.contains("not declared")),
+            "an unenforceable spec after a valid one: {later_bad:?}"
+        );
     }
 
-    /// Guard: `parse_allow_spec` reads `workload:port`, and rejects a spec with
-    /// no port, a port of 0, a port past the `u16` range, and an empty workload.
-    /// Mutation: drop the `port == 0` rejection -> `"web:0"` parses -> this
-    /// fails; drop the empty-workload check -> `":443"` parses -> this fails.
+    /// Guard: two gateway boundaries on the same `(from, to)` pair are refused,
+    /// because both would take the same gateway container name and collide at
+    /// bring-up, which a valid-by-construction `Environment` must not admit.
+    /// Mutation: drop the `gateway_pairs` duplicate check in `build` -> the
+    /// second gateway boundary builds -> this fails.
+    #[test]
+    fn a_duplicate_gateway_boundary_is_refused() {
+        let result = gateway_base()
+            .gateway_boundary("dmz", "internal", &["web:80"])
+            .gateway_boundary("dmz", "internal", &["web:443"])
+            .build();
+        assert!(
+            matches!(&result, Err(Error::InvalidEnvironment { reason }) if reason.contains("second gateway boundary") && reason.contains("collide")),
+            "a second gateway on the same pair: {result:?}"
+        );
+    }
+
+    /// Guard: `parse_allow_spec` reads `workload:port` across its boundary and
+    /// non-canonical cases, and rejects everything that is not a canonical
+    /// `1..=65535` port. Mutations: drop the `port == 0` rejection -> `"web:0"`
+    /// parses -> fails; drop the empty-workload check -> `":443"` parses ->
+    /// fails; change the `port <= 65535` edge (e.g. `port == 0` to
+    /// `port <= 1 || port == 65535`) -> `"web:1"` or `"web:65535"` is wrongly
+    /// rejected -> fails; drop the ASCII-digit/leading-zero checks -> `"web:+80"`
+    /// or `"web:080"` parses -> fails; change `rsplit_once` to `split_once` ->
+    /// `"a:b:80"` reads as `None` instead of `("a:b", 80)` -> fails.
     #[test]
     fn parse_allow_spec_reads_workload_and_port() {
         assert_eq!(parse_allow_spec("web:443"), Some(("web", 443)));
+        assert_eq!(parse_allow_spec("web:1"), Some(("web", 1)), "low boundary");
+        assert_eq!(
+            parse_allow_spec("web:65535"),
+            Some(("web", 65535)),
+            "high boundary"
+        );
+        // The last colon separates the port, so a workload-ish prefix with a
+        // colon keeps its colon (build then rejects it as an unknown workload).
+        assert_eq!(
+            parse_allow_spec("a:b:80"),
+            Some(("a:b", 80)),
+            "rsplit, not split"
+        );
         assert_eq!(parse_allow_spec("web"), None, "no port");
+        assert_eq!(parse_allow_spec("web:"), None, "empty port");
         assert_eq!(parse_allow_spec("web:0"), None, "port 0 is not usable");
+        assert_eq!(parse_allow_spec("web:65536"), None, "port past u16");
         assert_eq!(parse_allow_spec("web:99999"), None, "port past u16");
+        assert_eq!(
+            parse_allow_spec("web:+80"),
+            None,
+            "a leading + is not canonical"
+        );
+        assert_eq!(
+            parse_allow_spec("web:080"),
+            None,
+            "a leading zero is not canonical"
+        );
         assert_eq!(parse_allow_spec(":443"), None, "empty workload");
     }
 

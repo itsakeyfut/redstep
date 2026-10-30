@@ -131,7 +131,8 @@ impl LabGateway {
     }
 }
 
-/// A running lab: the Docker networks and containers a [`bring_up`] created.
+/// A running lab: the Docker networks, workload containers, and firewall-gateway
+/// containers a [`bring_up`] created.
 ///
 /// The normal path is the explicit async [`teardown`](RunningLab::teardown).
 /// `Drop` is the backstop for a forgotten teardown or a panic: it removes what
@@ -180,9 +181,14 @@ fn container_name(run_id: &str, workload: &str) -> String {
     format!("{run_id}-{workload}")
 }
 
-/// The gateway container's name for a boundary in this run.
+/// The gateway container's name for a boundary in this run. The `from` and `to`
+/// segments are joined with `_`, which a valid lab name can never contain (only
+/// lowercase letters, digits, and interior hyphens): that keeps a gateway name
+/// disjoint from every workload container name (`{run}-{workload}`, so a workload
+/// `gw-a-b` cannot collide with the `a -> b` gateway) and unambiguous between
+/// `a-b -> c` and `a -> b-c`, which a hyphen separator would conflate.
 fn gateway_name(run_id: &str, from: &str, to: &str) -> String {
-    format!("{run_id}-gw-{from}-{to}")
+    format!("{run_id}-gw-{from}_{to}")
 }
 
 /// The firewall-gateway container's image. At v0.3.0 (#113) the gateway is a
@@ -415,8 +421,9 @@ async fn provision(
 
     // Bring up one gateway container per gateway-mediated boundary (ADR-0011,
     // #113). It is dual-homed on the `from` and `to` segment networks and nothing
-    // else, so it is the sole L3 citizen of both and any future cross-segment path
-    // must pass through it. It is created on the `from` network via
+    // else, so by design it is the only container bridging the two segments and
+    // any future cross-segment path must pass through it. It is created on the
+    // `from` network via
     // networking_config (never the default bridge, which would re-add egress),
     // then connected to the `to` network; both are lab networks created
     // `internal: true`, so ADR-0006 layer 1 (egress-less) holds and the gateway
@@ -663,11 +670,15 @@ trait Prober {
 }
 
 /// Verify every declared-forbidden path is actually blocked, before any test
-/// runs (ADR-0011 step 4). For each boundary (an empty `allow` means the path
-/// is blocked, and a non-empty one is refused at build) and *every* workload in
-/// the `to` segment, a probe in the `from` segment must fail to reach the
-/// workload while a positive-control probe in the `to` segment reaches it, so a
-/// broken probe cannot read as isolation.
+/// runs (ADR-0011 step 4). For each boundary and *every* workload in the `to`
+/// segment, a probe in the `from` segment must fail to reach the workload while a
+/// positive-control probe in the `to` segment reaches it, so a broken probe
+/// cannot read as isolation. Every boundary is treated as fully forbidden here,
+/// a gateway-mediated one included: at v0.3.0 the gateway is a structural
+/// mediator that forwards nothing (#113), so its `to`-workloads are unreachable
+/// from `from` and the check passes. The port-level self-check, which must verify
+/// that a gateway's declared `allow` *is* reachable while everything else is not,
+/// is #114 and replaces this logic for a gateway boundary.
 ///
 /// `Ok(())` only when every declared boundary that has a `to`-workload is
 /// verified blocked. A reachable forbidden path is [`Error::BoundaryViolated`];
@@ -679,8 +690,8 @@ trait Prober {
 /// container name, which Docker's embedded DNS resolves only for peers on the
 /// same network, so it detects a workload wrongly attached to the `from` network
 /// (the MVP's all-or-nothing boundary) and needs no listener. It does not verify
-/// a routed or port-level boundary: the firewall gateway (ADR-0011, Phase 4 /
-/// v0.3.0) adds those and will need a TCP-to-port probe, not name-based ICMP.
+/// a routed or port-level boundary: that is the firewall gateway's own self-check
+/// (ADR-0011, #114), which will need a TCP-to-port probe, not name-based ICMP.
 ///
 /// The lab-wired runner gates on this before any test ([`run_in_running_lab`](crate::run_in_running_lab),
 /// #28): a failure is returned as `RunError::Lab` and no test runs. A caller that
@@ -2418,7 +2429,7 @@ impl RunningLab {
         &self.gateways
     }
 
-    /// Remove every container and network this lab created. The normal,
+    /// Remove every container, gateway, and network this lab created. The normal,
     /// error-surfacing teardown path.
     ///
     /// `torn_down` is set whether or not `remove_all` succeeded, but only once
@@ -2503,6 +2514,31 @@ mod tests {
                 command: Some(vec!["nc".to_owned(), "-l".to_owned()]),
             }),
             Some(vec!["nc".to_owned(), "-l".to_owned()])
+        );
+    }
+
+    /// Guard: `gateway_name` joins the segments with `_` so a gateway name is
+    /// disjoint from every workload container name and unambiguous between
+    /// `a-b -> c` and `a -> b-c`. This is the offline teeth for the naming (the
+    /// dual-home itself is Docker-gated): a workload `gw-a-b` and the `a -> b`
+    /// gateway must not take the same container name, and the two hyphenated
+    /// pairs must differ. Mutation: change the `_` separator back to `-` in
+    /// `gateway_name` -> the workload-collision assertion and the ambiguity
+    /// assertion both fail.
+    #[test]
+    fn gateway_name_is_disjoint_and_unambiguous() {
+        let run = "redstep-abc-0";
+        // A workload named like the gateway does not collide with it.
+        assert_ne!(
+            gateway_name(run, "a", "b"),
+            container_name(run, "gw-a-b"),
+            "a gateway name must not equal a workload container name"
+        );
+        // `a-b -> c` and `a -> b-c` are distinct gateways.
+        assert_ne!(
+            gateway_name(run, "a-b", "c"),
+            gateway_name(run, "a", "b-c"),
+            "hyphenated segment pairs must not be conflated"
         );
     }
 
