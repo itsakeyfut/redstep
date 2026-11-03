@@ -31,10 +31,10 @@ use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
-    HTTP_CMDI_VANTAGE, HTTP_IDOR_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE,
-    HTTP_SSTI_VANTAGE, LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE,
-    blast_radius_draft, blind_cmdi_exploit_from, http_witness_exploit_from, ssrf_exploit_from,
-    ssrf_token, tcp_reachable_from,
+    HTTP_CMDI_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, HTTP_SSTI_VANTAGE,
+    LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE, blast_radius_draft,
+    blind_cmdi_exploit_from, http_witness_exploit_from, idor_exploit_corroborated_from,
+    ssrf_exploit_from, ssrf_token, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -689,25 +689,41 @@ impl TestContext {
     /// parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and
     /// [`exploit_path_traversal_from_vantage`](Self::exploit_path_traversal_from_vantage)
-    /// and built on the same HTTP witness seam, differing in the capability name,
-    /// the diagnostic, and that it carries an identity in `request_headers` (the
-    /// attacker's own session or credential). `request_path` requests another user's
-    /// object by id, and `marker` is a value present only in that object, so its
-    /// appearance proves that object's body was served to this request. An exploit
-    /// is observed at `High`, a clean non-exploit at `High`, and an abnormal probe at
-    /// `Low` (ADR-0010, RK-002). The diagnostic is carried only when the object was
-    /// actually read (`observation.value`), like the siblings.
+    /// but run as a CORROBORATED PAIR (#71), because it carries an identity in
+    /// `request_headers` (the attacker's own session or credential) and a single
+    /// probe cannot tell a real "not exploitable" from a target that ignored the
+    /// identity. `victim_path` requests another user's object by id and
+    /// `victim_marker` is a value present only in that object, so its appearance
+    /// proves that object's body was served to this request. In the same run
+    /// `own_path`/`own_marker` are a positive control: the attacker reads their OWN
+    /// object, whose marker comes back only if the credential authenticated.
     ///
-    /// A confident "not exploitable" PASS here means only "this identity did not read
-    /// that object", NOT "the endpoint enforces ownership". If the target silently
-    /// ignores or rejects the credential and answers a marker-less 200 (not a
-    /// redirect), the probe never established that the identity took effect, yet it
-    /// reads `false`/`High`. So an IDOR check MUST be paired with a positive control:
-    /// a baseline read of the attacker's OWN object succeeding in the same run, which
-    /// proves the identity authenticated (the fix-replay loop test does exactly this).
-    /// Enforcing that corroboration inside the capability is deferred to a follow-up,
-    /// under ADR-0010's corroboration-deferred model that the sibling single-probe
-    /// checks also sit under.
+    /// A confident "not exploitable" PASS here means "this identity did not read that
+    /// object AND a read of the attacker's own object succeeded in the same run", NOT
+    /// merely the former. If the target ignores or rejects the credential and answers
+    /// a marker-less 200 (not a redirect), the own-object control also comes back
+    /// empty, so the result is `false`/`Low` (Inconclusive) rather than a confident
+    /// PASS: the probe did not establish that a read under this identity even worked
+    /// (CLAUDE.md row 6, ADR-0010). The control shows a read under this identity
+    /// SUCCEEDED; it does not by itself prove the credential was required (an endpoint
+    /// that serves the own object to anyone also passes it) nor that the victim
+    /// request was not separately blocked, so the PASS is scoped to this request, not
+    /// a proof the endpoint's access control is correct (see `docs/attacks/idor.md`;
+    /// the stronger negative control is a deferred follow-up). An exploit (the victim
+    /// marker came back) is `true`/`High` regardless of the control, since another
+    /// user's object leaving is broken access control whether or not the identity
+    /// took effect; the control probe is then skipped. A redirect or abnormal probe
+    /// is `Low`. The combination lives in `corroborate_idor`; the diagnostic is
+    /// carried only when the object was actually read (`observation.value`), like the
+    /// siblings.
+    ///
+    /// Evidence (ADR-0004): the returned [`Recorded`] links the judgement to the
+    /// victim draft, re-stamped to the corroborated confidence so no record
+    /// contradicts the verdict. On the non-exploit path the own-object control draft
+    /// is also appended, tagged `http_idor_control_vantage` (not the technique
+    /// capability) so a projection cannot read the benign self-read as a finding; it
+    /// is the fact that explains a downgrade. On the exploit path there is no control
+    /// draft.
     ///
     /// `request_headers` legitimately carries a credential (the attacker's token),
     /// and it is recorded VERBATIM in the evidence reproduction and the canonical
@@ -724,8 +740,10 @@ impl TestContext {
     pub async fn exploit_idor_from_vantage(
         &self,
         target: &ScopedTarget,
-        request_path: &str,
-        marker: &str,
+        victim_path: &str,
+        victim_marker: &str,
+        own_path: &str,
+        own_marker: &str,
         request_headers: &[(String, String)],
     ) -> Result<Recorded<bool>> {
         let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
@@ -735,22 +753,29 @@ impl TestContext {
         // The in-container gate: a Controlled HTTP attack (#44), confined by lab
         // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
         let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = http_witness_exploit_from(
+        let (observation, victim_draft, control_draft) = idor_exploit_corroborated_from(
             &binding.docker,
             &binding.vantage_network,
             target,
-            HTTP_IDOR_VANTAGE,
-            request_path,
-            marker,
+            victim_path,
+            victim_marker,
+            own_path,
+            own_marker,
             request_headers,
             DEFAULT_CONNECT_TIMEOUT,
             &cleared,
         )
         .await?;
-        let draft_ref = self.record_draft(draft);
+        // Victim first, so the returned ref is the judged finding; the own-object
+        // control is appended as a recorded fact when it ran (ADR-0004). On the
+        // exploit path the control is skipped, so there is no control draft.
+        let draft_ref = self.record_draft(victim_draft);
+        if let Some(control_draft) = control_draft {
+            self.record_draft(control_draft);
+        }
         // Only an object actually read across the boundary earns the diagnostic; its
         // text asserts another user's object was served, true iff observed.
-        let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(marker));
+        let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(victim_marker));
         Ok(Recorded {
             observation,
             draft_ref,
@@ -1963,6 +1988,8 @@ mod tests {
             &target,
             "/object?id=2",
             "REDSTEP_IDOR",
+            "/object?id=1",
+            "alice private note",
             &[("Authorization".to_owned(), "tok-alice".to_owned())],
         ));
         assert!(
