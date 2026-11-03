@@ -36,9 +36,14 @@ probe requests another user's object and reads `REDSTEP_IDOR_WITNESS_9C2E`, a va
 present only in that other user's row, from the response body. The mvp build serves
 any id with no ownership check; the fixed build serves the body only when the owner
 is the caller and otherwise returns a safe response without another user's data.
-`idor_check_flags_the_playground` proves the exploit, with a positive control that
-the user can still read their OWN object; `idor_fix_and_replay_closes_the_loop`
-replays the cross-user read not-exploitable against the fix
+The capability runs a same-run positive control as part of every check: the
+attacker also reads their OWN object, whose marker comes back only if the credential
+authenticated, so a confident "not exploitable" is licensed only when the identity
+is shown to have taken effect (`corroborate_idor`). `idor_check_flags_the_playground`
+proves the exploit and records both probes; `idor_without_an_effective_identity_reads_inconclusive`
+proves that an unmapped identity reads Inconclusive rather than a confident PASS;
+`idor_fix_and_replay_closes_the_loop` replays the cross-user read not-exploitable
+against the fix
 ([ADR-0022](../adr/0022-capture-a-success-witness-and-generate-a-pinned-replay.md)).
 
 ## What a verdict means
@@ -48,13 +53,17 @@ without an ownership check; the `idor_diagnostic` states exactly that and prescr
 an authorization check, and deliberately does NOT claim a credential was validated,
 because the observation is only that another user's object was returned
 ([ADR-0009](../adr/0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md)).
-A `Pass` (not-exploitable, High) means the other user's marker did not come back; a
-redirect or abnormal probe is `Inconclusive`
+A `Pass` (not-exploitable, High) means the other user's marker did not come back
+AND the same-run own-object control proved the identity took effect (the attacker's
+own object came back); a redirect or abnormal probe, or a control that did not come
+back, is `Inconclusive`
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
-A confident "not exploitable" does NOT prove access control holds: it proves this
-request did not return the marker, not that the identity on the request actually
-took effect (the endpoint may ignore identity entirely). Corroborating that the
-identity was applied is a deferred follow-up.
+So a confident "not exploitable" means this identity did not read that object and
+the identity was demonstrably applied: a target that silently ignores or rejects the
+credential and answers a marker-less 200 fails the control and reads Inconclusive,
+not a confident PASS (#71). It still does not prove access control is correct for
+every object or caller, only that this request did not cross the boundary with an
+identity that was in force.
 
 ## Confinement
 
