@@ -1436,6 +1436,16 @@ pub(crate) const NETWORK_SERVICE_DISCOVERY_VANTAGE: &str = "network_service_disc
 pub(crate) const BLAST_RADIUS_VANTAGE: &str = "blast_radius_vantage";
 pub(crate) const HTTP_PATH_TRAVERSAL_VANTAGE: &str = "http_path_traversal_vantage";
 pub(crate) const HTTP_IDOR_VANTAGE: &str = "http_idor_vantage";
+/// The IDOR own-object positive control (#71), NOT a technique of its own. The
+/// control probe (the attacker reads their own object) is recorded under this tag,
+/// distinct from `HTTP_IDOR_VANTAGE`, so a report or attack-graph projection that
+/// groups evidence by capability cannot read the benign self-read as a cross-user
+/// IDOR exploit: on a corroborated run the control draft is `observed: true`, and
+/// under the technique tag it would be indistinguishable from a finding. It names
+/// no catalog technique and is deliberately not a replayable witness
+/// (`parse_http_witness` fail-closes on it): a positive control is corroboration,
+/// not a success witness to pin.
+pub(crate) const HTTP_IDOR_CONTROL_VANTAGE: &str = "http_idor_control_vantage";
 pub(crate) const HTTP_CMDI_VANTAGE: &str = "http_cmdi_vantage";
 pub(crate) const HTTP_SSTI_VANTAGE: &str = "http_ssti_vantage";
 /// SSRF is on its own path, not the body-marker seam: its witness is out-of-band
@@ -1554,18 +1564,25 @@ pub(crate) async fn http_witness_exploit_from(
 /// licensed only when the control proves the carried identity took effect, because
 /// a target that silently ignores or rejects the token and answers a marker-less
 /// 200 would otherwise read as a confident PASS although the IDOR was never
-/// exercised (the row-6-adjacent false PASS of #71). The corroboration is specific
-/// to this identity-bearing technique; the sibling body-marker checks carry no
-/// identity, so this does not touch the shared [`http_witness_exploit_from`] /
+/// exercised (the false PASS of #71). The corroboration is specific to this
+/// identity-bearing technique; the sibling body-marker checks carry no identity, so
+/// this does not touch the shared [`http_witness_exploit_from`] /
 /// [`classify_witness_shared`] seam they all share (ADR-0010 keeps the general
 /// corroboration model deferred).
 ///
-/// Returns the corroborated observation and BOTH drafts, victim first. The victim
-/// draft is rebuilt from the CORROBORATED observation, not the raw victim probe's,
-/// so the record the finding links to carries the verdict's confidence and no
-/// projection can render a downgraded result as a confident clean. The
-/// control draft records the own-object probe as its own raw fact, an
-/// appended evidence row that explains why a downgrade happened.
+/// Both probe inputs are validated UP FRONT, before either probe is sent: a bad
+/// `own_path`/`own_marker` must not be discovered only after the victim request has
+/// already reached the target.
+///
+/// A positive victim witness (`true`/`High`) is an exploit regardless of the
+/// control, so the control probe is SKIPPED on that path: running it would be a
+/// wasted Controlled request that cannot change the verdict, and a probe/Docker
+/// error on it must not sink an already-witnessed exploit. The exploit returns one
+/// draft (the victim) and `None`. Otherwise the control runs and
+/// [`corroborate_idor_evidence`] combines the pair: it returns the corroborated
+/// observation, the victim draft re-stamped to that verdict, and the control draft
+/// tagged [`HTTP_IDOR_CONTROL_VANTAGE`] so a projection cannot read the benign
+/// self-read as a finding.
 // allow(too_many_arguments): the victim and own-object probe inputs plus the lab
 // handle, timeout, and clearance; reshaped with the seam it wraps in v0.4.0 (as
 // `http_witness_exploit_from`'s own note says), not grouped now.
@@ -1581,11 +1598,13 @@ pub(crate) async fn idor_exploit_corroborated_from(
     request_headers: &[(String, String)],
     timeout: Duration,
     cleared: &VantageCleared,
-) -> Result<(Observation<bool>, EvidenceDraft, EvidenceDraft)> {
-    // The victim probe. Its draft is discarded and rebuilt below from the
-    // corroborated observation; running the full seam still validates the request
-    // and classifies the probe.
-    let (victim_raw, _victim_draft_raw) = http_witness_exploit_from(
+) -> Result<(Observation<bool>, EvidenceDraft, Option<EvidenceDraft>)> {
+    // Validate BOTH probes' inputs before sending either, so an invalid control
+    // input is refused before the victim request touches the target.
+    validate_http_request(victim_path, victim_marker, request_headers)?;
+    validate_http_request(own_path, own_marker, request_headers)?;
+
+    let (victim_raw, victim_draft) = http_witness_exploit_from(
         docker,
         vantage,
         target,
@@ -1597,9 +1616,14 @@ pub(crate) async fn idor_exploit_corroborated_from(
         cleared,
     )
     .await?;
-    // The own-object positive control: the attacker reads their OWN object, whose
-    // `own_marker` comes back only if the credential authenticated. Its draft is
-    // kept verbatim as a recorded fact.
+    // An exploit passes through regardless of the control (another user's object
+    // came back), so do not run the control: it cannot change the verdict, and its
+    // failure must not sink the exploit.
+    if victim_raw.value {
+        return Ok((victim_raw, victim_draft, None));
+    }
+    // The own-object positive control: the attacker reads their OWN object, which
+    // comes back only if the read succeeded under this identity.
     let (control, control_draft) = http_witness_exploit_from(
         docker,
         vantage,
@@ -1612,22 +1636,66 @@ pub(crate) async fn idor_exploit_corroborated_from(
         cleared,
     )
     .await?;
-    let observation = corroborate_idor(victim_raw, &control);
-    // Rebuild the victim draft from the corroborated observation (the same
-    // `applied`/`spec` the seam derives), so it mirrors the verdict.
-    let applied = Duration::from_secs(timeout.as_secs().max(1));
-    let spec = format!("{}:{}", target.host(), target.port());
-    let victim_draft = http_witness_draft(
-        HTTP_IDOR_VANTAGE,
-        vantage.segment(),
-        spec,
-        victim_path,
+    let (observation, victim_draft, control_draft) = corroborate_idor_evidence(
+        victim_raw,
+        &control,
+        victim_draft,
+        control_draft,
         victim_marker,
-        request_headers,
-        &observation,
-        applied,
     );
-    Ok((observation, victim_draft, control_draft))
+    Ok((observation, victim_draft, Some(control_draft)))
+}
+
+/// Combine the victim probe with its own-object control into the observation the
+/// oracle judges and the two evidence rows that back it. Pure, so the whole
+/// combination is unit-tested without Docker (`corroborate_idor_evidence_*`): the
+/// wiring that feeds the control into [`corroborate_idor`], re-stamps the victim
+/// draft to the corroborated verdict, and tags the control row is otherwise
+/// exercised only by the Docker-gated tests, and a self-skip reports `ok`.
+///
+/// The `victim_draft` arrives built from the RAW victim observation (by
+/// [`http_witness_draft`], reusing its `applied`/`target` derivation so this does
+/// not duplicate the seam's). It is re-stamped to the corroborated observation so
+/// the record the finding links to carries the verdict's confidence, and its
+/// summary states the real cause of an Inconclusive: a clean victim probe
+/// downgraded because the control did not corroborate reads as that, not as "the
+/// probe did not complete cleanly" (which would misattribute the cause to an
+/// abnormal probe). The `control_draft` is re-tagged [`HTTP_IDOR_CONTROL_VANTAGE`]
+/// (both the draft and its reproduction) so no capability-keyed projection reads
+/// the benign self-read as a cross-user IDOR finding.
+///
+/// Only called when the victim is NOT an exploit (the exploit path skips the
+/// control), so `victim_raw.value` is `false` here.
+fn corroborate_idor_evidence(
+    victim_raw: Observation<bool>,
+    control: &Observation<bool>,
+    mut victim_draft: EvidenceDraft,
+    mut control_draft: EvidenceDraft,
+    victim_marker: &str,
+) -> (Observation<bool>, EvidenceDraft, EvidenceDraft) {
+    let victim_was_clean = victim_raw.confidence == Confidence::High;
+    let observation = corroborate_idor(victim_raw, control);
+
+    victim_draft.observed = serde_json::Value::Bool(observation.value);
+    victim_draft.confidence = observation.confidence;
+    victim_draft.summary = if observation.confidence == Confidence::High {
+        format!(
+            "the response did not carry the marker {victim_marker:?}; this request did not exploit it"
+        )
+    } else if victim_was_clean {
+        // The victim probe completed cleanly (a marker-less 200); the Inconclusive
+        // is the failed corroboration, not an abnormal probe.
+        format!(
+            "the response did not carry the marker {victim_marker:?}, but the own-object control did not confirm the identity took effect; the result is inconclusive"
+        )
+    } else {
+        "the probe did not complete cleanly; the result is inconclusive".to_owned()
+    };
+
+    control_draft.capability = HTTP_IDOR_CONTROL_VANTAGE;
+    control_draft.reproduction.capability = HTTP_IDOR_CONTROL_VANTAGE.to_owned();
+
+    (observation, victim_draft, control_draft)
 }
 
 /// Validate an HTTP witness probe's inputs before it runs, fail-closed. A crafted
@@ -1882,6 +1950,15 @@ fn classify_http_witness(
 ///
 /// Pure, so the whole mapping is unit-tested without Docker (`corroborate_idor_*`),
 /// the off-Docker guard the Docker-gated wiring test cannot be.
+///
+/// The two `== Confidence::High` checks are defensive, not reachable today:
+/// [`classify_witness_shared`] never emits a `true` value below `High`, so
+/// `control.value` already implies `High`, and a `false` victim is returned
+/// unchanged whether it is `High` or `Low`. They are kept so that if that invariant
+/// ever changes (a classifier that yields a low-confidence positive), a confident
+/// PASS still cannot be built from a low-confidence control; the unit test exercises
+/// the `low(true)` control to pin the intended behaviour even though it is
+/// unreachable input now.
 fn corroborate_idor(victim: Observation<bool>, control: &Observation<bool>) -> Observation<bool> {
     if victim.value {
         return victim;
@@ -6848,16 +6925,15 @@ mod tests {
     /// native IDOR check verdicts `Fail` against the vulnerable playground api and
     /// the `Fail` carries the ADR-0009 IDOR diagnostic (#64 AC 1). alice (her token
     /// in the `Authorization` header) requesting bob's object id witnesses bob's
-    /// marker; the same corroborated call also reads alice's OWN object (a different
-    /// object and marker), so the two recorded drafts are a real differential rather
-    /// than a constant-true probe (#71). Mutation: add the ownership check to the api
-    /// `serve_object` (the fix) -> alice no longer reads bob's object -> the verdict
-    /// assertion fails; swap the two `record_draft` calls in `exploit_idor_from_vantage`
-    /// so the control is recorded first -> `drafts[0]`'s request path is no longer
-    /// `IDOR_VICTIM_OBJECT` -> the per-draft path assertion fails, since the rows
-    /// are pinned to their own probe rather than linked only by position. The
-    /// draft-mirrors-observation check guards that each row's observed value and
-    /// confidence match what that probe saw.
+    /// marker. Because the victim read is an exploit, the own-object control is
+    /// skipped and exactly one draft (the victim finding) is recorded, pinned to the
+    /// victim probe's own path and marker (#71). Mutation: add the ownership check to
+    /// the api `serve_object` (the fix) -> alice no longer reads bob's object -> the
+    /// verdict assertion fails. Change the victim draft's recorded path to
+    /// `IDOR_OWN_OBJECT` -> the per-draft path assertion fails, since the row is
+    /// pinned to the victim probe rather than any request. The
+    /// draft-mirrors-observation check guards that the row's observed value and
+    /// confidence match what the probe saw.
     #[test]
     fn idor_check_flags_the_playground() {
         if !linux_docker_available() {
@@ -6945,17 +7021,15 @@ mod tests {
                 "the domain remediation names the authorization check: {:?}",
                 diagnostic.remediation
             );
-            // Both probes are recorded, victim first then the own-object control
-            // (ADR-0004). Each draft mirrors its own observation and is tagged as
-            // the IDOR capability; asserting the per-draft request path and marker
-            // pins the victim and control rows to their own probe rather than
-            // linking them only by position. The differential (the victim marker is
-            // not a constant-true probe) is that the two rows carry DIFFERENT objects
-            // and markers, both observed true against the vulnerable api.
+            // The victim probe is an exploit here, so the control is skipped and only
+            // ONE draft is recorded: the victim finding, under the IDOR technique
+            // capability, mirroring the observation and pinned to the victim probe's
+            // own path and marker (so it is not a constant-true projection of a
+            // different request).
             assert_eq!(
                 drafts.len(),
-                2,
-                "the victim probe and the own-object control are both recorded"
+                1,
+                "an exploit records only the victim finding; the control is skipped"
             );
             assert_eq!(drafts[0].capability, "http_idor_vantage");
             assert_eq!(drafts[0].observed, serde_json::Value::Bool(observed));
@@ -6971,17 +7045,6 @@ mod tests {
                 IDOR_VICTIM_OBJECT
             );
             assert_eq!(drafts[0].reproduction.params["marker"], IDOR_WITNESS);
-            assert_eq!(drafts[1].capability, "http_idor_vantage");
-            assert_eq!(
-                drafts[1].observed,
-                serde_json::Value::Bool(true),
-                "the own-object control reads alice's own object: the identity took effect"
-            );
-            assert_eq!(
-                drafts[1].reproduction.params["request_path"],
-                IDOR_OWN_OBJECT
-            );
-            assert_eq!(drafts[1].reproduction.params["marker"], IDOR_OWN_BODY);
         });
     }
 
@@ -6994,10 +7057,10 @@ mod tests {
     /// `Pass` against the fixed lab. The labs differ only in the api image, so the
     /// difference is the fix.
     ///
-    /// The corroborated check's OWN own-object control (#71) probes alice's object on
-    /// the fixed lab and requires her body back, so it distinguishes a working
-    /// endpoint from a "fix" that denied every request (which would satisfy "the IDOR
-    /// is closed" just as well); `drafts[1]` is that control. Taking the
+    /// The check's built-in own-object control (#71) probes alice's object on the
+    /// fixed lab and requires her body back, so it distinguishes a working endpoint
+    /// from a "fix" that denied every request (which would satisfy "the IDOR is
+    /// closed" just as well); `drafts[1]` is that control. Taking the
     /// replayed witness from the recorder round-trips it through `parse_http_witness`,
     /// identity headers included, so a replay that rejected what the seam writes would
     /// `Err`.
@@ -7124,13 +7187,19 @@ mod tests {
                 "the fixed not-exploitable is a confident clean, not an abnormal Low"
             );
             // The internal own-object control (drafts[1]) reads alice's own object
-            // back, so the identity took effect and the fix is a working endpoint,
-            // not a deny-all; this corroboration is what lets the victim negative read
-            // confidently (false/High) rather than Inconclusive (#71).
+            // back, so a read under this identity succeeded and the fix is a working
+            // endpoint, not a deny-all; this corroboration is what lets the victim
+            // negative read confidently (false/High) rather than Inconclusive (#71).
+            // It is tagged as the CONTROL capability, not the IDOR technique, so a
+            // projection cannot read this benign self-read as a finding.
+            assert_eq!(
+                drafts[1].capability, HTTP_IDOR_CONTROL_VANTAGE,
+                "the own-object control is recorded as the control capability, not an IDOR exploit row"
+            );
             assert_eq!(
                 drafts[1].observed,
                 serde_json::Value::Bool(true),
-                "the own-object control reads alice's own object on the fixed lab: the identity took effect, so the fix is a working endpoint"
+                "the own-object control reads alice's own object on the fixed lab: the read under this identity succeeded, so the fix is a working endpoint"
             );
             assert_eq!(
                 drafts[1].confidence,
@@ -7153,23 +7222,21 @@ mod tests {
     /// Guard (Docker; self-skips without a daemon or `redstep/api:fixed` + the db):
     /// the corroboration wiring (#71). Against the ownership-checking `fixed` api an
     /// UNMAPPED token makes every `/object` read DENIED (a marker-less 200), the
-    /// stand-in for a target that ignores or rejects the carried identity. The victim
+    /// stand-in for a target that rejects the carried identity. The victim
     /// read carries no marker (it would be `false`/`High` on its own), but the
-    /// same-run own-object control also comes back marker-less, so the identity is not
-    /// shown to have taken effect and the check reads `false`/`Low` (Inconclusive),
-    /// NOT a confident PASS: the row-6-adjacent false PASS of #71. With a VALID token
+    /// same-run own-object control also comes back marker-less, so no read under this
+    /// identity succeeded and the check reads `false`/`Low` (Inconclusive),
+    /// NOT a confident PASS: the false PASS of #71. With a VALID token
     /// the own-object control returns alice's body, so the identical victim negative
     /// reads `false`/`High` (confident). The two differ only in the token, so the
     /// difference is the corroboration.
     ///
-    /// This is the live-wiring face of `corroborate_idor_*` (the off-Docker guard):
-    /// it pins that `exploit_idor_from_vantage` actually runs the control probe and
-    /// feeds it to the combinator. Mutation: drop the control from
-    /// `idor_exploit_corroborated_from` (return the raw victim observation) -> the
-    /// unmapped-token case reads a confident PASS -> the `Confidence::Low` assertion
-    /// fails. Build the victim draft from the raw observation rather than the
-    /// corroborated one -> `drafts[0]` reads `High` while the verdict is `Low` -> the
-    /// draft-mirror assertion fails.
+    /// This is the live-wiring face of the off-Docker `corroborate_idor_*` and
+    /// `corroborate_idor_evidence_*` guards: it pins that `exploit_idor_from_vantage`
+    /// actually runs the control probe. Mutation: skip the control probe in
+    /// `idor_exploit_corroborated_from` for the non-exploit path (keep the raw victim
+    /// observation) -> the unmapped-token case reads a confident PASS -> the
+    /// `Confidence::Low` assertion fails.
     #[test]
     fn idor_without_an_effective_identity_reads_inconclusive() {
         if !linux_docker_available() {
@@ -7237,8 +7304,10 @@ mod tests {
                 )
                 .await
                 .expect("the corroborated IDOR check ran");
-            // drafts[0] is the uncorroborated victim probe; [1] its control, then the
-            // corroborated pair.
+            // Two non-exploit calls, each recording a victim draft then a control
+            // draft, so the store is [unmapped victim, unmapped control, valid victim,
+            // valid control]. drafts[0] is the unmapped call's victim draft, re-stamped
+            // to the corroborated verdict.
             let drafts = ctx.take_evidence_drafts();
             let _ = lab.teardown().await;
 
@@ -7260,6 +7329,11 @@ mod tests {
                 "the victim draft carries the corroborated Low, not the raw probe's High"
             );
             assert_eq!(drafts[0].observed, serde_json::Value::Bool(false));
+            // The control row is tagged as the control capability (not the IDOR
+            // technique) and came back empty, so no projection reads it as a finding
+            // and it is the fact that explains the downgrade.
+            assert_eq!(drafts[1].capability, HTTP_IDOR_CONTROL_VANTAGE);
+            assert_eq!(drafts[1].observed, serde_json::Value::Bool(false));
             assert!(!effective.observation.value);
             assert_eq!(
                 effective.observation.confidence,
@@ -7496,6 +7570,89 @@ mod tests {
         let abnormal = corroborate_idor(low(false), &high(true));
         assert!(!abnormal.value);
         assert_eq!(abnormal.confidence, Confidence::Low);
+    }
+
+    /// Guard (#71): `corroborate_idor_evidence` re-stamps the victim draft to the
+    /// corroborated verdict and tags the control draft so it cannot be read as a
+    /// finding. This is the off-Docker guard for the evidence wiring that the
+    /// Docker-gated tests otherwise cover: a self-skip reports `ok`, so without this
+    /// a regression in the draft construction ships green.
+    ///
+    /// Mutations:
+    /// - feed the victim draft the raw observation instead of the corroborated one
+    ///   (stamp `victim_raw` fields) -> the downgrade case's draft reads `High` while
+    ///   the verdict is `Low` -> the confidence assertion fails (the RK-002-class
+    ///   record-label contradiction);
+    /// - leave the control draft under `HTTP_IDOR_VANTAGE` (drop the re-tag) -> the
+    ///   control capability assertion fails;
+    /// - leave the downgraded summary as the confidence-keyed "did not complete
+    ///   cleanly" -> the summary-cause assertion fails.
+    #[test]
+    fn corroborate_idor_evidence_restamps_the_victim_and_tags_the_control() {
+        let obs = |value, confidence| Observation { value, confidence };
+        let headers: [(String, String); 0] = [];
+        // Realistic drafts as the seam would build them, both under the technique
+        // capability, from each probe's own raw observation.
+        let make = |path: &str, marker: &str, o: &Observation<bool>| {
+            http_witness_draft(
+                HTTP_IDOR_VANTAGE,
+                "lab",
+                "api:8081".to_owned(),
+                path,
+                marker,
+                &headers,
+                o,
+                Duration::from_secs(5),
+            )
+        };
+
+        // Downgrade: the victim probe was clean (false/High), the control failed
+        // (own object not read). The victim draft must be re-stamped to false/Low,
+        // and its summary must name the real cause (not "did not complete cleanly").
+        let victim_raw = obs(false, Confidence::High);
+        let control = obs(false, Confidence::High);
+        let victim_draft = make("/object?id=2", "VICTIM", &victim_raw);
+        let control_draft = make("/object?id=1", "OWN", &control);
+        let (observation, victim, control_row) =
+            corroborate_idor_evidence(victim_raw, &control, victim_draft, control_draft, "VICTIM");
+        assert!(!observation.value);
+        assert_eq!(observation.confidence, Confidence::Low);
+        assert_eq!(victim.observed, serde_json::Value::Bool(false));
+        assert_eq!(
+            victim.confidence,
+            Confidence::Low,
+            "the victim draft is re-stamped to the corroborated Low, not the raw High"
+        );
+        assert!(
+            victim.summary.contains("did not confirm the identity")
+                && !victim.summary.contains("did not complete cleanly"),
+            "the downgrade summary names the failed corroboration, not an abnormal probe: {:?}",
+            victim.summary
+        );
+        assert_eq!(
+            control_row.capability, HTTP_IDOR_CONTROL_VANTAGE,
+            "the control row is tagged as the control capability, not the IDOR technique"
+        );
+        assert_eq!(
+            control_row.reproduction.capability, HTTP_IDOR_CONTROL_VANTAGE,
+            "the control reproduction is tagged too, so a replay cannot reconstruct it as an IDOR finding"
+        );
+
+        // Corroborated clean: victim false/High, control true/High -> the victim draft
+        // stays false/High and reads as a clean negative, not the downgrade wording.
+        let victim_raw = obs(false, Confidence::High);
+        let control = obs(true, Confidence::High);
+        let victim_draft = make("/object?id=2", "VICTIM", &victim_raw);
+        let control_draft = make("/object?id=1", "OWN", &control);
+        let (observation, victim, _control_row) =
+            corroborate_idor_evidence(victim_raw, &control, victim_draft, control_draft, "VICTIM");
+        assert_eq!(observation.confidence, Confidence::High);
+        assert!(
+            victim.summary.contains("did not exploit it")
+                && !victim.summary.contains("did not confirm the identity"),
+            "a corroborated clean negative reads as a clean negative: {:?}",
+            victim.summary
+        );
     }
 
     /// Guard: `validate_ssrf_token` fails closed on a token that is empty, too

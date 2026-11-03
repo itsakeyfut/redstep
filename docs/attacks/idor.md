@@ -36,12 +36,17 @@ probe requests another user's object and reads `REDSTEP_IDOR_WITNESS_9C2E`, a va
 present only in that other user's row, from the response body. The mvp build serves
 any id with no ownership check; the fixed build serves the body only when the owner
 is the caller and otherwise returns a safe response without another user's data.
-The capability runs a same-run positive control as part of every check: the
-attacker also reads their OWN object, whose marker comes back only if the credential
-authenticated, so a confident "not exploitable" is licensed only when the identity
-is shown to have taken effect (`corroborate_idor`). `idor_check_flags_the_playground`
-proves the exploit and records both probes; `idor_without_an_effective_identity_reads_inconclusive`
-proves that an unmapped identity reads Inconclusive rather than a confident PASS;
+When the cross-user read is NOT an exploit, the capability runs a same-run positive
+control: the attacker also reads their OWN object, which comes back only if a read
+under this identity succeeded, so a confident "not exploitable" is licensed only
+when the control succeeds (`corroborate_idor`). The control probe is recorded under
+a distinct capability, `http_idor_control_vantage`, so a projection that groups
+evidence by capability cannot read the benign self-read as a cross-user finding; it
+is corroboration, not a technique, and is not a replayable witness. When the victim
+read IS an exploit, the control is skipped (it cannot change the verdict) and only
+the victim finding is recorded. `idor_check_flags_the_playground` proves the
+exploit; `idor_without_an_effective_identity_reads_inconclusive` proves that a
+rejected identity reads Inconclusive rather than a confident PASS;
 `idor_fix_and_replay_closes_the_loop` replays the cross-user read not-exploitable
 against the fix
 ([ADR-0022](../adr/0022-capture-a-success-witness-and-generate-a-pinned-replay.md)).
@@ -54,16 +59,23 @@ an authorization check, and deliberately does NOT claim a credential was validat
 because the observation is only that another user's object was returned
 ([ADR-0009](../adr/0009-emit-an-executable-rustc-style-fail-diagnostic-from-the-oracle.md)).
 A `Pass` (not-exploitable, High) means the other user's marker did not come back
-AND the same-run own-object control proved the identity took effect (the attacker's
-own object came back); a redirect or abnormal probe, or a control that did not come
-back, is `Inconclusive`
+AND the same-run own-object control succeeded (the attacker's own object came back);
+a redirect or abnormal probe, or a control that did not come back, is `Inconclusive`
 ([ADR-0010](../adr/0010-separate-observation-from-verdict-and-default-to-high-confidence.md)).
-So a confident "not exploitable" means this identity did not read that object and
-the identity was demonstrably applied: a target that silently ignores or rejects the
-credential and answers a marker-less 200 fails the control and reads Inconclusive,
-not a confident PASS (#71). It still does not prove access control is correct for
-every object or caller, only that this request did not cross the boundary with an
-identity that was in force.
+So a confident "not exploitable" means this identity did not read that object and a
+read under this identity did succeed in the same run: a target that ignores or
+rejects the credential and answers a marker-less 200 fails the control and reads
+Inconclusive, not a confident PASS (#71).
+
+The control establishes that a read under this identity worked; it does NOT by
+itself prove the credential was required (an endpoint that serves the own object to
+anyone also passes it), nor that the victim request was not separately blocked (a
+WAF or rate-limiter answering the suspicious request with a marker-less 200 would
+read not-exploitable while the benign own-object read still succeeds). A stronger
+corroboration, a matched negative control that reads the own object WITHOUT the
+credential and confirms it is denied, is a deferred follow-up under ADR-0010's
+corroboration model. So a `Pass` is scoped to this request: it does not prove access
+control is correct for every object or caller.
 
 ## Confinement
 

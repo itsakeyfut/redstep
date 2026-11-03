@@ -699,21 +699,31 @@ impl TestContext {
     /// object, whose marker comes back only if the credential authenticated.
     ///
     /// A confident "not exploitable" PASS here means "this identity did not read that
-    /// object AND the identity demonstrably took effect", NOT merely the former. If
-    /// the target silently ignores or rejects the credential and answers a
-    /// marker-less 200 (not a redirect), the own-object control fails, so the result
-    /// is `false`/`Low` (Inconclusive) rather than a confident PASS: the probe never
-    /// established that the identity was applied (CLAUDE.md row 6, ADR-0010). An
-    /// exploit (the victim marker came back) is `true`/`High` regardless of the
-    /// control, since another user's object leaving is broken access control whether
-    /// or not the identity took effect. A redirect or abnormal probe is `Low`. The
-    /// combination lives in `corroborate_idor`; the diagnostic is carried only when
-    /// the object was actually read (`observation.value`), like the siblings.
+    /// object AND a read of the attacker's own object succeeded in the same run", NOT
+    /// merely the former. If the target ignores or rejects the credential and answers
+    /// a marker-less 200 (not a redirect), the own-object control also comes back
+    /// empty, so the result is `false`/`Low` (Inconclusive) rather than a confident
+    /// PASS: the probe did not establish that a read under this identity even worked
+    /// (CLAUDE.md row 6, ADR-0010). The control shows a read under this identity
+    /// SUCCEEDED; it does not by itself prove the credential was required (an endpoint
+    /// that serves the own object to anyone also passes it) nor that the victim
+    /// request was not separately blocked, so the PASS is scoped to this request, not
+    /// a proof the endpoint's access control is correct (see `docs/attacks/idor.md`;
+    /// the stronger negative control is a deferred follow-up). An exploit (the victim
+    /// marker came back) is `true`/`High` regardless of the control, since another
+    /// user's object leaving is broken access control whether or not the identity
+    /// took effect; the control probe is then skipped. A redirect or abnormal probe
+    /// is `Low`. The combination lives in `corroborate_idor`; the diagnostic is
+    /// carried only when the object was actually read (`observation.value`), like the
+    /// siblings.
     ///
-    /// Both probes are recorded (ADR-0004): the returned [`Recorded`] links the
-    /// judgement to the victim draft, which carries the corroborated confidence so no
-    /// record contradicts the verdict; the own-object control draft is
-    /// appended as the fact that explains a downgrade.
+    /// Evidence (ADR-0004): the returned [`Recorded`] links the judgement to the
+    /// victim draft, re-stamped to the corroborated confidence so no record
+    /// contradicts the verdict. On the non-exploit path the own-object control draft
+    /// is also appended, tagged `http_idor_control_vantage` (not the technique
+    /// capability) so a projection cannot read the benign self-read as a finding; it
+    /// is the fact that explains a downgrade. On the exploit path there is no control
+    /// draft.
     ///
     /// `request_headers` legitimately carries a credential (the attacker's token),
     /// and it is recorded VERBATIM in the evidence reproduction and the canonical
@@ -757,9 +767,12 @@ impl TestContext {
         )
         .await?;
         // Victim first, so the returned ref is the judged finding; the own-object
-        // control is appended as a recorded fact (ADR-0004).
+        // control is appended as a recorded fact when it ran (ADR-0004). On the
+        // exploit path the control is skipped, so there is no control draft.
         let draft_ref = self.record_draft(victim_draft);
-        self.record_draft(control_draft);
+        if let Some(control_draft) = control_draft {
+            self.record_draft(control_draft);
+        }
         // Only an object actually read across the boundary earns the diagnostic; its
         // text asserts another user's object was served, true iff observed.
         let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(victim_marker));
