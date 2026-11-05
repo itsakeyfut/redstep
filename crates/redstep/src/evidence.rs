@@ -82,7 +82,21 @@ pub enum NodeRef {
 /// its parent record. `params` is the capability-specific input, kept neutral as
 /// a JSON value (for `TcpConnect`, `{"timeout_ms": N}`; for the vantage probe,
 /// also `"vantage_segment"`, the stable segment a replay probes from).
+///
+/// `#[non_exhaustive]`, so external code must build it with [`Reproduction::new`]
+/// rather than a struct literal, and a later field addition does not break an
+/// external caller (#43). An external struct literal does not compile (mutation:
+/// remove `#[non_exhaustive]` and it does):
+///
+/// ```compile_fail
+/// let _ = redstep::Reproduction {
+///     capability: "tcp_connect".to_owned(),
+///     target: "db:5432".to_owned(),
+///     params: serde_json::json!({}),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Reproduction {
     /// The capability to re-run, e.g. `"tcp_connect"`.
     pub capability: String,
@@ -92,11 +106,48 @@ pub struct Reproduction {
     pub params: serde_json::Value,
 }
 
+impl Reproduction {
+    /// Build a reproduction. The constructor (not a struct literal) is what lets
+    /// [`Reproduction`] be `#[non_exhaustive]`, so a field addition stays
+    /// non-breaking for an external caller (#43).
+    pub fn new(
+        capability: impl Into<String>,
+        target: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Self {
+        Self {
+            capability: capability.into(),
+            target: target.into(),
+            params,
+        }
+    }
+}
+
 /// What one capability execution produces, before the store gives it an identity:
 /// a pure, deterministic value with no id and no timestamp. The capability erases
 /// its own observed value to a `serde_json::Value` (it knows the type), so the
 /// draft is capability-neutral.
+///
+/// `#[non_exhaustive]`, so external code must build it with [`EvidenceDraft::new`]
+/// (plus [`with_source`](EvidenceDraft::with_source) for a vantage record) rather
+/// than a struct literal, and a later field addition (ADR-0004's deferred
+/// `artifacts`) does not break an external caller (#43). An external struct literal
+/// does not compile (mutation: remove `#[non_exhaustive]` and it does):
+///
+/// ```compile_fail
+/// let _ = redstep::EvidenceDraft {
+///     capability: "tcp_connect",
+///     target: "db:5432".to_owned(),
+///     intensity: redstep::Intensity::Safe,
+///     observed: serde_json::json!(false),
+///     confidence: redstep::Confidence::High,
+///     summary: "unreachable".to_owned(),
+///     source: None,
+///     reproduction: redstep::Reproduction::new("tcp_connect", "db:5432", serde_json::json!({})),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EvidenceDraft {
     /// The capability that produced it, e.g. `"tcp_connect"`.
     pub capability: &'static str,
@@ -119,6 +170,42 @@ pub struct EvidenceDraft {
     pub source: Option<NodeRef>,
     /// Enough to re-run the action.
     pub reproduction: Reproduction,
+}
+
+impl EvidenceDraft {
+    /// Build a draft with no attack-graph `source` (a host-run native record). A
+    /// probe run from the attacker's vantage adds one with
+    /// [`with_source`](Self::with_source). The constructor (not a struct literal) is
+    /// what lets [`EvidenceDraft`] be `#[non_exhaustive]`: a later optional field
+    /// (ADR-0004's `artifacts`) defaults here, so adding it does not break a caller
+    /// (#43).
+    pub fn new(
+        capability: &'static str,
+        target: impl Into<String>,
+        intensity: Intensity,
+        observed: serde_json::Value,
+        confidence: Confidence,
+        summary: impl Into<String>,
+        reproduction: Reproduction,
+    ) -> Self {
+        Self {
+            capability,
+            target: target.into(),
+            intensity,
+            observed,
+            confidence,
+            summary: summary.into(),
+            source: None,
+            reproduction,
+        }
+    }
+
+    /// Attribute the draft to the attack-graph node the action ran from (a vantage
+    /// probe, #27/#29): sets `source` to `Some(source)`.
+    pub fn with_source(mut self, source: NodeRef) -> Self {
+        self.source = Some(source);
+        self
+    }
 }
 
 /// The immutable record the store holds: an [`EvidenceDraft`] the store has given

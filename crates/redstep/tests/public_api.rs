@@ -263,3 +263,34 @@ fn public_api_items_are_reachable() {
     let target = ctx.resolve("web:80").expect("web:80 is allowed");
     let _: &str = target.host();
 }
+
+/// Guard: an `EvidenceDraft` (and its `Reproduction`) is constructible from outside
+/// the crate through the constructor, not a struct literal (#43). Both are
+/// `#[non_exhaustive]`, so an external struct literal is rejected (the `compile_fail`
+/// doctests on those types pin that), and a later field addition does not break this
+/// call. Mutation: drop a required argument from `EvidenceDraft::new` or
+/// `Reproduction::new` -> this external test crate no longer compiles (row 1).
+#[test]
+fn an_evidence_draft_is_constructible_externally_via_the_constructor() {
+    let draft = redstep::EvidenceDraft::new(
+        "tcp_connect",
+        "db:5432",
+        redstep::Intensity::Safe,
+        serde_json::json!(false),
+        redstep::Confidence::High,
+        "unreachable",
+        redstep::Reproduction::new(
+            "tcp_connect",
+            "db:5432",
+            serde_json::json!({ "timeout_ms": 2000 }),
+        ),
+    )
+    .with_source(redstep::NodeRef::Vantage {
+        segment: "internal".to_owned(),
+    });
+    assert_eq!(draft.capability, "tcp_connect");
+    assert!(matches!(
+        draft.source,
+        Some(redstep::NodeRef::Vantage { .. })
+    ));
+}

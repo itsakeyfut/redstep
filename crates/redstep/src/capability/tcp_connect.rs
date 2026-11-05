@@ -183,22 +183,22 @@ fn build_draft(
     outcome: ConnectOutcome,
     observation: &Observation<bool>,
 ) -> EvidenceDraft {
-    EvidenceDraft {
+    // No attack-graph source: this is a host-run connect, and the host is not a
+    // lab node (ADR-0004), so `new` leaves `source` as `None`. The vantage path
+    // records one with `with_source` (#27, #29).
+    EvidenceDraft::new(
         capability,
-        target: target.clone(),
+        target.clone(),
         intensity,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
-        summary: connect_summary(outcome).to_owned(),
-        // No attack-graph source: this is a host-run connect, and the host is
-        // not a lab node (ADR-0004). The vantage path records one (#27, #29).
-        source: None,
-        reproduction: Reproduction {
-            capability: capability.to_owned(),
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
+        connect_summary(outcome),
+        Reproduction::new(
+            capability,
             target,
-            params: serde_json::json!({ "timeout_ms": timeout.as_millis() as u64 }),
-        },
-    }
+            serde_json::json!({ "timeout_ms": timeout.as_millis() as u64 }),
+        ),
+    )
 }
 
 #[cfg(test)]
