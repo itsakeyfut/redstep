@@ -1834,6 +1834,27 @@ fn response_was_redirected(headers: &str) -> bool {
     })
 }
 
+/// The three fail-closed-mapping inputs, as a named-field parameter object so a
+/// caller cannot pass them in the wrong order (#104). They were three adjacent
+/// `bool`s, which the compiler could not tell apart, so a swap at a call site
+/// compiled clean and could flip a verdict (a redirect read as a witness, or the
+/// inverse). A named-field struct has no positional form - `WitnessSignal(a, b, c)`
+/// is `E0423` - so every construction names its fields and there is no order to get
+/// wrong. The fields are still bare `bool`s, so a mis-NAMED value is not caught here
+/// (type-separating the value sources, e.g. `response_was_redirected -> Redirected`,
+/// is the v0.4.0 probe-inputs reshape); this closes the positional-swap class.
+struct WitnessSignal {
+    /// The success signal: a marker in the probe's own body (in-band) or a per-probe
+    /// token in the canary's logs (out-of-band).
+    witnessed: bool,
+    /// The probe followed a 3xx redirect ([`response_was_redirected`]).
+    redirected: bool,
+    /// The witness is provably the scoped target's independent of the probe's own
+    /// response (an out-of-band canary token is; a body marker is not). See
+    /// [`classify_witness_shared`].
+    attributable: bool,
+}
+
 /// The one fail-closed witness mapping, shared by every technique whether its
 /// success signal is in-band (a marker in the probe's own body) or out-of-band (a
 /// per-probe token at a canary). `witnessed` is that signal, already reduced to a
@@ -1870,12 +1891,12 @@ fn response_was_redirected(headers: &str) -> bool {
 /// routing is a convention the callers keep, not a property the compiler holds (a
 /// new caller could still skip it); the mapping itself is pinned both ways by
 /// `classify_witness_shared_maps_fail_closed`.
-fn classify_witness_shared(
-    state: &ContainerState,
-    witnessed: bool,
-    redirected: bool,
-    attributable: bool,
-) -> Observation<bool> {
+fn classify_witness_shared(state: &ContainerState, signal: WitnessSignal) -> Observation<bool> {
+    let WitnessSignal {
+        witnessed,
+        redirected,
+        attributable,
+    } = signal;
     // An attributable witness (an out-of-band per-probe token found in the
     // canary's own logs) on a probe that did NOT follow a redirect proves the
     // target acted: with no redirect for the probe to follow, the only way the
@@ -1931,7 +1952,14 @@ fn classify_http_witness(
 ) -> Observation<bool> {
     // A body marker is not attributable: on a redirect the body may be another
     // host's, so the downgrade must still apply even when the marker is present.
-    classify_witness_shared(state, body.contains(marker), redirected, false)
+    classify_witness_shared(
+        state,
+        WitnessSignal {
+            witnessed: body.contains(marker),
+            redirected,
+            attributable: false,
+        },
+    )
 }
 
 /// Combine the IDOR victim probe with its same-run own-object positive control into
@@ -2553,8 +2581,14 @@ pub(crate) async fn ssrf_exploit_from(
     // abnormal exit of the outer probe does not downgrade a hit; a followed redirect
     // still downgrades it, since the probe may have delivered the token itself (#103,
     // #126).
-    let observation =
-        classify_witness_shared(&state, seen, response_was_redirected(&headers), true);
+    let observation = classify_witness_shared(
+        &state,
+        WitnessSignal {
+            witnessed: seen,
+            redirected: response_was_redirected(&headers),
+            attributable: true,
+        },
+    );
     let spec = format!("{}:{}", app.host(), app.port());
     let draft = ssrf_draft(
         vantage.segment(),
@@ -2762,8 +2796,14 @@ pub(crate) async fn blind_cmdi_exploit_from(
     // abnormal exit of the outer probe does not downgrade a hit; a followed redirect
     // still downgrades it, since the probe may have delivered the token itself (#103,
     // #126).
-    let observation =
-        classify_witness_shared(&state, seen, response_was_redirected(&headers), true);
+    let observation = classify_witness_shared(
+        &state,
+        WitnessSignal {
+            witnessed: seen,
+            redirected: response_was_redirected(&headers),
+            attributable: true,
+        },
+    );
     let spec = format!("{}:{}", app.host(), app.port());
     let draft = blind_cmdi_draft(
         vantage.segment(),
@@ -7389,24 +7429,51 @@ mod tests {
             exit_code: code,
             ..Default::default()
         };
-        let seen = classify_witness_shared(&state(Some(EXITED), Some(0)), true, false, false);
+        let seen = classify_witness_shared(
+            &state(Some(EXITED), Some(0)),
+            WitnessSignal {
+                witnessed: true,
+                redirected: false,
+                attributable: false,
+            },
+        );
         assert!(seen.value);
         assert_eq!(seen.confidence, Confidence::High);
 
-        let clean = classify_witness_shared(&state(Some(EXITED), Some(0)), false, false, false);
+        let clean = classify_witness_shared(
+            &state(Some(EXITED), Some(0)),
+            WitnessSignal {
+                witnessed: false,
+                redirected: false,
+                attributable: false,
+            },
+        );
         assert!(!clean.value);
         assert_eq!(clean.confidence, Confidence::High);
 
         // A followed redirect is Low even on a clean exit with the witness seen: the
         // response may not be the scoped target's, so the signal does not conclude.
-        let redirected = classify_witness_shared(&state(Some(EXITED), Some(0)), true, true, false);
+        let redirected = classify_witness_shared(
+            &state(Some(EXITED), Some(0)),
+            WitnessSignal {
+                witnessed: true,
+                redirected: true,
+                attributable: false,
+            },
+        );
         assert!(!redirected.value);
         assert_eq!(redirected.confidence, Confidence::Low);
 
         // And a redirected witness-less clean must not read as a confident "not
         // exploitable": the downgrade is unconditional on the witness.
-        let redirected_no_witness =
-            classify_witness_shared(&state(Some(EXITED), Some(0)), false, true, false);
+        let redirected_no_witness = classify_witness_shared(
+            &state(Some(EXITED), Some(0)),
+            WitnessSignal {
+                witnessed: false,
+                redirected: true,
+                attributable: false,
+            },
+        );
         assert!(!redirected_no_witness.value);
         assert_eq!(redirected_no_witness.confidence, Confidence::Low);
 
@@ -7426,7 +7493,14 @@ mod tests {
             state(Some(CREATED), Some(0)),
         ] {
             for witnessed in [true, false] {
-                let obs = classify_witness_shared(&abnormal, witnessed, false, false);
+                let obs = classify_witness_shared(
+                    &abnormal,
+                    WitnessSignal {
+                        witnessed,
+                        redirected: false,
+                        attributable: false,
+                    },
+                );
                 assert!(
                     !obs.value,
                     "abnormal: {:?} witnessed={witnessed}",
@@ -7448,7 +7522,14 @@ mod tests {
         // A followed redirect still downgrades (the probe may have delivered the
         // token itself, #103/#126), and the negative direction keeps the downgrade.
         let oob = |state: &ContainerState, witnessed, redirected| {
-            classify_witness_shared(state, witnessed, redirected, true)
+            classify_witness_shared(
+                state,
+                WitnessSignal {
+                    witnessed,
+                    redirected,
+                    attributable: true,
+                },
+            )
         };
         // Clean exit is unaffected by `attributable`: witnessed is High-exploit,
         // witnessless is High-not-exploitable.
