@@ -1352,25 +1352,25 @@ fn vantage_draft(
     summary: &str,
     applied: Duration,
 ) -> EvidenceDraft {
-    EvidenceDraft {
+    EvidenceDraft::new(
         capability,
-        target: target_spec.clone(),
-        intensity: Intensity::Safe,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
-        summary: summary.to_owned(),
-        source: Some(NodeRef::Vantage {
-            segment: segment.to_owned(),
-        }),
-        reproduction: Reproduction {
-            capability: capability.to_owned(),
-            target: target_spec,
-            params: serde_json::json!({
+        target_spec.clone(),
+        Intensity::Safe,
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
+        summary,
+        Reproduction::new(
+            capability,
+            target_spec,
+            serde_json::json!({
                 "timeout_ms": applied.as_millis() as u64,
                 "vantage_segment": segment,
             }),
-        },
-    }
+        ),
+    )
+    .with_source(NodeRef::Vantage {
+        segment: segment.to_owned(),
+    })
 }
 
 /// The aggregate blast-radius evidence draft (#112): the containment finding over
@@ -1387,22 +1387,22 @@ pub(crate) fn blast_radius_draft(
     observation: &Observation<bool>,
     summary: String,
 ) -> EvidenceDraft {
-    EvidenceDraft {
-        capability: BLAST_RADIUS_VANTAGE,
-        target: segment.to_owned(),
-        intensity: Intensity::Safe,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
+    EvidenceDraft::new(
+        BLAST_RADIUS_VANTAGE,
+        segment.to_owned(),
+        Intensity::Safe,
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
         summary,
-        source: Some(NodeRef::Vantage {
-            segment: segment.to_owned(),
-        }),
-        reproduction: Reproduction {
-            capability: BLAST_RADIUS_VANTAGE.to_owned(),
-            target: segment.to_owned(),
-            params: serde_json::json!({ "vantage_segment": segment }),
-        },
-    }
+        Reproduction::new(
+            BLAST_RADIUS_VANTAGE,
+            segment.to_owned(),
+            serde_json::json!({ "vantage_segment": segment }),
+        ),
+    )
+    .with_source(NodeRef::Vantage {
+        segment: segment.to_owned(),
+    })
 }
 
 /// The capability names of the HTTP witness techniques, as they appear in the
@@ -2056,44 +2056,41 @@ fn http_witness_draft(
     } else {
         format!("the response did not carry the marker {marker:?}; this request did not exploit it")
     };
-    EvidenceDraft {
+    // `request_headers` is added only when non-empty, so a SQLi/traversal witness
+    // (which carries none) serializes byte-for-byte as before: the published
+    // canonical-JSON shape of those techniques is unchanged (RK-003). A replay reads
+    // it back with `parse_http_witness`. The key mirrors the Rust name; a bare
+    // `headers` next to `request_path` would read as the response headers, which the
+    // code avoids by naming.
+    let params = {
+        let mut params = serde_json::json!({
+            "request_path": request_path,
+            "marker": marker,
+            "vantage_segment": segment,
+            "timeout_ms": applied.as_millis() as u64,
+        });
+        if !request_headers.is_empty() {
+            params["request_headers"] = serde_json::Value::Array(
+                request_headers
+                    .iter()
+                    .map(|(name, value)| serde_json::json!([name, value]))
+                    .collect(),
+            );
+        }
+        params
+    };
+    EvidenceDraft::new(
         capability,
-        target: target_spec.clone(),
-        intensity: Intensity::Controlled,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
+        target_spec.clone(),
+        Intensity::Controlled,
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
         summary,
-        source: Some(NodeRef::Vantage {
-            segment: segment.to_owned(),
-        }),
-        reproduction: Reproduction {
-            capability: capability.to_owned(),
-            target: target_spec,
-            // `request_headers` is added only when non-empty, so a SQLi/traversal
-            // witness (which carries none) serializes byte-for-byte as before: the
-            // published canonical-JSON shape of those techniques is unchanged
-            // (RK-003). A replay reads it back with `parse_http_witness`. The key
-            // mirrors the Rust name; a bare `headers` next to `request_path` would
-            // read as the response headers, which the code avoids by naming.
-            params: {
-                let mut params = serde_json::json!({
-                    "request_path": request_path,
-                    "marker": marker,
-                    "vantage_segment": segment,
-                    "timeout_ms": applied.as_millis() as u64,
-                });
-                if !request_headers.is_empty() {
-                    params["request_headers"] = serde_json::Value::Array(
-                        request_headers
-                            .iter()
-                            .map(|(name, value)| serde_json::json!([name, value]))
-                            .collect(),
-                    );
-                }
-                params
-            },
-        },
-    }
+        Reproduction::new(capability, target_spec, params),
+    )
+    .with_source(NodeRef::Vantage {
+        segment: segment.to_owned(),
+    })
 }
 
 /// The env-independent replay inputs parsed from a vantage witness: the technique
@@ -2398,20 +2395,17 @@ fn ssrf_draft(
     } else {
         "the target did not reach the canary; this coercion did not exploit it".to_owned()
     };
-    EvidenceDraft {
-        capability: HTTP_SSRF_VANTAGE,
-        target: target_spec.clone(),
-        intensity: Intensity::Controlled,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
+    EvidenceDraft::new(
+        HTTP_SSRF_VANTAGE,
+        target_spec.clone(),
+        Intensity::Controlled,
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
         summary,
-        source: Some(NodeRef::Vantage {
-            segment: segment.to_owned(),
-        }),
-        reproduction: Reproduction {
-            capability: HTTP_SSRF_VANTAGE.to_owned(),
-            target: target_spec,
-            params: serde_json::json!({
+        Reproduction::new(
+            HTTP_SSRF_VANTAGE,
+            target_spec,
+            serde_json::json!({
                 "request_path": request_path,
                 "token": token,
                 "canary_alias": canary_alias,
@@ -2419,8 +2413,11 @@ fn ssrf_draft(
                 "vantage_segment": segment,
                 "timeout_ms": applied.as_millis() as u64,
             }),
-        },
-    }
+        ),
+    )
+    .with_source(NodeRef::Vantage {
+        segment: segment.to_owned(),
+    })
 }
 
 /// The env-independent replay inputs parsed from an SSRF witness: the segment, the
@@ -2851,20 +2848,17 @@ fn blind_cmdi_draft(
     } else {
         "the target did not reach the canary; this injection did not exploit it".to_owned()
     };
-    EvidenceDraft {
-        capability: HTTP_BLIND_CMDI_VANTAGE,
-        target: target_spec.clone(),
-        intensity: Intensity::Controlled,
-        observed: serde_json::Value::Bool(observation.value),
-        confidence: observation.confidence,
+    EvidenceDraft::new(
+        HTTP_BLIND_CMDI_VANTAGE,
+        target_spec.clone(),
+        Intensity::Controlled,
+        serde_json::Value::Bool(observation.value),
+        observation.confidence,
         summary,
-        source: Some(NodeRef::Vantage {
-            segment: segment.to_owned(),
-        }),
-        reproduction: Reproduction {
-            capability: HTTP_BLIND_CMDI_VANTAGE.to_owned(),
-            target: target_spec,
-            params: serde_json::json!({
+        Reproduction::new(
+            HTTP_BLIND_CMDI_VANTAGE,
+            target_spec,
+            serde_json::json!({
                 "request_path": request_path,
                 "token": token,
                 "canary_alias": canary_alias,
@@ -2872,8 +2866,11 @@ fn blind_cmdi_draft(
                 "vantage_segment": segment,
                 "timeout_ms": applied.as_millis() as u64,
             }),
-        },
-    }
+        ),
+    )
+    .with_source(NodeRef::Vantage {
+        segment: segment.to_owned(),
+    })
 }
 
 /// The env-independent replay inputs parsed from a blind command-injection witness:
