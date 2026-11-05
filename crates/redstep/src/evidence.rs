@@ -211,7 +211,32 @@ impl EvidenceDraft {
 /// The immutable record the store holds: an [`EvidenceDraft`] the store has given
 /// an [`EvidenceId`] and a timestamp. The single source of truth every report and
 /// the canonical JSON project from (ADR-0004, ADR-0005), so it serializes.
+///
+/// `#[non_exhaustive]`, like the draft it is stamped from and every other growable
+/// published type (`Verdict`, the report types, `Error`): it is handed out by
+/// [`EvidenceStore::records`] and projected by every report/SARIF/graph consumer,
+/// and ADR-0004 still adds fields to it (`artifacts`, the node taxonomy), so an
+/// external consumer must not exhaustively destructure or struct-literal it or a
+/// field addition is a breaking change (#43). It is built only in-crate by `append`,
+/// so it needs no public constructor. An external struct literal does not compile
+/// (mutation: remove `#[non_exhaustive]` and it does):
+///
+/// ```compile_fail
+/// let _ = redstep::Evidence {
+///     id: redstep::EvidenceId(0),
+///     recorded_at_ms: 0,
+///     capability: "tcp_connect".to_owned(),
+///     target: "db:5432".to_owned(),
+///     intensity: redstep::Intensity::Safe,
+///     observed: serde_json::json!(false),
+///     confidence: redstep::Confidence::High,
+///     summary: "unreachable".to_owned(),
+///     source: None,
+///     reproduction: redstep::Reproduction::new("tcp_connect", "db:5432", serde_json::json!({})),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Evidence {
     /// Its identity within the run.
     pub id: EvidenceId,
