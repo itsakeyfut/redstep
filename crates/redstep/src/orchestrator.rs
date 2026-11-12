@@ -2482,26 +2482,26 @@ fn parse_ssrf_witness(
 /// seen against the playground canary with margin; a token still absent after the
 /// window is a genuine not-reached. This bound is where "absent" becomes a
 /// confident High `false`, so it is named rather than inlined.
-const SSRF_CANARY_POLL_ATTEMPTS: usize = 10;
-const SSRF_CANARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const CANARY_POLL_ATTEMPTS: usize = 10;
+const CANARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Poll `container`'s logs for `token` over the bounded out-of-band window,
 /// returning `true` as soon as the token appears in stdout or stderr and `false`
-/// if it is still absent after the window (see [`SSRF_CANARY_POLL_ATTEMPTS`] for
+/// if it is still absent after the window (see [`CANARY_POLL_ATTEMPTS`] for
 /// why a single read would risk a false PASS). The shared out-of-band witness read
 /// behind every canary-backed technique (SSRF and blind command injection), so
 /// the window and its row-6 rationale live in one place rather than copied per
 /// technique. Precondition: the caller has validated `token` as non-empty and
-/// specific ([`validate_ssrf_token`]), because `contains("")` is vacuously true and
+/// specific ([`validate_canary_token`]), because `contains("")` is vacuously true and
 /// would forge a witness.
 async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> Result<bool> {
-    for attempt in 0..SSRF_CANARY_POLL_ATTEMPTS {
+    for attempt in 0..CANARY_POLL_ATTEMPTS {
         let (out, err) = read_container_logs(docker, container).await?;
         if out.contains(token) || err.contains(token) {
             return Ok(true);
         }
-        if attempt + 1 < SSRF_CANARY_POLL_ATTEMPTS {
-            tokio::time::sleep(SSRF_CANARY_POLL_INTERVAL).await;
+        if attempt + 1 < CANARY_POLL_ATTEMPTS {
+            tokio::time::sleep(CANARY_POLL_INTERVAL).await;
         }
     }
     Ok(false)
@@ -2544,7 +2544,7 @@ pub(crate) async fn ssrf_exploit_from(
     // check: an empty/short token would false-witness (an empty token makes
     // `logs.contains(token)` vacuously true), and this fronts the replay path where
     // the token is untrusted witness input.
-    validate_ssrf_token(token)?;
+    validate_canary_token(token)?;
     let request_path = format!("/fetch?url=http://{canary_alias}:{canary_port}/{token}");
     // Fail-closed validation of the interpolated path. `canary_alias` is the one
     // component not already constrained (the token is validated above, the port is
@@ -2604,10 +2604,10 @@ pub(crate) async fn ssrf_exploit_from(
 /// coercion URL and specific enough that `logs.contains(token)` cannot match
 /// stale or unrelated canary-log content: at least 8 characters and only URL-safe
 /// unreserved bytes. An empty or too-short token would false-witness. The
-/// capability caller ([`ssrf_token`]) mints a fresh unique token per probe; this
+/// capability caller ([`canary_token`]) mints a fresh unique token per probe; this
 /// is the defensive floor for any caller, including a replay from an untrusted
 /// witness. Pure, so it is guarded offline.
-fn validate_ssrf_token(token: &str) -> Result<()> {
+fn validate_canary_token(token: &str) -> Result<()> {
     let safe = token.len() >= 8
         && token
             .bytes()
@@ -2624,7 +2624,7 @@ fn validate_ssrf_token(token: &str) -> Result<()> {
 /// A fresh, unique, URL-safe per-probe SSRF token (reuses [`run_id`]'s uniqueness).
 /// Minted by the capability caller so each coercion's canary callback is
 /// distinguishable and cannot match a prior probe's log line.
-pub(crate) fn ssrf_token() -> String {
+pub(crate) fn canary_token() -> String {
     format!("ssrf-{}", run_id())
 }
 
@@ -2734,7 +2734,7 @@ fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
 /// SSRF.
 ///
 /// It shares the content-free out-of-band primitives with [`ssrf_exploit_from`]:
-/// `validate_ssrf_token` (the token is untrusted on the replay path and an empty
+/// `validate_canary_token` (the token is untrusted on the replay path and an empty
 /// one would false-witness), `run_probe_capturing`, [`poll_logs_for_token`] (the
 /// bounded canary-log poll, so a hit still propagating is not read as a confident
 /// not-reached), and [`classify_witness_shared`] (the one fail-closed witness
@@ -2759,7 +2759,7 @@ pub(crate) async fn blind_cmdi_exploit_from(
     // Fail-closed on a weak token before it reaches the injected URL or the
     // `contains` check, exactly as the SSRF path: an empty/short token would
     // false-witness, and this fronts the replay path where the token is untrusted.
-    validate_ssrf_token(token)?;
+    validate_canary_token(token)?;
     let request_path = blind_cmdi_coercion_path(canary_alias, canary_port, token);
     // Fail-closed validation of the interpolated path, as the SSRF coercion does
     // (RK-015). `canary_alias` is the one component not already constrained (the
@@ -7733,29 +7733,29 @@ mod tests {
         );
     }
 
-    /// Guard: `validate_ssrf_token` fails closed on a token that is empty, too
+    /// Guard: `validate_canary_token` fails closed on a token that is empty, too
     /// short, or not URL-safe. An empty token would make the canary-log `contains`
     /// check vacuously true (a forged witness). Mutation: drop the length check or
-    /// the char check in `validate_ssrf_token` -> the matching case passes -> this
+    /// the char check in `validate_canary_token` -> the matching case passes -> this
     /// fails.
     #[test]
-    fn validate_ssrf_token_fails_closed() {
-        assert!(validate_ssrf_token("redstep-ssrf-witness-7e1a").is_ok());
-        assert!(validate_ssrf_token("ssrf-redstep-1a2b-3").is_ok());
+    fn validate_canary_token_fails_closed() {
+        assert!(validate_canary_token("redstep-ssrf-witness-7e1a").is_ok());
+        assert!(validate_canary_token("ssrf-redstep-1a2b-3").is_ok());
         assert!(
-            validate_ssrf_token("").is_err(),
+            validate_canary_token("").is_err(),
             "an empty token is refused"
         );
         assert!(
-            validate_ssrf_token("short").is_err(),
+            validate_canary_token("short").is_err(),
             "a sub-8-char token is refused"
         );
         assert!(
-            validate_ssrf_token("has space 1234").is_err(),
+            validate_canary_token("has space 1234").is_err(),
             "a non-URL-safe token is refused"
         );
         assert!(
-            validate_ssrf_token("tok/../../x").is_err(),
+            validate_canary_token("tok/../../x").is_err(),
             "a path-traversal-ish token is refused ('/' is not unreserved)"
         );
     }
@@ -8247,8 +8247,8 @@ mod tests {
 
     /// A per-probe token for the blind command-injection Docker tests (#87). Like
     /// `SSRF_TOKEN`, a fixed value the manual probes and the recorded witness reuse;
-    /// the capability under test mints its own via `ssrf_token`. URL-safe and >=8
-    /// chars so `validate_ssrf_token` admits it and `logs.contains` is specific.
+    /// the capability under test mints its own via `canary_token`. URL-safe and >=8
+    /// chars so `validate_canary_token` admits it and `logs.contains` is specific.
     const BLIND_CMDI_TOKEN: &str = "redstep-blindcmdi-witness-4c2d";
     /// The positive-control token for the blind command-injection Docker tests: a
     /// DIRECT vantage->canary hit carries it, proving the canary records on the lab,
