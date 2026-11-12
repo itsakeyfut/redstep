@@ -48,4 +48,4 @@ Nothing yet. No adapter contract is implemented; the tiers land in Phase 4 (nmap
 
 ## More Information
 
-Was "Decision G" in the retired `design-decisions.md`. Open: whether `CapabilityAdapter` is the same as or contains the ADR-0002 `Capability` trait, each tier's registry, and tracking tool version/format drift. See ADR-0002 (the capability abstraction these adapters specialize).
+Was "Decision G" in the retired `design-decisions.md`. [ADR-0025](./0025-author-out-of-crate-capabilities-behind-a-destination-fixed-channel.md) settles the first open point: `CapabilityAdapter` is *separate from* the ADR-0002 `Capability` trait, not the same and not containing it. It is the public, destination-fixed, out-of-crate boundary (first-party techniques now, tools later); `Capability` stays the sealed in-process host primitive. Still open: each tier's registry, and tracking tool version/format drift. See ADR-0002 (the capability abstraction these adapters specialize).
