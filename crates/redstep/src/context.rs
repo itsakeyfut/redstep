@@ -33,8 +33,8 @@ use crate::observation::{Confidence, Observation};
 use crate::orchestrator::{
     HTTP_CMDI_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, HTTP_SSTI_VANTAGE,
     LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE, blast_radius_draft,
-    blind_cmdi_exploit_from, http_witness_exploit_from, idor_exploit_corroborated_from,
-    ssrf_exploit_from, ssrf_token, tcp_reachable_from,
+    blind_cmdi_exploit_from, canary_token, http_witness_exploit_from,
+    idor_exploit_corroborated_from, ssrf_exploit_from, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -824,7 +824,7 @@ impl TestContext {
         // Mint a fresh, unique per-probe token here, not from the caller: this
         // coercion's canary callback must be distinguishable and a caller cannot
         // pass a weak or forgeable one.
-        let token = ssrf_token();
+        let token = canary_token();
         // The in-container gate: a Controlled coercion (#44), lab-confined.
         let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = ssrf_exploit_from(
@@ -894,7 +894,7 @@ impl TestContext {
         // Mint a fresh, unique per-probe token here, not from the caller: this
         // callback must be distinguishable and a caller cannot pass a weak or
         // forgeable one. The out-of-band token helper is shared with SSRF.
-        let token = ssrf_token();
+        let token = canary_token();
         // The in-container gate: a Controlled coercion (#44), lab-confined.
         let cleared = VantageCleared::issue(Intensity::Controlled)?;
         let (observation, draft) = blind_cmdi_exploit_from(
