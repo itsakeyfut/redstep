@@ -45,8 +45,9 @@ standard. Copy [`adr-template.md`](./adr-template.md) to start one.
 | [0022](./0022-capture-a-success-witness-and-generate-a-pinned-replay.md) | Capture a success witness and generate a pinned replay from it | accepted | nothing yet (first piece is #29; Phase 5) |
 | [0023](./0023-capture-an-out-of-band-witness-at-an-in-lab-canary.md) | Capture an out-of-band witness at an in-lab canary | accepted | SSRF check (#65): ssrf_exploit_from + the canary, attributed to the target |
 | [0024](./0024-realize-the-inter-segment-gateway-as-a-tcp-proxy.md) | Realize the inter-segment gateway as a TCP proxy, not a packet filter | accepted | port/east-west enforcement + self-check (#114), refining ADR-0011's mechanism |
+| [0025](./0025-author-out-of-crate-capabilities-behind-a-destination-fixed-channel.md) | Author out-of-crate attack capabilities behind a destination-fixed channel, so escape-scope stays compiler-held | accepted | nothing yet (#89, blocked on this and #123); the escape-scope guarantee was measured on a throwaway prototype (E0624/E0616), and becomes `compile_fail` cases when the split is built |
 
-**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024 · proposed: none · superseded: none
+**By status**: accepted: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024, 0025 · proposed: none · superseded: none
 
 Records are numbered consecutively from `0001`. The lettered decisions A to V (with H-2) are now the records above; the retired `design-decisions.md`'s "Decision MVP" was scope, not a decision, and lives in [`docs/roadmap/mvp.md`](../roadmap/mvp.md).
 
