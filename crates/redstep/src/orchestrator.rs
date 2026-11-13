@@ -1040,7 +1040,7 @@ impl Prober for DockerProber<'_> {
 /// This is the boundary self-check's own `Safe` isolation verification, which runs
 /// before any test, not a capability or an attack action on the vantage, so it is
 /// deliberately not behind the `VantageCleared` gate (#44): the gate is for the
-/// attack seams (`tcp_reachable_from`, `http_witness_exploit_from` and the
+/// attack seams (`tcp_reachable_from`, `VantageChannel::http_witness` and the
 /// coercion seams), not the framework's own defensive probe.
 struct DockerTcpProber<'a> {
     docker: &'a Docker,
@@ -1460,6 +1460,16 @@ pub(crate) const HTTP_SSRF_VANTAGE: &str = "http_ssrf_vantage";
 /// `HTTP_CMDI_VANTAGE` above; this is its out-of-band twin.
 pub(crate) const HTTP_BLIND_CMDI_VANTAGE: &str = "http_blind_cmdi_vantage";
 
+/// Build the probe URL for `request_path` with its authority FIXED to the
+/// scope-resolved `target` (ADR-0025): the technique chooses the path, never the host
+/// or port. Pure, so an offline test pins the authority on every gate rather than
+/// leaving the destination-fix to the Docker-gated exploit tests (#133); a re-aim of
+/// the authority here is exactly the scope-escape this refactor exists to make
+/// impossible, so it is guarded offline, not only in the lab.
+fn witness_url(target: &ScopedTarget, request_path: &str) -> String {
+    format!("http://{}:{}{}", target.host(), target.port(), request_path)
+}
+
 /// The attacker vantage a capability technique runs against: the lab handle, the
 /// vantage network, the ONE scope-resolved target, and the timeout. A technique is
 /// handed `&VantageChannel` and chooses only its payload; the destination is this
@@ -1557,12 +1567,7 @@ impl<'a> VantageChannel<'a> {
         validate_http_request(request_path, marker, request_headers)?;
         let secs = self.timeout.as_secs().max(1);
         let applied = Duration::from_secs(secs);
-        let url = format!(
-            "http://{}:{}{}",
-            self.target.host(),
-            self.target.port(),
-            request_path
-        );
+        let url = witness_url(self.target, request_path);
         let cmd = wget_cmd(&url, secs, request_headers);
         let (state, body, resp_headers) = run_probe_capturing(
             self.docker,
@@ -2039,7 +2044,7 @@ fn corroborate_idor(victim: Observation<bool>, control: &Observation<bool>) -> O
 /// vantage intensity by type (so a higher-intensity seam cannot be cleared by a
 /// lower-intensity proof) lands with the v0.4.0 Aggressive adapters (#123). The
 /// `intensity` recorded below is the seam's own honest label.
-// allow(too_many_arguments): mirrors `http_witness_exploit_from`'s inputs to build
+// allow(too_many_arguments): mirrors `VantageChannel::http_witness`'s inputs to build
 // the draft from them; the same reasoning applies.
 #[allow(clippy::too_many_arguments)]
 fn http_witness_draft(
@@ -2226,7 +2231,7 @@ pub(crate) async fn replay_vantage_probe(
 /// `&'static str` and fails closed on an unknown one, so a witness naming a
 /// capability this build does not have cannot be replayed into the wrong technique.
 // allow(type_complexity): the parsed witness is a flat tuple of the probe inputs,
-// read positionally straight back into `http_witness_exploit_from`; a named struct
+// read positionally straight back into `VantageChannel::http_witness`; a named struct
 // is the clean refactor for when v0.4.0 reshapes this seam (mvp.md), not now.
 #[allow(clippy::type_complexity)]
 fn parse_http_witness(
@@ -2520,23 +2525,15 @@ async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> R
     Ok(false)
 }
 
-/// Coerce `app` (the SSRF target) from the attacker vantage to fetch
-/// `http://{canary_alias}:{canary_port}/{token}` server-side, then witness the
-/// request OUT-OF-BAND in the canary's container logs, NOT in the app's own
-/// response (the app returns only the fetched status). `token` is minted fresh per
-/// probe and is not known outside this run, and the only request carrying it that
-/// this check issues is the coercion at `app`, so a `token` seen in the canary's
-/// log means `app` reached the canary. Layer-1 isolation (ADR-0006) confines that
-/// fetch to the egress-less lab: nothing outside the lab can reach the canary, and
-/// within the lab the check sends the token to no host but `app`. The token is not
-/// a secret (anything on the lab that learned it could reach the canary too), which
-/// is why a replay re-derives the coercion path rather than trusting the recorded
-/// one. The marker-in-path forgery guard does NOT apply here: `token` legitimately
-/// appears in the request path (it is the coercion target), and the witness is at
-/// the canary, not the body. The draft's `target` is `app`, not the canary (#65,
-/// ADR-0023). This is a separate path from `http_witness_exploit_from`: that seam's
-/// `classify_http_witness` reads the probe's own body, and an SSRF witness is not
-/// there.
+/// The out-of-band coercion ops of [`VantageChannel`]. Both SSRF (#65) and blind
+/// command injection (#87) coerce the channel's target to call back to an in-lab
+/// canary and witness the per-probe token in the canary's logs OUT-OF-BAND, not in
+/// the probe's own response, so this is a separate path from
+/// [`VantageChannel::http_witness`] (whose `classify_http_witness` reads the body).
+/// Layer-1 isolation (ADR-0006) confines the callback to the egress-less lab, the
+/// draft's target is the coerced app and not the canary, and the token is not a
+/// secret (a replay re-derives the coercion path rather than trusting the recorded
+/// one), ADR-0023.
 impl<'a> VantageChannel<'a> {
     /// Coerce the channel's target, from the attacker vantage, to reach the in-lab
     /// `canary` with a fresh per-probe token, witnessed OUT-OF-BAND in the canary's
@@ -2603,12 +2600,7 @@ impl<'a> VantageChannel<'a> {
         }
         let secs = self.timeout.as_secs().max(1);
         let applied = Duration::from_secs(secs);
-        let url = format!(
-            "http://{}:{}{}",
-            self.target.host(),
-            self.target.port(),
-            request_path
-        );
+        let url = witness_url(self.target, &request_path);
         let cmd = wget_cmd(&url, secs, &[]);
         let (state, _body, headers) = run_probe_capturing(
             self.docker,
@@ -3390,6 +3382,98 @@ mod tests {
 
     fn blind_cmdi_path_is_safe(request_path: &str) -> bool {
         coercion_path_is_safe(request_path)
+    }
+
+    /// Guard: every adapter stamps ITS OWN capability (#133). The adapter -> capability
+    /// wiring is a convention (was structural, one wrapper per technique, before the
+    /// carve), and the draft shims pass the capability themselves, so nothing else
+    /// offline pins that each adapter names its own technique. A swapped tag records a
+    /// finding under the wrong technique and misroutes a replay (RK-011, row-6-adjacent).
+    /// Mutation: change any adapter's `capability()` to another `HTTP_*_VANTAGE` -> the
+    /// matching assertion fails (verified on the real tree: Sqli -> HTTP_IDOR_VANTAGE).
+    #[test]
+    fn each_adapter_stamps_its_own_capability() {
+        use adapters::CapabilityAdapter;
+        assert_eq!(
+            adapters::Sqli {
+                request_path: "/",
+                marker: "m"
+            }
+            .capability(),
+            HTTP_SQLI_VANTAGE
+        );
+        assert_eq!(
+            adapters::CommandInjection {
+                request_path: "/",
+                marker: "m"
+            }
+            .capability(),
+            HTTP_CMDI_VANTAGE
+        );
+        assert_eq!(
+            adapters::Ssti {
+                request_path: "/",
+                marker: "m"
+            }
+            .capability(),
+            HTTP_SSTI_VANTAGE
+        );
+        assert_eq!(
+            adapters::PathTraversal {
+                request_path: "/",
+                marker: "m"
+            }
+            .capability(),
+            HTTP_PATH_TRAVERSAL_VANTAGE
+        );
+        assert_eq!(
+            adapters::Idor {
+                victim_path: "/",
+                victim_marker: "m",
+                own_path: "/o",
+                own_marker: "om",
+                request_headers: &[]
+            }
+            .capability(),
+            HTTP_IDOR_VANTAGE
+        );
+        assert_eq!(
+            adapters::Ssrf {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .capability(),
+            HTTP_SSRF_VANTAGE
+        );
+        assert_eq!(
+            adapters::BlindCommandInjection {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .capability(),
+            HTTP_BLIND_CMDI_VANTAGE
+        );
+    }
+
+    /// Guard: `witness_url` fixes the request authority to the scope-resolved target,
+    /// whatever path a technique passes (ADR-0025). The live build sites in
+    /// `http_witness` / `oob_coercion_with_token` were guarded only by the Docker-gated
+    /// exploit tests, so a one-line re-aim shipped green on the offline gate (#133
+    /// review). Mutation: build the URL from anything but `target.host()/port()` in
+    /// `witness_url` -> this fails.
+    #[test]
+    fn witness_url_fixes_the_authority_to_the_target() {
+        let scope = Scope::builder()
+            .allow("web:80")
+            .expect("valid spec")
+            .build();
+        let target = scope.resolve("web:80").expect("web:80 is allowed");
+        assert_eq!(
+            witness_url(&target, "/fetch?url=http://evil/x"),
+            "http://web:80/fetch?url=http://evil/x"
+        );
     }
 
     /// Guard: the container command follows the workload kind (#46). A `Standin`
@@ -7548,7 +7632,7 @@ mod tests {
     /// This is the live-wiring face of the off-Docker `corroborate_idor_*` and
     /// `corroborate_idor_evidence_*` guards: it pins that `exploit_idor_from_vantage`
     /// actually runs the control probe. Mutation: skip the control probe in
-    /// `idor_exploit_corroborated_from` for the non-exploit path (keep the raw victim
+    /// `VantageChannel::http_witness_corroborated` for the non-exploit path (keep the raw victim
     /// observation) -> the unmapped-token case reads a confident PASS -> the
     /// `Confidence::Low` assertion fails.
     #[test]
@@ -8072,6 +8156,10 @@ mod tests {
         assert_eq!(draft.reproduction.params["canary_alias"], "canary");
         assert_eq!(draft.reproduction.params["canary_port"], 8082);
         assert_eq!(draft.capability, "http_ssrf_vantage");
+        // The intensity is a canonical-JSON contract field; `oob_draft` hardcodes
+        // Controlled, and nothing else offline asserts it (#133 review). Mutation:
+        // Controlled -> Safe in `oob_draft` -> this fails.
+        assert_eq!(draft.intensity, Intensity::Controlled);
         assert_eq!(draft.observed, serde_json::Value::Bool(true));
         assert_eq!(draft.confidence, Confidence::High);
         assert!(
@@ -8621,6 +8709,10 @@ mod tests {
         assert_eq!(draft.reproduction.params["canary_alias"], "canary");
         assert_eq!(draft.reproduction.params["canary_port"], 8082);
         assert_eq!(draft.capability, "http_blind_cmdi_vantage");
+        // The intensity is a canonical-JSON contract field; `oob_draft` hardcodes
+        // Controlled, and nothing else offline asserts it (#133 review). Mutation:
+        // Controlled -> Safe in `oob_draft` -> this fails.
+        assert_eq!(draft.intensity, Intensity::Controlled);
         assert_eq!(draft.observed, serde_json::Value::Bool(true));
         assert_eq!(draft.confidence, Confidence::High);
         assert!(
@@ -8829,6 +8921,52 @@ mod tests {
         assert!(
             matches!(result, Err(Error::InvalidTarget { .. })),
             "a tampered witness whose request_path does not re-derive must be refused before bring_up (got Ok: {})",
+            result.is_ok()
+        );
+    }
+
+    /// Guard: `replay_ssrf_probe` refuses a tampered witness whose `request_path` does
+    /// not re-derive from its recorded canary+token, before `bring_up` (ADR-0022). The
+    /// blind-cmdi replay had this offline guard and SSRF did not (the asymmetry #75 left
+    /// and the #133 review flagged), so the SSRF tamper-check was pinned only by the
+    /// Docker-gated path. This is the SSRF mirror. Mutation: change the
+    /// `if request_path != expected_path` guard in `replay_ssrf_probe` to `if false` ->
+    /// this fails. Offline: the refusal returns before `bring_up`, so the lazy Docker
+    /// handle is never used.
+    #[test]
+    fn replay_ssrf_probe_refuses_a_tampered_witness() {
+        let draft = ssrf_draft(
+            "lab",
+            "api:8081".to_owned(),
+            &ssrf_coercion_path("canary", 8082, "tok12345"),
+            "tok12345",
+            "canary",
+            8082,
+            &Observation {
+                value: true,
+                confidence: Confidence::High,
+            },
+            Duration::from_millis(5_000),
+        );
+        let mut witness = draft.reproduction;
+        // Tamper: a request_path that does not re-derive from canary+token (the token in
+        // the path is DIFFERENT, not tok12345).
+        witness.params.as_object_mut().unwrap().insert(
+            "request_path".to_owned(),
+            serde_json::json!("/fetch?url=http://canary:8082/DIFFERENT"),
+        );
+        let env = Environment::builder()
+            .segment("lab")
+            .vantage("lab")
+            .service("api", "redstep/api:mvp", "lab")
+            .service("canary", "redstep/canary:mvp", "lab")
+            .build()
+            .expect("the api+canary environment is valid");
+        let docker = Docker::connect_with_local_defaults().expect("lazy connect");
+        let result = block_on(replay_ssrf_probe(&docker, &env, &witness));
+        assert!(
+            matches!(result, Err(Error::InvalidTarget { .. })),
+            "a tampered SSRF witness whose request_path does not re-derive must be refused before bring_up (got Ok: {})",
             result.is_ok()
         );
     }

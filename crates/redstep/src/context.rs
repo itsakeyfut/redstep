@@ -461,7 +461,7 @@ impl TestContext {
     ///
     /// The lab-wired counterpart of [`run`](Self::run) for the SQLi check, parallel
     /// to [`connect_from_vantage`](Self::connect_from_vantage): it runs an injected
-    /// request from a container on the vantage network (`http_witness_exploit_from`) and
+    /// request from a container on the vantage network (`VantageChannel::http_witness`) and
     /// captures the response body, so the observation and its evidence are what the
     /// attacker's vantage would see, not a host-run request. `request_path` carries
     /// the payload (URL-encoded), and `marker` is the DB-only value whose presence
@@ -502,7 +502,7 @@ impl TestContext {
 
     /// The lab-wired command injection check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the same HTTP witness seam (`VantageChannel::http_witness`): it runs a probe from
     /// the attacker vantage whose `request_path` injects a command into the target's
     /// `/exec`, and `marker` is the body of a sentinel file only an executed command
     /// could read, so the shared `classify_http_witness` reads it from the response.
@@ -538,7 +538,7 @@ impl TestContext {
 
     /// The lab-wired server-side template injection (SSTI) check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the same HTTP witness seam (`VantageChannel::http_witness`): it runs a probe from
     /// the attacker vantage whose `request_path` injects a template expression into
     /// the target's `/render`, and `marker` is a secret seeded into the engine's
     /// template context, present in the response only when the expression was
@@ -578,7 +578,7 @@ impl TestContext {
     ///
     /// The second native app-security check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`), differing only in
+    /// the same HTTP witness seam (`VantageChannel::http_witness`), differing only in
     /// the capability name and the diagnostic. `request_path` carries the traversal
     /// payload (an escaping `?path=`, URL-encoded), and `marker` is the body of a
     /// file seeded outside the web root, present in the response only if the
@@ -702,7 +702,7 @@ impl TestContext {
     ///
     /// The fourth native app-security check, and the one not on the body-marker
     /// seam: its witness is the per-probe `token` appearing in the canary's logs,
-    /// not in the app's own response (`ssrf_exploit_from`, #65). `canary_alias` and
+    /// not in the app's own response (`VantageChannel::oob_coercion`, #65). `canary_alias` and
     /// `canary_port` name the canary on the lab network (the coercion URL), and
     /// `canary_container` is its container (whose logs are read); the test resolves
     /// the container name from the running lab. The finding is attributed to `app`,
@@ -750,7 +750,7 @@ impl TestContext {
     /// the target to run an injected command that calls back to the in-lab canary
     /// and witnesses the per-probe token in the canary's logs, OUT-OF-BAND, exactly
     /// as [`exploit_ssrf_from_vantage`](Self::exploit_ssrf_from_vantage) does
-    /// (`blind_cmdi_exploit_from`, ADR-0023). `canary_alias`/`canary_port` are where
+    /// (`VantageChannel::oob_coercion`, ADR-0023). `canary_alias`/`canary_port` are where
     /// the injected command is steered, and `canary_container` is the container
     /// whose logs are read for the token. An exploit is observed at `High`, a clean
     /// non-exploit at `High`, and an abnormal probe at `Low` (ADR-0010, RK-002). The
@@ -1574,6 +1574,58 @@ mod tests {
         assert_eq!(drafts[0].observed, serde_json::Value::Bool(true));
         // Drained, not left behind: a second drain is empty.
         assert!(ctx.take_evidence_drafts().is_empty());
+    }
+
+    /// Guard: `finish` records the FINDING (victim) draft first, so the returned ref is
+    /// the finding, and appends the control second (ADR-0004, RK-004). `finish` is new
+    /// #133 code; the victim-first ordering and the ref-points-at-the-finding invariant
+    /// were otherwise pinned only by the Docker-gated IDOR tests, so a mutation making
+    /// the returned ref follow the control (the finding would then resolve to the benign
+    /// own-object control row) shipped green offline (#133 review). Mutations in `finish`:
+    /// reassign `draft_ref` from the control's `record_draft`, or record the control
+    /// before the victim -> an assertion here fails.
+    #[test]
+    fn finish_records_the_finding_first_and_appends_the_control() {
+        let ctx = TestContext::new(Scope::default());
+        let draft = |capability: &'static str, observed: bool| {
+            EvidenceDraft::new(
+                capability,
+                "api:8081".to_owned(),
+                Intensity::Controlled,
+                serde_json::Value::Bool(observed),
+                Confidence::High,
+                "summary".to_owned(),
+                crate::evidence::Reproduction::new(
+                    capability,
+                    "api:8081".to_owned(),
+                    serde_json::json!({}),
+                ),
+            )
+        };
+        let observation = Observation {
+            value: false,
+            confidence: Confidence::High,
+        };
+        let recorded = ctx.finish(
+            observation,
+            draft("victim_finding", false),
+            Some(draft("own_object_control", true)),
+            None,
+        );
+        let drafts = ctx.take_evidence_drafts();
+        assert_eq!(
+            drafts.len(),
+            2,
+            "the finding and the control are both recorded"
+        );
+        // The returned ref is the FINDING (victim), recorded first; not the control.
+        assert_eq!(recorded.draft_ref.index(), 0);
+        assert_eq!(
+            drafts[recorded.draft_ref.index()].capability,
+            "victim_finding"
+        );
+        // The control is the next-appended fact.
+        assert_eq!(drafts[1].capability, "own_object_control");
     }
 
     /// Guard: expecting over a capability's `Observed` result carries the per-test
