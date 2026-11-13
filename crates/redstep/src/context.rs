@@ -30,11 +30,10 @@ use crate::evidence::{DraftRef, EvidenceDraft};
 use crate::expectation::{Diagnostic, Expectation, Judgement, judge};
 use crate::intensity::Intensity;
 use crate::observation::{Confidence, Observation};
+use crate::orchestrator::adapters::{self, CapabilityAdapter};
 use crate::orchestrator::{
-    HTTP_CMDI_VANTAGE, HTTP_PATH_TRAVERSAL_VANTAGE, HTTP_SQLI_VANTAGE, HTTP_SSTI_VANTAGE,
-    LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE, blast_radius_draft,
-    blind_cmdi_exploit_from, canary_token, http_witness_exploit_from,
-    idor_exploit_corroborated_from, ssrf_exploit_from, tcp_reachable_from,
+    LabNetwork, NETWORK_SERVICE_DISCOVERY_VANTAGE, TCP_CONNECT_VANTAGE, VantageChannel,
+    blast_radius_draft, tcp_reachable_from,
 };
 use crate::scope::{Scope, ScopedTarget};
 use crate::verdict::Verdict;
@@ -462,7 +461,7 @@ impl TestContext {
     ///
     /// The lab-wired counterpart of [`run`](Self::run) for the SQLi check, parallel
     /// to [`connect_from_vantage`](Self::connect_from_vantage): it runs an injected
-    /// request from a container on the vantage network (`http_witness_exploit_from`) and
+    /// request from a container on the vantage network (`VantageChannel::http_witness`) and
     /// captures the response body, so the observation and its evidence are what the
     /// attacker's vantage would see, not a host-run request. `request_path` carries
     /// the payload (URL-encoded), and `marker` is the DB-only value whose presence
@@ -488,39 +487,22 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_sqli_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
-        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = http_witness_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            target,
-            HTTP_SQLI_VANTAGE,
+        let channel = self.vantage_channel(target)?;
+        let (observation, draft, control) = adapters::Sqli {
             request_path,
             marker,
-            &[],
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only an executed injection earns the domain diagnostic; its text asserts
         // the injection ran, which holds iff the marker was observed.
         let diagnostic = gated_diagnostic(observation.value, || sqli_diagnostic(marker));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        Ok(self.finish(observation, draft, control, diagnostic))
     }
 
     /// The lab-wired command injection check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the same HTTP witness seam (`VantageChannel::http_witness`): it runs a probe from
     /// the attacker vantage whose `request_path` injects a command into the target's
     /// `/exec`, and `marker` is the body of a sentinel file only an executed command
     /// could read, so the shared `classify_http_witness` reads it from the response.
@@ -540,40 +522,23 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_command_injection_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
-        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = http_witness_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            target,
-            HTTP_CMDI_VANTAGE,
+        let channel = self.vantage_channel(target)?;
+        let (observation, draft, control) = adapters::CommandInjection {
             request_path,
             marker,
-            &[],
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only an executed command earns the domain diagnostic; its text asserts a
         // command ran, true iff the marker (the command's output) was observed.
         let diagnostic =
             gated_diagnostic(observation.value, || command_injection_diagnostic(marker));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        Ok(self.finish(observation, draft, control, diagnostic))
     }
 
     /// The lab-wired server-side template injection (SSTI) check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`): it runs a probe from
+    /// the same HTTP witness seam (`VantageChannel::http_witness`): it runs a probe from
     /// the attacker vantage whose `request_path` injects a template expression into
     /// the target's `/render`, and `marker` is a secret seeded into the engine's
     /// template context, present in the response only when the expression was
@@ -593,35 +558,18 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_ssti_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
-        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = http_witness_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            target,
-            HTTP_SSTI_VANTAGE,
+        let channel = self.vantage_channel(target)?;
+        let (observation, draft, control) = adapters::Ssti {
             request_path,
             marker,
-            &[],
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only an evaluated expression earns the domain diagnostic; its text asserts
         // the template was evaluated, which holds iff the marker (the seeded secret)
         // was observed.
         let diagnostic = gated_diagnostic(observation.value, || ssti_diagnostic(marker));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        Ok(self.finish(observation, draft, control, diagnostic))
     }
 
     /// Attempt a path traversal against `target` from the attacker's vantage and
@@ -630,7 +578,7 @@ impl TestContext {
     ///
     /// The second native app-security check, parallel to
     /// [`exploit_sqli_from_vantage`](Self::exploit_sqli_from_vantage) and built on
-    /// the same HTTP witness seam (`http_witness_exploit_from`), differing only in
+    /// the same HTTP witness seam (`VantageChannel::http_witness`), differing only in
     /// the capability name and the diagnostic. `request_path` carries the traversal
     /// payload (an escaping `?path=`, URL-encoded), and `marker` is the body of a
     /// file seeded outside the web root, present in the response only if the
@@ -650,34 +598,17 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_path_traversal_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
-        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = http_witness_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            target,
-            HTTP_PATH_TRAVERSAL_VANTAGE,
+        let channel = self.vantage_channel(target)?;
+        let (observation, draft, control) = adapters::PathTraversal {
             request_path,
             marker,
-            &[],
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only a traversal that read the sentinel earns the domain diagnostic; its
         // text asserts a file outside the web root was read, true iff observed.
         let diagnostic = gated_diagnostic(observation.value, || path_traversal_diagnostic(marker));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        Ok(self.finish(observation, draft, control, diagnostic))
     }
 
     /// Attempt an IDOR (broken access control) against `target` from the attacker's
@@ -746,41 +677,22 @@ impl TestContext {
         own_marker: &str,
         request_headers: &[(String, String)],
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_idor_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // The in-container gate: a Controlled HTTP attack (#44), confined by lab
-        // isolation (ADR-0006 layers 1-2); Aggressive would be refused here.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, victim_draft, control_draft) = idor_exploit_corroborated_from(
-            &binding.docker,
-            &binding.vantage_network,
-            target,
+        let channel = self.vantage_channel(target)?;
+        let (observation, victim_draft, control_draft) = adapters::Idor {
             victim_path,
             victim_marker,
             own_path,
             own_marker,
             request_headers,
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
-        .await?;
-        // Victim first, so the returned ref is the judged finding; the own-object
-        // control is appended as a recorded fact when it ran (ADR-0004). On the
-        // exploit path the control is skipped, so there is no control draft.
-        let draft_ref = self.record_draft(victim_draft);
-        if let Some(control_draft) = control_draft {
-            self.record_draft(control_draft);
         }
+        .run(&channel)
+        .await?;
         // Only an object actually read across the boundary earns the diagnostic; its
         // text asserts another user's object was served, true iff observed.
         let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(victim_marker));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        // `finish` records the victim draft first (the judged finding) and appends the
+        // own-object control when present (ADR-0004); the exploit path has no control.
+        Ok(self.finish(observation, victim_draft, control_draft, diagnostic))
     }
 
     /// Coerce `app` (the SSRF target) from the attacker vantage to fetch an in-lab
@@ -790,7 +702,7 @@ impl TestContext {
     ///
     /// The fourth native app-security check, and the one not on the body-marker
     /// seam: its witness is the per-probe `token` appearing in the canary's logs,
-    /// not in the app's own response (`ssrf_exploit_from`, #65). `canary_alias` and
+    /// not in the app's own response (`VantageChannel::oob_coercion`, #65). `canary_alias` and
     /// `canary_port` name the canary on the lab network (the coercion URL), and
     /// `canary_container` is its container (whose logs are read); the test resolves
     /// the container name from the running lab. The finding is attributed to `app`,
@@ -817,37 +729,18 @@ impl TestContext {
         canary_port: u16,
         canary_container: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_ssrf_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // Mint a fresh, unique per-probe token here, not from the caller: this
-        // coercion's canary callback must be distinguishable and a caller cannot
-        // pass a weak or forgeable one.
-        let token = canary_token();
-        // The in-container gate: a Controlled coercion (#44), lab-confined.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = ssrf_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            app,
+        let channel = self.vantage_channel(app)?;
+        let (observation, draft, control) = adapters::Ssrf {
             canary_alias,
             canary_port,
             canary_container,
-            &token,
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only a coercion that actually reached the canary earns the diagnostic;
         // its text asserts the server reached an internal host, true iff observed.
         let diagnostic = gated_diagnostic(observation.value, || ssrf_diagnostic(canary_alias));
-        Ok(Recorded {
-            observation,
-            draft_ref,
-            diagnostic,
-        })
+        Ok(self.finish(observation, draft, control, diagnostic))
     }
 
     /// The lab-wired BLIND OS command injection check (#87): the out-of-band twin
@@ -857,7 +750,7 @@ impl TestContext {
     /// the target to run an injected command that calls back to the in-lab canary
     /// and witnesses the per-probe token in the canary's logs, OUT-OF-BAND, exactly
     /// as [`exploit_ssrf_from_vantage`](Self::exploit_ssrf_from_vantage) does
-    /// (`blind_cmdi_exploit_from`, ADR-0023). `canary_alias`/`canary_port` are where
+    /// (`VantageChannel::oob_coercion`, ADR-0023). `canary_alias`/`canary_port` are where
     /// the injected command is steered, and `canary_container` is the container
     /// whose logs are read for the token. An exploit is observed at `High`, a clean
     /// non-exploit at `High`, and an abnormal probe at `Low` (ADR-0010, RK-002). The
@@ -887,40 +780,63 @@ impl TestContext {
         canary_port: u16,
         canary_container: &str,
     ) -> Result<Recorded<bool>> {
-        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
-            reason: "no attacker vantage is bound to this run; exploit_blind_command_injection_from_vantage needs a lab (run_in_lab)"
-                .to_owned(),
-        })?;
-        // Mint a fresh, unique per-probe token here, not from the caller: this
-        // callback must be distinguishable and a caller cannot pass a weak or
-        // forgeable one. The out-of-band token helper is shared with SSRF.
-        let token = canary_token();
-        // The in-container gate: a Controlled coercion (#44), lab-confined.
-        let cleared = VantageCleared::issue(Intensity::Controlled)?;
-        let (observation, draft) = blind_cmdi_exploit_from(
-            &binding.docker,
-            &binding.vantage_network,
-            app,
+        let channel = self.vantage_channel(app)?;
+        let (observation, draft, control) = adapters::BlindCommandInjection {
             canary_alias,
             canary_port,
             canary_container,
-            &token,
-            DEFAULT_CONNECT_TIMEOUT,
-            &cleared,
-        )
+        }
+        .run(&channel)
         .await?;
-        let draft_ref = self.record_draft(draft);
         // Only an injection that actually reached the canary earns the diagnostic;
         // its text asserts the target ran an injected command that called out, true
         // iff observed.
         let diagnostic = gated_diagnostic(observation.value, || {
             blind_command_injection_diagnostic(canary_alias)
         });
-        Ok(Recorded {
+        Ok(self.finish(observation, draft, control, diagnostic))
+    }
+
+    /// Build a [`VantageChannel`] for `target` on this run's bound lab, minting the
+    /// in-container gate (`Controlled`, confined by ADR-0006 layers 1-2; Aggressive is
+    /// refused). Errors with [`Error::LabUnavailable`] when no lab is bound. Shared by
+    /// every `exploit_*_from_vantage` wrapper so the gate and the lab binding live in
+    /// one place; the proof is required to build the channel and then dropped (#44).
+    fn vantage_channel<'c>(&'c self, target: &'c ScopedTarget) -> Result<VantageChannel<'c>> {
+        let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
+            reason: "no attacker vantage is bound to this run; a vantage capability needs a lab (run_in_lab)"
+                .to_owned(),
+        })?;
+        let cleared = VantageCleared::issue(Intensity::Controlled)?;
+        Ok(VantageChannel::new(
+            &binding.docker,
+            &binding.vantage_network,
+            target,
+            &cleared,
+            DEFAULT_CONNECT_TIMEOUT,
+        ))
+    }
+
+    /// Record a capability's draft(s) and wrap the result. The victim/finding draft is
+    /// recorded first, so the returned [`DraftRef`] is the judged finding; a second
+    /// draft (IDOR's own-object control) is appended as a recorded fact when present
+    /// (ADR-0004, RK-004). Shared by every `exploit_*_from_vantage` wrapper.
+    fn finish(
+        &self,
+        observation: Observation<bool>,
+        victim_draft: EvidenceDraft,
+        control_draft: Option<EvidenceDraft>,
+        diagnostic: Option<Diagnostic>,
+    ) -> Recorded<bool> {
+        let draft_ref = self.record_draft(victim_draft);
+        if let Some(control_draft) = control_draft {
+            self.record_draft(control_draft);
+        }
+        Recorded {
             observation,
             draft_ref,
             diagnostic,
-        })
+        }
     }
 
     /// Push one evidence draft into the sink and return its per-test reference.
@@ -1658,6 +1574,58 @@ mod tests {
         assert_eq!(drafts[0].observed, serde_json::Value::Bool(true));
         // Drained, not left behind: a second drain is empty.
         assert!(ctx.take_evidence_drafts().is_empty());
+    }
+
+    /// Guard: `finish` records the FINDING (victim) draft first, so the returned ref is
+    /// the finding, and appends the control second (ADR-0004, RK-004). `finish` is new
+    /// #133 code; the victim-first ordering and the ref-points-at-the-finding invariant
+    /// were otherwise pinned only by the Docker-gated IDOR tests, so a mutation making
+    /// the returned ref follow the control (the finding would then resolve to the benign
+    /// own-object control row) shipped green offline (#133 review). Mutations in `finish`:
+    /// reassign `draft_ref` from the control's `record_draft`, or record the control
+    /// before the victim -> an assertion here fails.
+    #[test]
+    fn finish_records_the_finding_first_and_appends_the_control() {
+        let ctx = TestContext::new(Scope::default());
+        let draft = |capability: &'static str, observed: bool| {
+            EvidenceDraft::new(
+                capability,
+                "api:8081".to_owned(),
+                Intensity::Controlled,
+                serde_json::Value::Bool(observed),
+                Confidence::High,
+                "summary".to_owned(),
+                crate::evidence::Reproduction::new(
+                    capability,
+                    "api:8081".to_owned(),
+                    serde_json::json!({}),
+                ),
+            )
+        };
+        let observation = Observation {
+            value: false,
+            confidence: Confidence::High,
+        };
+        let recorded = ctx.finish(
+            observation,
+            draft("victim_finding", false),
+            Some(draft("own_object_control", true)),
+            None,
+        );
+        let drafts = ctx.take_evidence_drafts();
+        assert_eq!(
+            drafts.len(),
+            2,
+            "the finding and the control are both recorded"
+        );
+        // The returned ref is the FINDING (victim), recorded first; not the control.
+        assert_eq!(recorded.draft_ref.index(), 0);
+        assert_eq!(
+            drafts[recorded.draft_ref.index()].capability,
+            "victim_finding"
+        );
+        // The control is the next-appended fact.
+        assert_eq!(drafts[1].capability, "own_object_control");
     }
 
     /// Guard: expecting over a capability's `Observed` result carries the per-test
