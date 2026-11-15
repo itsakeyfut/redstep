@@ -1473,15 +1473,28 @@ fn witness_url(target: &ScopedTarget, request_path: &str) -> String {
 /// The attacker vantage a capability technique runs against: the lab handle, the
 /// vantage network, the ONE scope-resolved target, and the timeout. A technique is
 /// handed `&VantageChannel` and chooses only its payload; the destination is this
-/// channel's private `target`, and only this crate (holding a [`VantageCleared`] and
+/// channel's private `target`, and only this crate (holding a `VantageCleared` and
 /// a scope-resolved [`ScopedTarget`]) can build one, so a technique has no route to a
-/// target it was not given. This is the in-crate form of ADR-0025's escape-scope
-/// relocation; the cross-crate `compile_fail` guard arrives when the trait goes
-/// public (#89). Every op owns the trust-critical steps: request validation
+/// target it was not given. Every op owns the trust-critical steps: request validation
 /// (RK-015), the destination-fixing URL build, the out-of-band token mint, the
 /// classification (ADR-0010), and the evidence draft (ADR-0004); a technique supplies
 /// payload and text only (#133).
-pub(crate) struct VantageChannel<'a> {
+///
+/// The struct is public, so an out-of-crate technique (the #89 crate split) can be
+/// handed one, but `new` is `pub(crate)` and the fields are private: only this crate
+/// can build a channel (the gate proof `new` requires is itself un-constructable
+/// outside the crate) or read its fixed `target`. That private `target` is where
+/// ADR-0025's escape-scope guarantee lives -- a technique cannot learn, let alone
+/// change, where the channel points -- and this doctest holds it: reading the field
+/// from outside the crate is `E0616` (mutation: make `target` `pub` and this compiles,
+/// so the test fails):
+///
+/// ```compile_fail
+/// fn _reads_the_fixed_target(channel: &redstep::VantageChannel<'_>) {
+///     let _ = channel.target;
+/// }
+/// ```
+pub struct VantageChannel<'a> {
     docker: &'a Docker,
     vantage: &'a LabNetwork,
     target: &'a ScopedTarget,
@@ -2529,7 +2542,7 @@ async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> R
 /// command injection (#87) coerce the channel's target to call back to an in-lab
 /// canary and witness the per-probe token in the canary's logs OUT-OF-BAND, not in
 /// the probe's own response, so this is a separate path from
-/// [`VantageChannel::http_witness`] (whose `classify_http_witness` reads the body).
+/// `VantageChannel::http_witness` (whose `classify_http_witness` reads the body).
 /// Layer-1 isolation (ADR-0006) confines the callback to the egress-less lab, the
 /// draft's target is the coerced app and not the canary, and the token is not a
 /// secret (a replay re-derives the coercion path rather than trusting the recorded
@@ -2781,10 +2794,10 @@ fn coercion_path_is_safe(request_path: &str) -> bool {
 /// The in-lab canary an out-of-band coercion steers the target to call back to: the
 /// network alias and port the callback URL names, and the container whose logs carry
 /// the per-probe token when the callback fires (#65, #87, ADR-0023).
-pub(crate) struct CanaryCoords<'a> {
-    pub(crate) alias: &'a str,
-    pub(crate) port: u16,
-    pub(crate) container: &'a str,
+pub struct CanaryCoords<'a> {
+    pub alias: &'a str,
+    pub port: u16,
+    pub container: &'a str,
 }
 
 /// The evidence summary when an SSRF coercion reached the canary. A free fn (not
@@ -2816,14 +2829,27 @@ const BLIND_CMDI_CLEAN_SUMMARY: &str =
 /// cross-crate boundary and lifting these into `redstep-attacks` is #89.
 pub(crate) mod adapters {
     use super::*;
+    use crate::context::{
+        blind_command_injection_diagnostic, command_injection_diagnostic, idor_diagnostic,
+        path_traversal_diagnostic, sqli_diagnostic, ssrf_diagnostic, ssti_diagnostic,
+    };
+    use crate::expectation::Diagnostic;
 
     /// One attack technique, expressed as a recipe over a destination-fixed
     /// [`VantageChannel`]. `run` returns the observation, the finding's draft, and an
-    /// optional second draft (the IDOR own-object control). Static dispatch for now; a
-    /// `dyn`-safe registry is #89.
+    /// optional second draft (the IDOR own-object control); `diagnostic` carries the
+    /// per-technique remediation text when the technique was observed, so it travels
+    /// with the technique (into `redstep-attacks`, #89) rather than with a `redstep`
+    /// wrapper. The trait is public and unsealed: an out-of-crate technique (the #89
+    /// crate split) implements it, and the escape-scope guarantee is held by
+    /// [`VantageChannel`] (which only this crate can construct), not by sealing the
+    /// trait (ADR-0025). Static dispatch for now; a `dyn`-safe registry is #89.
     #[allow(async_fn_in_trait)]
-    pub(crate) trait CapabilityAdapter {
+    pub trait CapabilityAdapter {
         fn capability(&self) -> &'static str;
+        /// The remediation diagnostic when the technique was observed (`observed`),
+        /// `None` otherwise -- gated so an un-exploited probe carries no finding text.
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic>;
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2838,6 +2864,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for Sqli<'_> {
         fn capability(&self) -> &'static str {
             HTTP_SQLI_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| sqli_diagnostic(self.marker))
         }
         async fn run(
             &self,
@@ -2860,6 +2889,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_CMDI_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| command_injection_diagnostic(self.marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2881,6 +2913,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_SSTI_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| ssti_diagnostic(self.marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2901,6 +2936,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for PathTraversal<'_> {
         fn capability(&self) -> &'static str {
             HTTP_PATH_TRAVERSAL_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| path_traversal_diagnostic(self.marker))
         }
         async fn run(
             &self,
@@ -2926,6 +2964,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_IDOR_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| idor_diagnostic(self.victim_marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2949,6 +2990,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for Ssrf<'_> {
         fn capability(&self) -> &'static str {
             HTTP_SSRF_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| ssrf_diagnostic(self.canary_alias))
         }
         async fn run(
             &self,
@@ -2981,6 +3025,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for BlindCommandInjection<'_> {
         fn capability(&self) -> &'static str {
             HTTP_BLIND_CMDI_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| blind_command_injection_diagnostic(self.canary_alias))
         }
         async fn run(
             &self,
@@ -3454,6 +3501,94 @@ mod tests {
             }
             .capability(),
             HTTP_BLIND_CMDI_VANTAGE
+        );
+    }
+
+    /// Guard: each adapter's `diagnostic` is gated on `observed` -- None on a clean
+    /// result, Some on an observed exploit -- and a body-marker technique names its own
+    /// marker. The per-adapter form of the former
+    /// `gated_diagnostic_attaches_only_to_an_observed_exploit` (#137). Mutation: drop an
+    /// adapter's `observed.then(..)` gate (always Some), or call another technique's
+    /// diagnostic fn (so the cause no longer names this technique's input) -> an
+    /// assertion fails.
+    #[test]
+    fn each_adapter_diagnostic_is_gated_on_observed() {
+        use adapters::CapabilityAdapter;
+        // A clean (non-observed) result carries no diagnostic, for every adapter.
+        assert!(
+            adapters::Sqli {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::CommandInjection {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Ssti {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::PathTraversal {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Idor {
+                victim_path: "/",
+                victim_marker: "M",
+                own_path: "/o",
+                own_marker: "O",
+                request_headers: &[],
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Ssrf {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::BlindCommandInjection {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        // An observed exploit carries the technique's own diagnostic: the SQLi cause
+        // names the marker it exfiltrated (so a wrong-fn wiring, which would name a
+        // canary alias or another marker, is caught).
+        let sqli = adapters::Sqli {
+            request_path: "/",
+            marker: "MARKER42",
+        }
+        .diagnostic(true)
+        .expect("an observed SQLi carries a diagnostic");
+        assert!(
+            sqli.probable_cause.contains("MARKER42"),
+            "the SQLi diagnostic names the marker: {:?}",
+            sqli.probable_cause
         );
     }
 

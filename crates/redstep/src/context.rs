@@ -487,17 +487,14 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(target)?;
-        let (observation, draft, control) = adapters::Sqli {
-            request_path,
-            marker,
-        }
-        .run(&channel)
-        .await?;
-        // Only an executed injection earns the domain diagnostic; its text asserts
-        // the injection ran, which holds iff the marker was observed.
-        let diagnostic = gated_diagnostic(observation.value, || sqli_diagnostic(marker));
-        Ok(self.finish(observation, draft, control, diagnostic))
+        self.run_from_vantage(
+            target,
+            adapters::Sqli {
+                request_path,
+                marker,
+            },
+        )
+        .await
     }
 
     /// The lab-wired command injection check, parallel to
@@ -522,18 +519,14 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(target)?;
-        let (observation, draft, control) = adapters::CommandInjection {
-            request_path,
-            marker,
-        }
-        .run(&channel)
-        .await?;
-        // Only an executed command earns the domain diagnostic; its text asserts a
-        // command ran, true iff the marker (the command's output) was observed.
-        let diagnostic =
-            gated_diagnostic(observation.value, || command_injection_diagnostic(marker));
-        Ok(self.finish(observation, draft, control, diagnostic))
+        self.run_from_vantage(
+            target,
+            adapters::CommandInjection {
+                request_path,
+                marker,
+            },
+        )
+        .await
     }
 
     /// The lab-wired server-side template injection (SSTI) check, parallel to
@@ -558,18 +551,14 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(target)?;
-        let (observation, draft, control) = adapters::Ssti {
-            request_path,
-            marker,
-        }
-        .run(&channel)
-        .await?;
-        // Only an evaluated expression earns the domain diagnostic; its text asserts
-        // the template was evaluated, which holds iff the marker (the seeded secret)
-        // was observed.
-        let diagnostic = gated_diagnostic(observation.value, || ssti_diagnostic(marker));
-        Ok(self.finish(observation, draft, control, diagnostic))
+        self.run_from_vantage(
+            target,
+            adapters::Ssti {
+                request_path,
+                marker,
+            },
+        )
+        .await
     }
 
     /// Attempt a path traversal against `target` from the attacker's vantage and
@@ -598,17 +587,14 @@ impl TestContext {
         request_path: &str,
         marker: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(target)?;
-        let (observation, draft, control) = adapters::PathTraversal {
-            request_path,
-            marker,
-        }
-        .run(&channel)
-        .await?;
-        // Only a traversal that read the sentinel earns the domain diagnostic; its
-        // text asserts a file outside the web root was read, true iff observed.
-        let diagnostic = gated_diagnostic(observation.value, || path_traversal_diagnostic(marker));
-        Ok(self.finish(observation, draft, control, diagnostic))
+        self.run_from_vantage(
+            target,
+            adapters::PathTraversal {
+                request_path,
+                marker,
+            },
+        )
+        .await
     }
 
     /// Attempt an IDOR (broken access control) against `target` from the attacker's
@@ -677,22 +663,17 @@ impl TestContext {
         own_marker: &str,
         request_headers: &[(String, String)],
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(target)?;
-        let (observation, victim_draft, control_draft) = adapters::Idor {
-            victim_path,
-            victim_marker,
-            own_path,
-            own_marker,
-            request_headers,
-        }
-        .run(&channel)
-        .await?;
-        // Only an object actually read across the boundary earns the diagnostic; its
-        // text asserts another user's object was served, true iff observed.
-        let diagnostic = gated_diagnostic(observation.value, || idor_diagnostic(victim_marker));
-        // `finish` records the victim draft first (the judged finding) and appends the
-        // own-object control when present (ADR-0004); the exploit path has no control.
-        Ok(self.finish(observation, victim_draft, control_draft, diagnostic))
+        self.run_from_vantage(
+            target,
+            adapters::Idor {
+                victim_path,
+                victim_marker,
+                own_path,
+                own_marker,
+                request_headers,
+            },
+        )
+        .await
     }
 
     /// Coerce `app` (the SSRF target) from the attacker vantage to fetch an in-lab
@@ -729,18 +710,15 @@ impl TestContext {
         canary_port: u16,
         canary_container: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(app)?;
-        let (observation, draft, control) = adapters::Ssrf {
-            canary_alias,
-            canary_port,
-            canary_container,
-        }
-        .run(&channel)
-        .await?;
-        // Only a coercion that actually reached the canary earns the diagnostic;
-        // its text asserts the server reached an internal host, true iff observed.
-        let diagnostic = gated_diagnostic(observation.value, || ssrf_diagnostic(canary_alias));
-        Ok(self.finish(observation, draft, control, diagnostic))
+        self.run_from_vantage(
+            app,
+            adapters::Ssrf {
+                canary_alias,
+                canary_port,
+                canary_container,
+            },
+        )
+        .await
     }
 
     /// The lab-wired BLIND OS command injection check (#87): the out-of-band twin
@@ -780,20 +758,31 @@ impl TestContext {
         canary_port: u16,
         canary_container: &str,
     ) -> Result<Recorded<bool>> {
-        let channel = self.vantage_channel(app)?;
-        let (observation, draft, control) = adapters::BlindCommandInjection {
-            canary_alias,
-            canary_port,
-            canary_container,
-        }
-        .run(&channel)
-        .await?;
-        // Only an injection that actually reached the canary earns the diagnostic;
-        // its text asserts the target ran an injected command that called out, true
-        // iff observed.
-        let diagnostic = gated_diagnostic(observation.value, || {
-            blind_command_injection_diagnostic(canary_alias)
-        });
+        self.run_from_vantage(
+            app,
+            adapters::BlindCommandInjection {
+                canary_alias,
+                canary_port,
+                canary_container,
+            },
+        )
+        .await
+    }
+
+    /// Run a capability technique from the attacker vantage: mint the gate, build the
+    /// destination-fixed [`VantageChannel`] for `target`, run the `adapter`, and record
+    /// its draft(s) with the adapter's own diagnostic. Core drives the adapter without
+    /// naming a concrete type -- the shape the one-way `redstep-attacks` dependency needs
+    /// (#137, ADR-0025). The `exploit_*_from_vantage` methods are thin wrappers over this,
+    /// and an out-of-crate technique (#89) is driven the same way.
+    pub async fn run_from_vantage(
+        &self,
+        target: &ScopedTarget,
+        adapter: impl CapabilityAdapter,
+    ) -> Result<Recorded<bool>> {
+        let channel = self.vantage_channel(target)?;
+        let (observation, draft, control) = adapter.run(&channel).await?;
+        let diagnostic = adapter.diagnostic(observation.value);
         Ok(self.finish(observation, draft, control, diagnostic))
     }
 
@@ -993,26 +982,12 @@ fn blast_radius_summary(elements: &[BlastRadiusElement]) -> String {
     )
 }
 
-/// Attach a domain diagnostic only to an observed exploit. The ADR-0009 cause is
-/// carried iff the capability actually witnessed the technique (`observed`), so a
-/// clean non-exploit never carries one; `make` is called only then. Every vantage
-/// check routes its diagnostic through this one gate, so the "always attach"
-/// mutation lives here and a single offline test
-/// (`gated_diagnostic_attaches_only_to_an_observed_exploit`) stands for all of them.
-/// Before this, the gate (`observation.value.then(..)`) was inlined per method and
-/// guarded only by each Docker-gated flags test, so the mutation shipped green
-/// off-Docker (#88; #85/#90 reviews). Pure, no lab. The capability-stamping half of
-/// that same gap needs the method to run offline and is deferred to #94 (v0.3.0).
-fn gated_diagnostic(observed: bool, make: impl FnOnce() -> Diagnostic) -> Option<Diagnostic> {
-    observed.then(make)
-}
-
 /// The ADR-0009 domain diagnostic for a successful SQL injection: the cause names
 /// the `marker` the injection exfiltrated and that input reached the SQL, and the
 /// remediation is a parameterized query. Framework-emitted, not author-written
 /// (ADR-0009). Pure, so the text is guarded without Docker
 /// (`sqli_diagnostic_names_the_marker_and_the_fix`).
-fn sqli_diagnostic(marker: &str) -> Diagnostic {
+pub(crate) fn sqli_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the injected request returned {marker:?}, a value present only in the database, \
@@ -1030,7 +1005,7 @@ fn sqli_diagnostic(marker: &str) -> Diagnostic {
 /// argument vector (no shell) and validate the input. Framework-emitted, not
 /// author-written (ADR-0009). Pure, so the text is guarded without Docker
 /// (`command_injection_diagnostic_names_the_marker_and_the_fix`).
-fn command_injection_diagnostic(marker: &str) -> Diagnostic {
+pub(crate) fn command_injection_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the response returned {marker:?}, the output of a command the request injected, \
@@ -1051,7 +1026,7 @@ fn command_injection_diagnostic(marker: &str) -> Diagnostic {
 /// returned marker. Framework-emitted, not author-written (ADR-0009). Pure, so the
 /// text is guarded without Docker
 /// (`blind_command_injection_diagnostic_names_the_callback_and_the_fix`).
-fn blind_command_injection_diagnostic(canary_alias: &str) -> Diagnostic {
+pub(crate) fn blind_command_injection_diagnostic(canary_alias: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the target called back to the in-lab host {canary_alias:?} with the injected token, \
@@ -1070,7 +1045,7 @@ fn blind_command_injection_diagnostic(canary_alias: &str) -> Diagnostic {
 /// the remediation is to render a fixed template and pass input as a bound value.
 /// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
 /// without Docker (`ssti_diagnostic_names_the_marker_and_the_fix`).
-fn ssti_diagnostic(marker: &str) -> Diagnostic {
+pub(crate) fn ssti_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the response returned {marker:?}, the result of an expression the request injected, \
@@ -1088,7 +1063,7 @@ fn ssti_diagnostic(marker: &str) -> Diagnostic {
 /// remediation is to canonicalize the resolved path and reject one that escapes
 /// that directory. Framework-emitted, not author-written (ADR-0009). Pure, so the text is
 /// guarded without Docker (`path_traversal_diagnostic_names_the_marker_and_the_fix`).
-fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
+pub(crate) fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the request returned {marker:?}, the body of a file outside the intended directory, \
@@ -1109,7 +1084,7 @@ fn path_traversal_diagnostic(marker: &str) -> Diagnostic {
 /// as the playground mvp does), so it states what the marker proves and no more.
 /// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
 /// without Docker (`idor_diagnostic_names_the_marker_and_the_fix`).
-fn idor_diagnostic(marker: &str) -> Diagnostic {
+pub(crate) fn idor_diagnostic(marker: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the response returned {marker:?}, a value present only in another user's object, \
@@ -1127,7 +1102,7 @@ fn idor_diagnostic(marker: &str) -> Diagnostic {
 /// allowlist the permitted outbound hosts and refuse an internal/private target.
 /// Framework-emitted, not author-written (ADR-0009). Pure, so the text is guarded
 /// without Docker (`ssrf_diagnostic_names_the_host_and_the_fix`).
-fn ssrf_diagnostic(canary_alias: &str) -> Diagnostic {
+pub(crate) fn ssrf_diagnostic(canary_alias: &str) -> Diagnostic {
     Diagnostic {
         probable_cause: format!(
             "the target fetched a caller-supplied URL and reached the internal host \
@@ -1837,31 +1812,6 @@ mod tests {
             matches!(result, Err(Error::LabUnavailable { .. })),
             "exploit_sqli_from_vantage without a vantage must fail closed (got Ok: {})",
             result.is_ok()
-        );
-    }
-
-    /// Guard: the shared diagnostic gate attaches a diagnostic only to an observed
-    /// exploit, and does not evaluate the constructor on a clean result. Every
-    /// vantage check (sqli, command injection, ssti, path traversal, idor, ssrf)
-    /// routes its diagnostic through `gated_diagnostic`, so this one offline test
-    /// stands for all six: the "always attach" mutation lives in the helper, not in
-    /// the methods, and before #88 that mutation shipped green off-Docker because the
-    /// only guard was each Docker-gated flags test. Mutation: change the helper's
-    /// `observed.then(make)` to `Some(make())` -> the not-observed case returns `Some`
-    /// and runs the panicking constructor -> this fails.
-    #[test]
-    fn gated_diagnostic_attaches_only_to_an_observed_exploit() {
-        assert!(
-            gated_diagnostic(false, || panic!(
-                "the constructor must not run on a clean result"
-            ))
-            .is_none(),
-            "a non-exploit carries no diagnostic"
-        );
-        assert_eq!(
-            gated_diagnostic(true, || sqli_diagnostic("M")),
-            Some(sqli_diagnostic("M")),
-            "an observed exploit carries the constructed diagnostic"
         );
     }
 
