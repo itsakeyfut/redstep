@@ -1473,14 +1473,20 @@ fn witness_url(target: &ScopedTarget, request_path: &str) -> String {
 /// The attacker vantage a capability technique runs against: the lab handle, the
 /// vantage network, the ONE scope-resolved target, and the timeout. A technique is
 /// handed `&VantageChannel` and chooses only its payload; the destination is this
-/// channel's private `target`, and only this crate (holding a [`VantageCleared`] and
+/// channel's private `target`, and only this crate (holding a `VantageCleared` and
 /// a scope-resolved [`ScopedTarget`]) can build one, so a technique has no route to a
-/// target it was not given. This is the in-crate form of ADR-0025's escape-scope
-/// relocation; the cross-crate `compile_fail` guard arrives when the trait goes
-/// public (#89). Every op owns the trust-critical steps: request validation
+/// target it was not given. Every op owns the trust-critical steps: request validation
 /// (RK-015), the destination-fixing URL build, the out-of-band token mint, the
 /// classification (ADR-0010), and the evidence draft (ADR-0004); a technique supplies
 /// payload and text only (#133).
+///
+/// The struct and its fields are `pub(crate)`: a technique cannot construct a channel
+/// (the gate proof `new` requires is itself un-constructable outside the crate) or
+/// read its fixed `target`. That private `target` is where ADR-0025's escape-scope
+/// guarantee lives. The cross-crate `compile_fail` guard that an out-of-crate
+/// technique cannot forge or redirect a channel arrives when the boundary is published,
+/// with the crate split (#89, ADR-0025); it is deferred rather than written against a
+/// still-`pub(crate)` type.
 pub(crate) struct VantageChannel<'a> {
     docker: &'a Docker,
     vantage: &'a LabNetwork,
@@ -2529,7 +2535,7 @@ async fn poll_logs_for_token(docker: &Docker, container: &str, token: &str) -> R
 /// command injection (#87) coerce the channel's target to call back to an in-lab
 /// canary and witness the per-probe token in the canary's logs OUT-OF-BAND, not in
 /// the probe's own response, so this is a separate path from
-/// [`VantageChannel::http_witness`] (whose `classify_http_witness` reads the body).
+/// `VantageChannel::http_witness` (whose `classify_http_witness` reads the body).
 /// Layer-1 isolation (ADR-0006) confines the callback to the egress-less lab, the
 /// draft's target is the coerced app and not the canary, and the token is not a
 /// secret (a replay re-derives the coercion path rather than trusting the recorded
@@ -2809,21 +2815,34 @@ const BLIND_CMDI_CLEAN_SUMMARY: &str =
 
 /// The attack techniques as capability recipes (#133, ADR-0025). Each implements
 /// `CapabilityAdapter`: handed a [`VantageChannel`] whose destination is already
-/// fixed, it chooses only its payload and returns the normalized observation and the
-/// evidence draft(s). The per-technique remediation diagnostic stays with the public
-/// `exploit_*_from_vantage` wrapper in `context.rs`, not here, so an adapter is purely
-/// the probe recipe. The trait is `pub(crate)` and in-crate; making it the public
-/// cross-crate boundary and lifting these into `redstep-attacks` is #89.
+/// fixed, it chooses only its payload, returns the normalized observation and the
+/// evidence draft(s), and carries its own gated remediation diagnostic (#137), so the
+/// per-technique text travels with the technique rather than with a `context.rs`
+/// wrapper. The trait is `pub(crate)` and in-crate; making it the public cross-crate
+/// boundary and lifting these into `redstep-attacks` is #89.
 pub(crate) mod adapters {
     use super::*;
+    use crate::context::{
+        blind_command_injection_diagnostic, command_injection_diagnostic, idor_diagnostic,
+        path_traversal_diagnostic, sqli_diagnostic, ssrf_diagnostic, ssti_diagnostic,
+    };
+    use crate::expectation::Diagnostic;
 
     /// One attack technique, expressed as a recipe over a destination-fixed
     /// [`VantageChannel`]. `run` returns the observation, the finding's draft, and an
-    /// optional second draft (the IDOR own-object control). Static dispatch for now; a
-    /// `dyn`-safe registry is #89.
+    /// optional second draft (the IDOR own-object control); `diagnostic` carries the
+    /// per-technique remediation text when the technique was observed, so it travels
+    /// with the technique (into `redstep-attacks`, #89) rather than with a `redstep`
+    /// wrapper. The trait is public and unsealed: an out-of-crate technique (the #89
+    /// crate split) implements it, and the escape-scope guarantee is held by
+    /// [`VantageChannel`] (which only this crate can construct), not by sealing the
+    /// trait (ADR-0025). Static dispatch for now; a `dyn`-safe registry is #89.
     #[allow(async_fn_in_trait)]
     pub(crate) trait CapabilityAdapter {
         fn capability(&self) -> &'static str;
+        /// The remediation diagnostic when the technique was observed (`observed`),
+        /// `None` otherwise -- gated so an un-exploited probe carries no finding text.
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic>;
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2838,6 +2857,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for Sqli<'_> {
         fn capability(&self) -> &'static str {
             HTTP_SQLI_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| sqli_diagnostic(self.marker))
         }
         async fn run(
             &self,
@@ -2860,6 +2882,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_CMDI_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| command_injection_diagnostic(self.marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2881,6 +2906,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_SSTI_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| ssti_diagnostic(self.marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2901,6 +2929,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for PathTraversal<'_> {
         fn capability(&self) -> &'static str {
             HTTP_PATH_TRAVERSAL_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| path_traversal_diagnostic(self.marker))
         }
         async fn run(
             &self,
@@ -2926,6 +2957,9 @@ pub(crate) mod adapters {
         fn capability(&self) -> &'static str {
             HTTP_IDOR_VANTAGE
         }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| idor_diagnostic(self.victim_marker))
+        }
         async fn run(
             &self,
             ch: &VantageChannel<'_>,
@@ -2949,6 +2983,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for Ssrf<'_> {
         fn capability(&self) -> &'static str {
             HTTP_SSRF_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| ssrf_diagnostic(self.canary_alias))
         }
         async fn run(
             &self,
@@ -2981,6 +3018,9 @@ pub(crate) mod adapters {
     impl CapabilityAdapter for BlindCommandInjection<'_> {
         fn capability(&self) -> &'static str {
             HTTP_BLIND_CMDI_VANTAGE
+        }
+        fn diagnostic(&self, observed: bool) -> Option<Diagnostic> {
+            observed.then(|| blind_command_injection_diagnostic(self.canary_alias))
         }
         async fn run(
             &self,
@@ -3454,6 +3494,149 @@ mod tests {
             }
             .capability(),
             HTTP_BLIND_CMDI_VANTAGE
+        );
+    }
+
+    /// Guard: each adapter's `diagnostic` is gated on `observed` (None on a clean
+    /// result, Some on an observed exploit) AND is exactly ITS OWN technique's
+    /// diagnostic (the matching `*_diagnostic` fn with the technique's own input).
+    /// Replaces the removed shared `gated_diagnostic` gate's single test with a
+    /// per-adapter one (#137). Mutations: drop an adapter's `observed.then(..)` gate
+    /// (always Some), return None, call another technique's diagnostic fn, or pass the
+    /// wrong field -> the matching assertion fails.
+    #[test]
+    fn each_adapter_diagnostic_is_gated_on_observed() {
+        use adapters::CapabilityAdapter;
+        // A clean (non-observed) result carries no diagnostic, for every adapter.
+        assert!(
+            adapters::Sqli {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::CommandInjection {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Ssti {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::PathTraversal {
+                request_path: "/",
+                marker: "M"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Idor {
+                victim_path: "/",
+                victim_marker: "M",
+                own_path: "/o",
+                own_marker: "O",
+                request_headers: &[],
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::Ssrf {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        assert!(
+            adapters::BlindCommandInjection {
+                canary_alias: "c",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(false)
+            .is_none()
+        );
+        // An observed exploit carries EXACTLY its own technique's diagnostic (the right
+        // fn with the right field), so a wrong-fn wiring or a wrong-field argument is
+        // caught for every adapter, not only SQLi.
+        use crate::context::{
+            blind_command_injection_diagnostic, command_injection_diagnostic, idor_diagnostic,
+            path_traversal_diagnostic, sqli_diagnostic, ssrf_diagnostic, ssti_diagnostic,
+        };
+        assert_eq!(
+            adapters::Sqli {
+                request_path: "/",
+                marker: "MK"
+            }
+            .diagnostic(true),
+            Some(sqli_diagnostic("MK"))
+        );
+        assert_eq!(
+            adapters::CommandInjection {
+                request_path: "/",
+                marker: "MK"
+            }
+            .diagnostic(true),
+            Some(command_injection_diagnostic("MK"))
+        );
+        assert_eq!(
+            adapters::Ssti {
+                request_path: "/",
+                marker: "MK"
+            }
+            .diagnostic(true),
+            Some(ssti_diagnostic("MK"))
+        );
+        assert_eq!(
+            adapters::PathTraversal {
+                request_path: "/",
+                marker: "MK"
+            }
+            .diagnostic(true),
+            Some(path_traversal_diagnostic("MK"))
+        );
+        // IDOR names the VICTIM marker (the finding), not the own-object control.
+        assert_eq!(
+            adapters::Idor {
+                victim_path: "/",
+                victim_marker: "VM",
+                own_path: "/o",
+                own_marker: "OM",
+                request_headers: &[],
+            }
+            .diagnostic(true),
+            Some(idor_diagnostic("VM"))
+        );
+        assert_eq!(
+            adapters::Ssrf {
+                canary_alias: "CA",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(true),
+            Some(ssrf_diagnostic("CA"))
+        );
+        assert_eq!(
+            adapters::BlindCommandInjection {
+                canary_alias: "CA",
+                canary_port: 80,
+                canary_container: "cc"
+            }
+            .diagnostic(true),
+            Some(blind_command_injection_diagnostic("CA"))
         );
     }
 
