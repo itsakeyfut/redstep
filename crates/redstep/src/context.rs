@@ -775,7 +775,7 @@ impl TestContext {
     /// naming a concrete type -- the shape the one-way `redstep-attacks` dependency needs
     /// (#137, ADR-0025). The `exploit_*_from_vantage` methods are thin wrappers over this,
     /// and an out-of-crate technique (#89) is driven the same way.
-    pub async fn run_from_vantage(
+    pub(crate) async fn run_from_vantage(
         &self,
         target: &ScopedTarget,
         adapter: impl CapabilityAdapter,
@@ -788,9 +788,9 @@ impl TestContext {
 
     /// Build a [`VantageChannel`] for `target` on this run's bound lab, minting the
     /// in-container gate (`Controlled`, confined by ADR-0006 layers 1-2; Aggressive is
-    /// refused). Errors with [`Error::LabUnavailable`] when no lab is bound. Shared by
-    /// every `exploit_*_from_vantage` wrapper so the gate and the lab binding live in
-    /// one place; the proof is required to build the channel and then dropped (#44).
+    /// refused). Errors with [`Error::LabUnavailable`] when no lab is bound. Called by
+    /// `run_from_vantage` so the gate and the lab binding live in one place; the proof
+    /// is required to build the channel and then dropped (#44).
     fn vantage_channel<'c>(&'c self, target: &'c ScopedTarget) -> Result<VantageChannel<'c>> {
         let binding = self.lab.as_ref().ok_or_else(|| Error::LabUnavailable {
             reason: "no attacker vantage is bound to this run; a vantage capability needs a lab (run_in_lab)"
@@ -809,7 +809,7 @@ impl TestContext {
     /// Record a capability's draft(s) and wrap the result. The victim/finding draft is
     /// recorded first, so the returned [`DraftRef`] is the judged finding; a second
     /// draft (IDOR's own-object control) is appended as a recorded fact when present
-    /// (ADR-0004, RK-004). Shared by every `exploit_*_from_vantage` wrapper.
+    /// (ADR-0004, RK-004). Called by `run_from_vantage`.
     fn finish(
         &self,
         observation: Observation<bool>,
